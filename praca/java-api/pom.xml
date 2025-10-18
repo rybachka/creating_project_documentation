@@ -99,7 +99,7 @@
 			<artifactId>activation</artifactId>
 			<version>1.1.1</version>
 		</dependency>
-		<dependencies>
+		
 		<!-- JavaParser do analizy kodu -->
 		<dependency>
 			<groupId>com.github.javaparser</groupId>
