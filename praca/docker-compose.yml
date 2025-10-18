@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  java-api:
+    build:
+      context: ./java-api
+    image: praca/java-api:dev
+    container_name: java-api
+    expose:
+      - "8080"
+    volumes:
+      - ./snapshots:/snapshots  
+      - uploads:/uploads 
+
+  python-nlp:
+    build:
+      context: ./python-nlp
+    image: praca/python-nlp:dev
+    container_name: python-nlp
+    expose:
+      - "8000"
+
+  web:
+    build:
+      context: ./web-ui
+    image: praca/web:dev
+    container_name: web
+    ports:
+      - "8080:80"
+    depends_on:
+      - java-api
+      - python-nlp
+
+volumes:
+  uploads: {} 

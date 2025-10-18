@@ -1,0 +1,28 @@
+openapi: 3.0.1
+info:
+  title: Sample Test API
+  version: "1.0.0"
+  description: |
+    Prosta specyfikacja testowa do sprawdzenia uploadu ZIP.
+servers:
+  - url: http://localhost:8080
+paths:
+  /hello:
+    get:
+      summary: Zwraca przywitanie
+      parameters:
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string

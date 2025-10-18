@@ -1,0 +1,39 @@
+---
+openapi: "3.0.1"
+info:
+  title: "AI Docs - Java API(Etap 1)"
+  description: "Szkielet dokumentacji API generowany automatycznie z kodu(springdoc)."
+  termsOfService: null
+  contact:
+    name: "Mariia Rybak"
+    url: null
+    email: "marjarybak@gmail.com"
+    extensions: null
+  license:
+    name: "MIT"
+    url: "https://opensource.org/licenses/MIT"
+    identifier: null
+    extensions: null
+  version: "v1"
+  extensions: null
+  summary: null
+externalDocs: null
+servers: null
+security: null
+tags: null
+paths: {}
+components:
+  schemas: null
+  responses: null
+  parameters: null
+  examples: null
+  requestBodies: null
+  headers: null
+  securitySchemes: null
+  links: null
+  callbacks: null
+  extensions: null
+  pathItems: null
+extensions: null
+jsonSchemaDialect: null
+webhooks: null

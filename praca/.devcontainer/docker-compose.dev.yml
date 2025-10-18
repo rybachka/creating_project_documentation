@@ -1,0 +1,11 @@
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/base:ubuntu-24.04
+    volumes:
+      - ..:/workspaces/praca:cached
+    command: sleep infinity
+    # Dzięki wspólnej sieci Compose dev-container widzi: java-api, python-nlp, web
+    depends_on:
+      - java-api
+      - python-nlp
+      - web
