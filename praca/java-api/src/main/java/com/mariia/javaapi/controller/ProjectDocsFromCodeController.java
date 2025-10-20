@@ -47,10 +47,10 @@ public class ProjectDocsFromCodeController {
                     .body("No endpoints found in source code.");
         }
 
-        // 2) Generacja OpenAPI + wzbogacenie NLP
+        // 2) Generacja OpenAPI + wzbogacenie NLP (przekazujemy projectDir!)
         Path out = storage.resolveGeneratedSpecPath(id);
         Files.createDirectories(out.getParent());
-        code2docs.generateYamlFromCode(endpoints, "Project " + id, level, out);
+        code2docs.generateYamlFromCode(endpoints, "Project " + id, level, out, projectDir);
 
         // 3) Zwróć YAML
         String yaml = Files.readString(out);
