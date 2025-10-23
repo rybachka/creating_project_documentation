@@ -1,5 +1,4 @@
-version: "3.9"
-
+# docker-compose.yml
 services:
   java-api:
     build:
@@ -9,8 +8,8 @@ services:
     expose:
       - "8080"
     volumes:
-      - ./snapshots:/snapshots  
-      - uploads:/uploads 
+      - ./snapshots:/snapshots
+      - uploads:/uploads
 
   python-nlp:
     build:
@@ -19,6 +18,26 @@ services:
     container_name: python-nlp
     expose:
       - "8000"
+    environment:
+      NLP_ENABLE_MT5: "true"
+      NLP_WARMUP: "false"
+      MT5_MODEL_NAME: "google/mt5-small"
+      MT5_NUM_BEAMS: "2"
+      MT5_MAX_TOK_SHORT: "48"
+      MT5_MAX_TOK_MED: "96"
+      MT5_MAX_TOK_LONG: "140"
+      MT5_MAX_TOK_RET: "64"
+      MT5_TASK_PREFIX: ""   # <-- NOWE
+      NLP_DEBUG: "true"                # <-- NOWE (na czas diagnostyki)
+      TOKENIZERS_PARALLELISM: "false"
+    healthcheck:
+      # bardzo lekki check – tylko sprawdza, czy serwer HTTP już słucha
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 20                  # <- dajemy dużo czasu
+      start_period: 60s            # <- i dłuższe okno na start
+
 
   web:
     build:
@@ -28,8 +47,10 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - java-api
-      - python-nlp
+      java-api:
+        condition: service_started
+      python-nlp:
+        condition: service_healthy
 
 volumes:
-  uploads: {} 
+  uploads: {}

@@ -4,13 +4,16 @@ import com.mariia.javaapi.code.CodeToDocsService;
 import com.mariia.javaapi.code.JavaSpringParser;
 import com.mariia.javaapi.code.ir.EndpointIR;
 import com.mariia.javaapi.uploads.UploadStorage;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.io.IOException;
+import java.nio.file.*;
 import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 @RestController
 @RequestMapping("/api/projects")
@@ -25,10 +28,17 @@ public class ProjectDocsFromCodeController {
         this.code2docs = code2docs;
     }
 
-    /** Generuje openapi.generated.yaml z kodu źródłowego + NLP i zwraca treść YAML. */
-    @PostMapping(value = "/{id}/docs/from-code", produces = "text/yaml")
-    public ResponseEntity<String> fromCode(
+    /**
+     * Generuje OpenAPI z kodu i zwraca:
+     *  - mode=plain|rules|mt5 -> pojedynczy YAML (attachment)
+     *  - mode=all             -> ZIP z trzema plikami YAML (attachment)
+     *
+     * level: short|medium|long (dla opisów)
+     */
+    @PostMapping(value = "/{id}/docs/from-code")
+    public ResponseEntity<byte[]> fromCode(
             @PathVariable String id,
+            @RequestParam(defaultValue = "all") String mode,
             @RequestParam(defaultValue = "medium") String level
     ) throws Exception {
 
@@ -36,26 +46,99 @@ public class ProjectDocsFromCodeController {
         if (!Files.exists(projectDir)) {
             return ResponseEntity.status(404)
                     .contentType(MediaType.TEXT_PLAIN)
-                    .body("Project not found: " + id);
+                    .body(("Project not found: " + id).getBytes());
         }
 
-        // 1) Parsowanie kodu (Java/Spring) -> IR endpointów
         List<EndpointIR> endpoints = parser.parseProject(projectDir);
         if (endpoints.isEmpty()) {
             return ResponseEntity.badRequest()
                     .contentType(MediaType.TEXT_PLAIN)
-                    .body("No endpoints found in source code.");
+                    .body("No endpoints found in source code.".getBytes());
         }
 
-        // 2) Generacja OpenAPI + wzbogacenie NLP (przekazujemy projectDir!)
-        Path out = storage.resolveGeneratedSpecPath(id);
-        Files.createDirectories(out.getParent());
-        code2docs.generateYamlFromCode(endpoints, "Project " + id, level, out, projectDir);
+        Files.createDirectories(projectDir);
+        Path plainPath = projectDir.resolve("openapi.plain.yaml");
+        Path rulesPath = projectDir.resolve("openapi.rules.yaml");
+        Path mt5Path   = projectDir.resolve("openapi.mt5.yaml");
+        Path zipPath   = projectDir.resolve("openapi.all.zip");
 
-        // 3) Zwróć YAML
-        String yaml = Files.readString(out);
+        String m = (mode == null) ? "all" : mode.trim().toLowerCase();
+
+        switch (m) {
+            case "plain": {
+                code2docs.generateYamlFromCode(
+                        endpoints, "Project " + id, "none",
+                        plainPath, projectDir,
+                        CodeToDocsService.DescribeMode.PLAIN
+                );
+                return asAttachment(plainPath, "openapi.plain.yaml", "text/yaml");
+            }
+            case "rules": {
+                code2docs.generateYamlFromCode(
+                        endpoints, "Project " + id, level,
+                        rulesPath, projectDir,
+                        CodeToDocsService.DescribeMode.RULES
+                );
+                return asAttachment(rulesPath, "openapi.rules.yaml", "text/yaml");
+            }
+            case "mt5": {
+                code2docs.generateYamlFromCode(
+                        endpoints, "Project " + id, level,
+                        mt5Path, projectDir,
+                        CodeToDocsService.DescribeMode.MT5
+                );
+                return asAttachment(mt5Path, "openapi.mt5.yaml", "text/yaml");
+            }
+            case "all":
+            default: {
+                code2docs.generateYamlFromCode(
+                        endpoints, "Project " + id, "none",
+                        plainPath, projectDir,
+                        CodeToDocsService.DescribeMode.PLAIN
+                );
+                code2docs.generateYamlFromCode(
+                        endpoints, "Project " + id, level,
+                        rulesPath, projectDir,
+                        CodeToDocsService.DescribeMode.RULES
+                );
+                code2docs.generateYamlFromCode(
+                        endpoints, "Project " + id, level,
+                        mt5Path, projectDir,
+                        CodeToDocsService.DescribeMode.MT5
+                );
+
+                zipFiles(zipPath,
+                        new Path[]{plainPath, rulesPath, mt5Path},
+                        new String[]{"openapi.plain.yaml", "openapi.rules.yaml", "openapi.mt5.yaml"});
+
+                return asAttachment(zipPath, "openapi.all.zip", "application/zip");
+            }
+        }
+    }
+
+    // —— helpers ——
+    private static ResponseEntity<byte[]> asAttachment(Path path, String filename, String contentType) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
         return ResponseEntity.ok()
-                .contentType(MediaType.parseMediaType("text/yaml"))
-                .body(yaml);
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .contentType(MediaType.parseMediaType(contentType))
+                .body(bytes);
+    }
+
+    private static void zipFiles(Path targetZip, Path[] sources, String[] namesInZip) throws IOException {
+        if (Files.exists(targetZip)) Files.delete(targetZip);
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(targetZip, StandardOpenOption.CREATE_NEW))) {
+            for (int i = 0; i < sources.length; i++) {
+                Path src = sources[i];
+                if (!Files.exists(src)) continue;
+                String entryName = (namesInZip != null && i < namesInZip.length && namesInZip[i] != null)
+                        ? namesInZip[i]
+                        : src.getFileName().toString();
+                zos.putNextEntry(new ZipEntry(entryName));
+                Files.copy(src, zos);
+                zos.closeEntry();
+            }
+        }
     }
 }
