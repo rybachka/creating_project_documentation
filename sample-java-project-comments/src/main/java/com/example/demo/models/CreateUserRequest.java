@@ -1,5 +1,4 @@
-package com.example.demo.dto;
-
+package models;
 
 public class CreateUserRequest {
     public String name;

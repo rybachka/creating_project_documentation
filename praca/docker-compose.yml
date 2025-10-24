@@ -21,23 +21,24 @@ services:
     environment:
       NLP_ENABLE_MT5: "true"
       NLP_WARMUP: "false"
-      MT5_MODEL_NAME: "google/mt5-small"
-      MT5_NUM_BEAMS: "2"
+      # ➜ przełączamy na instruction-tuned model
+      MT5_MODEL_NAME: "google/flan-t5-base"
+      # ➜ stabilniejsza generacja
+      MT5_NUM_BEAMS: "8"
+      # ➜ zostawiamy tylko MED/RET (short/long ignorowane przez serwer – niewadzą)
       MT5_MAX_TOK_SHORT: "48"
-      MT5_MAX_TOK_MED: "96"
+      MT5_MAX_TOK_MED: "200"
       MT5_MAX_TOK_LONG: "140"
-      MT5_MAX_TOK_RET: "64"
-      MT5_TASK_PREFIX: ""   # <-- NOWE
-      NLP_DEBUG: "true"                # <-- NOWE (na czas diagnostyki)
+      MT5_MAX_TOK_RET: "80"
+      MT5_TASK_PREFIX: ""          # bez prefiksu (lepiej dla FLAN/T5-instruct)
+      NLP_DEBUG: "true"            # diagnostyka w logach
       TOKENIZERS_PARALLELISM: "false"
     healthcheck:
-      # bardzo lekki check – tylko sprawdza, czy serwer HTTP już słucha
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
       interval: 20s
       timeout: 5s
-      retries: 20                  # <- dajemy dużo czasu
-      start_period: 60s            # <- i dłuższe okno na start
-
+      retries: 20
+      start_period: 60s
 
   web:
     build:

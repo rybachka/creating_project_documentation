@@ -6,5 +6,5 @@ public class ParamIR {
     public String type;
     public boolean required;
     public String description;
-    
+    public boolean descriptionFromJavadoc;
 }
