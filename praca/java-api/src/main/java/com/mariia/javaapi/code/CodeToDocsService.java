@@ -26,7 +26,7 @@ import java.util.stream.Stream;
 @Service
 public class CodeToDocsService {
 
-    public enum DescribeMode { PLAIN, RULES, MT5 }
+    public enum DescribeMode { PLAIN, RULES, AI }
 
     private final WebClient nlp;
     private final Duration timeout = Duration.ofSeconds(90);
@@ -77,7 +77,7 @@ public class CodeToDocsService {
             var op = new io.swagger.v3.oas.models.Operation();
             op.setOperationId(ep.operationId);
 
-            // --- wejście do NLP (tylko dla RULES/MT5; w PLAIN dociągamy paramDocs przez /plain) ---
+            // --- wejście do NLP ---
             Map<String, Object> nlpRes = Collections.emptyMap();
             if (mode != DescribeMode.PLAIN) {
                 Map<String, Object> body = new LinkedHashMap<>();
@@ -86,7 +86,7 @@ public class CodeToDocsService {
                 body.put("signature", ep.http + " " + ep.path);
                 body.put("comment", ep.description == null ? "" : ep.description);
 
-                // kontekst dla MT5/RULES
+                // dodatkowy kontekst
                 body.put("http", ep.http);
                 body.put("pathTemplate", ep.path);
                 body.put("javadoc", ep.javadoc == null ? "" : ep.javadoc);
@@ -110,20 +110,9 @@ public class CodeToDocsService {
                         "description", ep.returns != null ? (ep.returns.description == null ? "" : ep.returns.description) : ""
                 ));
 
-                nlpRes = callNlp(body, mode);
-
-                if (mode == DescribeMode.MT5) {
-                    System.out.println("[MT5 raw map] " + nlpRes);
-                    boolean empty = true;
-                    for (String k : List.of("shortDescription","mediumDescription","longDescription","returnDoc")) {
-                        Object v = nlpRes.get(k);
-                        if (v != null && !v.toString().isBlank()) { empty = false; break; }
-                    }
-                    if (empty) {
-                        System.out.println("[MT5 WARN] NLP zwróciło puste pola dla " + ep.operationId);
-                    }
-                }
+                nlpRes = callNlp(body, mode, level);
             } else {
+                // PLAIN: tylko paramDocs z /plain (zachowanie zgodne wstecznie)
                 Map<String, Object> body = new LinkedHashMap<>();
                 body.put("symbol", ep.operationId);
                 body.put("kind", "endpoint");
@@ -139,34 +128,24 @@ public class CodeToDocsService {
                 }
                 body.put("params", nlpParams);
                 body.put("returns", Map.of("type", ep.returns != null ? ep.returns.type : "void"));
-                nlpRes = callNlp(body, DescribeMode.PLAIN);
-            }
-
-            // ➜ odczyt i sanitizacja tekstów z NLP
-            String shortD, medD, longD, retDoc;
-            if (mode == DescribeMode.MT5) {
-                shortD = sanitizeNlpGentle(asStr(nlpRes.get("shortDescription")));
-                medD   = sanitizeNlpGentle(asStr(nlpRes.get("mediumDescription")));
-                longD  = sanitizeNlpGentle(asStr(nlpRes.get("longDescription")));
-                retDoc = sanitizeNlpGentle(asStr(nlpRes.get("returnDoc")));
-            } else {
-                shortD = sanitizeNlpStrict(asStr(nlpRes.get("shortDescription")));
-                medD   = sanitizeNlpStrict(asStr(nlpRes.get("mediumDescription")));
-                longD  = sanitizeNlpStrict(asStr(nlpRes.get("longDescription")));
-                retDoc = sanitizeNlpStrict(asStr(nlpRes.get("returnDoc")));
+                nlpRes = callNlp(body, DescribeMode.PLAIN, level);
             }
 
             // —— summary/description zależnie od trybu ——
             if (mode == DescribeMode.PLAIN) {
                 // bez opisów
             } else if (mode == DescribeMode.RULES) {
+                String shortD = sanitizeNlpStrict(asStr(nlpRes.get("shortDescription")));
+                String medD   = sanitizeNlpStrict(asStr(nlpRes.get("mediumDescription")));
+                String longD  = sanitizeNlpStrict(asStr(nlpRes.get("longDescription")));
+                String retDoc = sanitizeNlpStrict(asStr(nlpRes.get("returnDoc")));
+
                 String summary = firstNonBlank(shortD, medD, longD, ep.description, ep.operationId);
                 if (summary != null && !summary.isBlank()) op.setSummary(trim100(summary));
                 String descr = pickByLevel(shortD, medD, longD, level);
                 if (descr == null) descr = firstNonBlank(longD, medD, shortD, ep.description);
                 if (descr != null && !descr.isBlank()) op.setDescription(descr);
 
-                // RULES – vendor extensions z surowych ep.notes/todos (zostaje jak było)
                 if (ep.notes != null && !ep.notes.isEmpty()) op.addExtension("x-impl-notes", ep.notes);
                 if (ep.todos != null && !ep.todos.isEmpty()) op.addExtension("x-todos", ep.todos);
 
@@ -180,71 +159,56 @@ public class CodeToDocsService {
                     op.setDescription(finalDesc);
                 }
 
-            } else { // MT5
-                // MT5 – bez fallbacku do ep.description
-                String summary = firstNonBlank(shortD, medD, longD);
-                if (summary != null && !summary.isBlank()) op.setSummary(trim100(summary));
-                String descr = pickByLevel(shortD, medD, longD, level);
-                if (descr != null && !descr.isBlank()) op.setDescription(descr);
-
-                // ---- implNotes od MT5 (2–3 ludzkie punkty) ----
-                Object implNotesObj = nlpRes.get("implNotes");
-                List<String> implNotes = (implNotesObj instanceof List)
-                        ? ((List<?>) implNotesObj).stream()
-                            .map(x -> Objects.toString(x, ""))
-                            .filter(s -> s != null && !s.isBlank())
-                            .map(String::trim)
-                            .limit(3)
-                            .toList()
-                        : List.of();
-
-                if (!implNotes.isEmpty()) {
-                    op.addExtension("x-impl-notes", implNotes);
-                    String base = (op.getDescription() == null) ? "" : op.getDescription().trim();
-                    String joined = String.join("; ", implNotes);
-                    if (!joined.isBlank()) {
-                        String finalDesc = base.isBlank() ? ("Notes: " + joined) : (base + "\n\nNotes: " + joined);
-                        op.setDescription(finalDesc);
+            } else { // AI (Ollama)
+                // Bez fallbacku: pokazujemy dokładny efekt LLM
+                String medD = asStr(nlpRes.get("mediumDescription"));
+                if (medD != null && !medD.isBlank()) {
+                    op.setDescription(medD.trim());
+                    // summary = pierwsze zdanie z opisu
+                    String[] split = medD.split("\\.\\s|\\.$", 2);
+                    String firstSentence = (split.length > 0) ? split[0] : "";
+                    if (!firstSentence.isBlank()) {
+                        op.setSummary(trim100(firstSentence.trim() + "."));
                     }
                 }
 
-                // ---- examples: request(s) + response ----
+                // ---- notes (x-impl-notes) ----
+                Object notesObj = nlpRes.get("notes");
+                if (notesObj instanceof List) {
+                    List<String> implNotes = ((List<?>) notesObj).stream()
+                            .map(x -> Objects.toString(x, ""))
+                            .filter(s -> !s.isBlank())
+                            .map(String::trim)
+                            .limit(3)
+                            .toList();
+                    if (!implNotes.isEmpty()) {
+                        op.addExtension("x-impl-notes", implNotes);
+                    }
+                }
+
+                // ---- examples ----
                 Object examplesObj = nlpRes.get("examples");
                 if (examplesObj instanceof Map) {
                     Map<String, Object> examples = (Map<String, Object>) examplesObj;
 
-                    // a) Request examples – użyj pierwszego jako główny
+                    // a) request examples: zapisz jako vendor extension (lista cURL)
                     Object reqsObj = examples.get("requests");
                     if (reqsObj instanceof List && !((List<?>) reqsObj).isEmpty()) {
-                        Map<String, Object> req = (Map<String, Object>) ((List<?>) reqsObj).get(0);
-
-                        // query param examples
-                        if (op.getParameters() != null && req.get("query") instanceof Map) {
-                            Map<String, Object> q = (Map<String, Object>) req.get("query");
-                            op.getParameters().forEach(par -> {
-                                if ("query".equalsIgnoreCase(par.getIn())) {
-                                    Object ex = q.get(par.getName());
-                                    if (ex != null) {
-                                        if (par.getSchema() == null) par.setSchema(new StringSchema());
-                                        par.getSchema().setExample(ex);
-                                    }
-                                }
-                            });
-                        }
-
-                        // requestBody example
-                        if (req.get("body") != null && op.getRequestBody() != null) {
-                            Content c = op.getRequestBody().getContent();
-                            if (c != null) {
-                                io.swagger.v3.oas.models.media.MediaType mt = c.get("application/json");
-                                if (mt != null) {
-                                    mt.setExample(req.get("body"));
+                        List<String> curlList = new ArrayList<>();
+                        for (Object r : (List<?>) reqsObj) {
+                            if (r instanceof Map) {
+                                Object curl = ((Map<?, ?>) r).get("curl");
+                                if (curl != null && !curl.toString().isBlank()) {
+                                    curlList.add(curl.toString());
                                 }
                             }
                         }
+                        if (!curlList.isEmpty()) {
+                            op.addExtension("x-request-examples", curlList);
+                        }
                     }
 
-                    // b) Response example
+                    // b) response example: ustaw w responses
                     Object respObj = examples.get("response");
                     if (respObj instanceof Map) {
                         Map<String, Object> resp = (Map<String, Object>) respObj;
@@ -300,11 +264,12 @@ public class CodeToDocsService {
                 if (!ps.isEmpty()) op.setParameters(ps);
             }
 
-            // --- responses (200) – jeśli MT5 nie nadpisał/nie dodał nic innego ---
+            // --- responses (200) – jeśli AI/RULES/PLAIN nic nie zbudowało ---
             if (op.getResponses() == null || op.getResponses().isEmpty()) {
                 ApiResponses rs = new ApiResponses();
                 ApiResponse ok = new ApiResponse();
-                ok.setDescription(retDoc != null ? retDoc : "OK");
+                String retDoc = asStr(nlpRes.get("returnDoc"));
+                ok.setDescription((retDoc != null && !retDoc.isBlank()) ? retDoc : "OK");
                 ok.setContent(new Content().addMediaType(
                         "application/json",
                         new io.swagger.v3.oas.models.media.MediaType()
@@ -361,14 +326,22 @@ public class CodeToDocsService {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> callNlp(Map<String, Object> body, DescribeMode mode) {
+    private Map<String, Object> callNlp(Map<String, Object> body, DescribeMode mode, String level) {
         try {
             String modeParam = (mode == DescribeMode.PLAIN) ? "plain"
-                               : (mode == DescribeMode.MT5) ? "mt5"
-                               : "rule";
-            String extra = (mode == DescribeMode.MT5) ? "&strict=false" : "";
+                    : (mode == DescribeMode.RULES) ? "rule"
+                    : "ollama";
+
+            // mapowanie level -> audience (beginner|intermediate|advanced)
+            String audience = switch (safe(level)) {
+                case "short" -> "beginner";
+                case "long"  -> "advanced";
+                default      -> "intermediate";
+            };
+
+            String uri = "/describe?mode=" + modeParam + "&audience=" + audience;
             return nlp.post()
-                    .uri("/describe?mode=" + modeParam + extra)
+                    .uri(uri)
                     .contentType(MediaType.APPLICATION_JSON)
                     .bodyValue(body)
                     .retrieve()
@@ -379,6 +352,8 @@ public class CodeToDocsService {
             return Collections.emptyMap();
         }
     }
+
+    private static String safe(String s) { return (s == null) ? "" : s.trim().toLowerCase(Locale.ROOT); }
 
     // ============= Teksty i wybór długości =============
 
@@ -401,17 +376,6 @@ public class CodeToDocsService {
         }
         if (t.equals(".") || t.length() < 8) return null;
         if (!t.endsWith(".")) t = t + ".";
-        return t;
-    }
-
-    private static String sanitizeNlpGentle(String s) { // łagodnie dla MT5
-        if (s == null) return null;
-        String t = s.trim();
-        String lower = t.toLowerCase(Locale.ROOT);
-        if (t.startsWith("規") || lower.contains("<extra_id_")) {
-            return null;
-        }
-        if (!t.isEmpty() && !t.endsWith(".")) t = t + ".";
         return t;
     }
 

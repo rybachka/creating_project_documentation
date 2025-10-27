@@ -12,33 +12,29 @@ services:
       - uploads:/uploads
 
   python-nlp:
-    build:
-      context: ./python-nlp
+    build: ./python-nlp
     image: praca/python-nlp:dev
     container_name: python-nlp
     expose:
       - "8000"
     environment:
-      NLP_ENABLE_MT5: "true"
-      NLP_WARMUP: "false"
-      # ➜ przełączamy na instruction-tuned model
-      MT5_MODEL_NAME: "google/flan-t5-base"
-      # ➜ stabilniejsza generacja
-      MT5_NUM_BEAMS: "8"
-      # ➜ zostawiamy tylko MED/RET (short/long ignorowane przez serwer – niewadzą)
-      MT5_MAX_TOK_SHORT: "48"
-      MT5_MAX_TOK_MED: "200"
-      MT5_MAX_TOK_LONG: "140"
-      MT5_MAX_TOK_RET: "80"
-      MT5_TASK_PREFIX: ""          # bez prefiksu (lepiej dla FLAN/T5-instruct)
-      NLP_DEBUG: "true"            # diagnostyka w logach
-      TOKENIZERS_PARALLELISM: "false"
+      NLP_MODE: "ollama"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_MODEL: "llama3.1:8b-instruct-q4_K_M"
+      # Parametry generacji (bazowe)
+      OLLAMA_TEMPERATURE: "0.3"
+      OLLAMA_TOP_P: "0.9"
+      OLLAMA_TOP_K: "60"
+      OLLAMA_REPEAT_PENALTY: "1.15"
+      OLLAMA_NUM_CTX: "4096"
+      OLLAMA_NUM_PREDICT: "256"
+      NLP_DEBUG: "true"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
-      interval: 20s
+      interval: 15s
       timeout: 5s
       retries: 20
-      start_period: 60s
+      start_period: 45s
 
   web:
     build:

@@ -7,9 +7,18 @@ type DescribeOut = {
   longDescription: string;
   paramDocs: { name: string; doc: string }[];
   returnDoc?: string | null;
+  // opcjonalnie: from AI
+  notes?: string[];
+  examples?: any;
 };
 
-type Healthz = { status: string; mt5?: string; device?: string };
+type Healthz = {
+  status: string;
+  llm?: string;        // np. "llama3.1:8b-instruct-q4_K_M"
+  provider?: string;   // "ollama"
+  device?: string;     // np. "Apple M4 / Metal"
+  model_loaded?: boolean;
+};
 
 export default function App() {
   const [hello, setHello] = useState<HelloResponse | null>(null);
@@ -48,21 +57,29 @@ export default function App() {
       .catch(console.error);
   }, [name]);
 
+  const audienceOf = (lvl: "short" | "medium" | "long") =>
+    lvl === "short" ? "beginner" : lvl === "long" ? "advanced" : "intermediate";
+
   const runNlp = async () => {
     const body = {
       symbol: "getUserById",
-      kind: "function",
-      signature: "getUserById(id: string): User",
+      kind: "endpoint",
+      signature: "GET /api/users/{id}",
       comment,
-      params: [{ name: "id", type: "string", description: "Identyfikator" }],
-      returns: { type: "User", description: "Obiekt użytkownika" },
+      language: "pl",
+      http: "GET",
+      pathTemplate: "/api/users/{id}",
+      params: [{ name: "id", in: "path", type: "string", required: true, description: "Identyfikator" }],
+      returns: { type: "UserResponse", description: "Obiekt użytkownika" },
+      notes: [],
+      todos: []
     };
 
     setNlp(null);
     setStatus("sprawdzam usługę NLP…");
     startTimer();
 
-    // mały healthcheck
+    // healthcheck (Ollama LLM)
     let health: Healthz | null = null;
     try {
       const hr = await fetch("/nlp/healthz");
@@ -70,24 +87,21 @@ export default function App() {
     } catch {}
 
     if (!health) setStatus("usługa NLP niedostępna – spróbuję mimo to…");
-    else if (!health.mt5 || health.mt5 === "unavailable")
-      setStatus("rozgrzewam model (pierwsze wywołanie może potrwać)…");
-    else setStatus(`model: ${health.mt5} (${health.device}) – generuję opis…`);
+    else if (!health.model_loaded)
+      setStatus("rozgrzewam LLM (pierwsze wywołanie może potrwać)…");
+    else
+      setStatus(`LLM: ${health.llm ?? "unknown"} (${health.device ?? "cpu"}) – generuję opis…`);
 
-    const ac = new AbortController();
     try {
-      const r = await fetch("/nlp/describe", {
+      const r = await fetch(`/nlp/describe?mode=ollama&audience=${encodeURIComponent(audienceOf(level))}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: ac.signal,
+        body: JSON.stringify(body)
       });
 
       if (!r.ok) {
         if (r.status === 504) {
-          setStatus(
-            "serwer przekroczył czas oczekiwania (504) – model mógł się jeszcze ładować."
-          );
+          setStatus("serwer przekroczył czas oczekiwania (504) – model mógł się rozgrzewać.");
         } else {
           setStatus(`błąd: ${r.status} ${r.statusText}`);
         }
@@ -130,7 +144,7 @@ export default function App() {
       </section>
 
       <section style={{ marginTop: 24 }}>
-        <h2>Test NLP</h2>
+        <h2>Test NLP (Ollama / LLM)</h2>
 
         {/* STATUS BAR */}
         <div
@@ -208,9 +222,46 @@ function UploadBox({
   const [file, setFile] = React.useState<File | null>(null);
   const [res, setRes] = React.useState<UploadResult | null>(null);
   const [busy, setBusy] = React.useState(false);
-  const [genBusy, setGenBusy] = React.useState(false); // osobny boolean (fix TS2345)
+  const [genBusy, setGenBusy] = React.useState(false);
   const [level, setLevel] = React.useState<"short" | "medium" | "long">("medium");
-  const [mode, setMode] = React.useState<"plain" | "rules" | "mt5" | "all">("all");
+  const [mode, setMode] = React.useState<"plain" | "rules" | "ai" | "all">("all");
+
+  // ⬇⬇⬇ DODANE: pobieranie PDF (AI)
+  const downloadPdfAi = async () => {
+    if (!res?.id) return;
+    parentSetStatus("generuję PDF (AI) z OpenAPI…");
+    parentStartTimer();
+    try {
+      const r = await fetch(`/api/projects/${res.id}/docs/pdf`, { method: "POST" });
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        parentSetStatus(`błąd generowania PDF: ${r.status}`);
+        alert(`Błąd generowania PDF: ${r.status} ${r.statusText}\n${text}`);
+        return;
+      }
+      const blob = await r.blob();
+      const cd = r.headers.get("Content-Disposition") || "";
+      const m = cd.match(/filename="?([^"]+)"?/i);
+      const filename = m?.[1] || "openapi.ai.pdf";
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      parentSetStatus("PDF (AI) wygenerowany i pobrany ✓");
+    } catch (e) {
+      parentSetStatus(`błąd sieci podczas generowania PDF: ${String(e)}`);
+    } finally {
+      parentStopTimer();
+    }
+  };
+  // ⬆⬆⬆ KONIEC DODANEGO
+
 
   const onUpload = async () => {
     if (!file) return;
@@ -277,7 +328,6 @@ function UploadBox({
       }
 
       const ct = r.headers.get("Content-Type") || "";
-      // Jeśli ZIP -> pobierz binarnie
       if (ct.includes("application/zip")) {
         const blob = await r.blob();
         const filename = filenameFromCD(r, "openapi.all.zip");
@@ -293,11 +343,8 @@ function UploadBox({
         return;
       }
 
-      // W przeciwnym razie traktujemy to jako YAML (tekst)
       const yamlText = await r.text();
-      // jeśli backend w trybie =all jednak zwróci JSON (np. ścieżki), pokaż komunikat
       if (yamlText.startsWith("{") || yamlText.startsWith("[")) {
-        // UX: uprzejmy komunikat, ale i tak spróbujemy zapisać jako .json
         console.warn("Otrzymano JSON — możliwe, że to mapa ścieżek plików.");
         const blob = new Blob([yamlText], { type: "application/json" });
         const url = URL.createObjectURL(blob);
@@ -318,9 +365,9 @@ function UploadBox({
           ? "openapi.plain.yaml"
           : mode === "rules"
           ? "openapi.rules.yaml"
-          : mode === "mt5"
-          ? "openapi.mt5.yaml"
-          : "openapi.generated.yaml"; // fallback
+          : mode === "ai"
+          ? "openapi.ai.yaml"
+          : "openapi.generated.yaml";
       const url = URL.createObjectURL(blob);
 
       const a = document.createElement("a");
@@ -374,8 +421,8 @@ function UploadBox({
             Tryb generacji:&nbsp;
             <select value={mode} onChange={(e) => setMode(e.target.value as any)}>
               <option value="plain">plain (bez opisów)</option>
-              <option value="rules">rules (fallback)</option>
-              <option value="mt5">mt5 (model)</option>
+              <option value="rules">rules (reguły)</option>
+              <option value="ai">ai (Ollama / LLM)</option>
               <option value="all">all (ZIP 3 plików)</option>
             </select>
           </div>
@@ -390,6 +437,9 @@ function UploadBox({
             <button onClick={generateFromCode} disabled={!res?.id || genBusy}>
               {genBusy ? "Generuję z kodu…" : "Wygeneruj z kodu"}
             </button>
+          <button onClick={downloadPdfAi} disabled={!res?.id}>
+            Pobierz PDF (AI)
+          </button>
           </div>
         </div>
       )}

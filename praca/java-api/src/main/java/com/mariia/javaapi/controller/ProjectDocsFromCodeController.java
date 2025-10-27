@@ -8,10 +8,14 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import com.mariia.javaapi.docs.PdfDocService;
+
 
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -19,18 +23,23 @@ import java.util.zip.ZipOutputStream;
 @RequestMapping("/api/projects")
 public class ProjectDocsFromCodeController {
 
+
     private final UploadStorage storage;
     private final CodeToDocsService code2docs;
     private final JavaSpringParser parser = new JavaSpringParser();
+    private final PdfDocService pdfDocService;
 
-    public ProjectDocsFromCodeController(UploadStorage storage, CodeToDocsService code2docs) {
+
+
+    public ProjectDocsFromCodeController(UploadStorage storage, CodeToDocsService code2docs, PdfDocService pdfDocService) {
         this.storage = storage;
         this.code2docs = code2docs;
+        this.pdfDocService = pdfDocService;
     }
 
     /**
      * Generuje OpenAPI z kodu i zwraca:
-     *  - mode=plain|rules|mt5 -> pojedynczy YAML (attachment)
+     *  - mode=plain|rules|ai  -> pojedynczy YAML (attachment)
      *  - mode=all             -> ZIP z trzema plikami YAML (attachment)
      *
      * level: short|medium|long (dla opisów)
@@ -59,10 +68,10 @@ public class ProjectDocsFromCodeController {
         Files.createDirectories(projectDir);
         Path plainPath = projectDir.resolve("openapi.plain.yaml");
         Path rulesPath = projectDir.resolve("openapi.rules.yaml");
-        Path mt5Path   = projectDir.resolve("openapi.mt5.yaml");
+        Path aiPath    = projectDir.resolve("openapi.ai.yaml");
         Path zipPath   = projectDir.resolve("openapi.all.zip");
 
-        String m = (mode == null) ? "all" : mode.trim().toLowerCase();
+        String m = (mode == null) ? "all" : mode.trim().toLowerCase(Locale.ROOT);
 
         switch (m) {
             case "plain": {
@@ -81,13 +90,13 @@ public class ProjectDocsFromCodeController {
                 );
                 return asAttachment(rulesPath, "openapi.rules.yaml", "text/yaml");
             }
-            case "mt5": {
+            case "ai": {
                 code2docs.generateYamlFromCode(
                         endpoints, "Project " + id, level,
-                        mt5Path, projectDir,
-                        CodeToDocsService.DescribeMode.MT5
+                        aiPath, projectDir,
+                        CodeToDocsService.DescribeMode.AI
                 );
-                return asAttachment(mt5Path, "openapi.mt5.yaml", "text/yaml");
+                return asAttachment(aiPath, "openapi.ai.yaml", "text/yaml");
             }
             case "all":
             default: {
@@ -103,13 +112,13 @@ public class ProjectDocsFromCodeController {
                 );
                 code2docs.generateYamlFromCode(
                         endpoints, "Project " + id, level,
-                        mt5Path, projectDir,
-                        CodeToDocsService.DescribeMode.MT5
+                        aiPath, projectDir,
+                        CodeToDocsService.DescribeMode.AI
                 );
 
                 zipFiles(zipPath,
-                        new Path[]{plainPath, rulesPath, mt5Path},
-                        new String[]{"openapi.plain.yaml", "openapi.rules.yaml", "openapi.mt5.yaml"});
+                        new Path[]{plainPath, rulesPath, aiPath},
+                        new String[]{"openapi.plain.yaml", "openapi.rules.yaml", "openapi.ai.yaml"});
 
                 return asAttachment(zipPath, "openapi.all.zip", "application/zip");
             }
@@ -141,4 +150,42 @@ public class ProjectDocsFromCodeController {
             }
         }
     }
+
+    @PostMapping(value = "/{id}/docs/pdf")
+    public ResponseEntity<byte[]> pdfFromAi(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "ai") String mode // na przyszłość
+    ) throws Exception {
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body(("Project not found: " + id).getBytes());
+        }
+        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
+        if (!Files.exists(aiYaml)) {
+            // Jeżeli nie ma jeszcze AI-YAML, spróbuj wygenerować:
+            List<EndpointIR> endpoints = parser.parseProject(projectDir);
+            if (endpoints.isEmpty()) {
+                return ResponseEntity.badRequest()
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body("No endpoints found in source code.".getBytes());
+            }
+            code2docs.generateYamlFromCode(
+                    endpoints, "Project " + id, "medium",
+                    aiYaml, projectDir, CodeToDocsService.DescribeMode.AI
+            );
+        }
+
+        Path outPdf = projectDir.resolve("openapi.ai.pdf");
+        pdfDocService.renderPdfFromYaml(aiYaml, outPdf);
+
+        byte[] bytes = Files.readAllBytes(outPdf);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"openapi.ai.pdf\"")
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .contentType(MediaType.APPLICATION_PDF)
+                .body(bytes);
+    }
+
 }

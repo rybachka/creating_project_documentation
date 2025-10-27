@@ -1,30 +1,56 @@
+from typing import List, Optional, Literal, Dict
 from pydantic import BaseModel, Field
-from typing import List, Optional
 
-class Param(BaseModel):
+class ParamIn(BaseModel):
     name: str
+    in_: Optional[str] = Field(default=None, alias="in")
     type: Optional[str] = None
+    required: Optional[bool] = None
     description: Optional[str] = None
 
-class ReturnMeta(BaseModel):
+    model_config = {
+        "populate_by_name": True,
+        "extra": "ignore",
+    }
+
+class ReturnDoc(BaseModel):
     type: Optional[str] = None
     description: Optional[str] = None
 
 class DescribeIn(BaseModel):
-    symbol: str                      # np. UsersController.getById
-    kind: Optional[str] = "endpoint" # "endpoint"/"function"
-    signature: Optional[str] = None  # np. GET /api/users/{id}: UserResponse
-    comment: Optional[str] = None    # Javadoc/Opis z adnotacji/komentarz surowy
-    params: List[Param] = []
-    returns: Optional[ReturnMeta] = None
+    symbol: str
+    kind: Literal["endpoint","function","method","dto"] = "endpoint"
+    signature: Optional[str] = None
+    comment: Optional[str] = None
+    http: Optional[str] = None
+    pathTemplate: Optional[str] = None
+    javadoc: Optional[str] = None
+    notes: Optional[List[str]] = None
+    todos: Optional[List[str]] = None
+    language: Optional[str] = "pl"
+    params: Optional[List[ParamIn]] = None
+    returns: Optional[ReturnDoc] = None
 
 class ParamDoc(BaseModel):
     name: str
     doc: str
 
+class ExampleReq(BaseModel):
+    curl: str
+
+class ExampleResp(BaseModel):
+    status: int = Field(200, ge=100, le=599)
+    body: Dict[str, object] = Field(default_factory=dict)
+
+class Examples(BaseModel):
+    requests: List[ExampleReq] = Field(default_factory=list, max_items=2)
+    response: ExampleResp
+
 class DescribeOut(BaseModel):
-    shortDescription: str
-    mediumDescription: str
-    longDescription: str
+    shortDescription: Optional[str] = ""
+    mediumDescription: Optional[str] = ""
+    longDescription: Optional[str] = ""
     paramDocs: List[ParamDoc] = []
-    returnDoc: Optional[str] = None
+    returnDoc: Optional[str] = ""
+    notes: Optional[List[str]] = None
+    examples: Optional[Dict] = None
