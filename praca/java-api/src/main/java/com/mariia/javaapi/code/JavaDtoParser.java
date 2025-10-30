@@ -11,6 +11,10 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.stream.Collectors;
+import com.github.javaparser.ast.body.RecordDeclaration;
+import io.swagger.v3.oas.models.media.*;
+import com.github.javaparser.ast.body.EnumDeclaration;
+
 
 public class JavaDtoParser {
 
@@ -68,6 +72,34 @@ public class JavaDtoParser {
                 schema.setProperties(props);
                 sink.put(className, schema);
             }
+
+
+
+            for (RecordDeclaration rec : cu.findAll(RecordDeclaration.class)) {
+                String className = rec.getNameAsString();
+                ObjectSchema schema = new ObjectSchema();
+                schema.setName(className);
+
+                Map<String, Schema> props = new LinkedHashMap<>();
+                rec.getParameters().forEach(p ->
+                    props.put(p.getNameAsString(), mapType(p.getType().asString()))
+                );
+
+                schema.setProperties(props);
+                sink.put(className, schema);
+            }
+
+            for (EnumDeclaration en : cu.findAll(EnumDeclaration.class)) {
+                String n = en.getNameAsString();
+                StringSchema s = new StringSchema();
+                List<String> values = en.getEntries().stream()
+                        .map(e -> e.getNameAsString())
+                        .toList();
+                s.setEnum(values);
+                sink.put(n, s);
+            }
+
+
         } catch (Exception e) {
             System.err.println("Błąd parsowania DTO: " + file + " -> " + e.getMessage());
         }
@@ -86,7 +118,33 @@ public class JavaDtoParser {
     private Schema mapType(String t) {
         if (t == null || t.isBlank()) return new ObjectSchema();
         String type = t.trim();
+        // 1) Zdejmij najczęstsze wrappery generyczne:
+        if (type.startsWith("ResponseEntity<") ||
+            type.startsWith("Optional<") ||
+            type.startsWith("CompletableFuture<") ||
+            type.startsWith("Mono<") ||
+            type.startsWith("Flux<")) {
+            return mapType(stripGenerics(type)); // np. ResponseEntity<List<X>> -> List<X>
+        }
 
+        // 2) Dedykowane mapowanie Page<T> -> obiekt z content[] + metadane
+        if (type.startsWith("Page<")) {
+            Schema inner = mapType(stripGenerics(type));
+            ArraySchema content = new ArraySchema();
+            content.setItems(inner);
+
+            ObjectSchema page = new ObjectSchema();
+            Map<String, Schema> props = new LinkedHashMap<>();
+            props.put("content", content);
+            props.put("page", new IntegerSchema());
+            props.put("size", new IntegerSchema());
+            props.put("totalElements", new IntegerSchema()); // możesz użyć IntegerSchema/NumberSchema
+            props.put("totalPages", new IntegerSchema());
+            props.put("last", new BooleanSchema());
+            page.setProperties(props);
+            page.setName("Page«" + simpleName(stripGenerics(type)) + "»");
+            return page;
+        }
         if (type.endsWith("[]")) {
             ArraySchema arr = new ArraySchema();
             arr.setItems(mapType(type.substring(0, type.length() - 2)));

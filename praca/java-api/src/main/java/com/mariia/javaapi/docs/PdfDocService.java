@@ -1,17 +1,19 @@
 package com.mariia.javaapi.docs;
 
 import com.openhtmltopdf.pdfboxout.PdfRendererBuilder;
+import io.swagger.v3.oas.models.Components;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
-import io.swagger.v3.oas.models.media.Content;
+import io.swagger.v3.oas.models.media.*;
+import io.swagger.v3.oas.models.parameters.Parameter;
+import io.swagger.v3.oas.models.responses.ApiResponse;
 import io.swagger.v3.parser.OpenAPIV3Parser;
 import org.springframework.stereotype.Service;
 
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 
 @Service
 public class PdfDocService {
@@ -28,7 +30,6 @@ public class PdfDocService {
         }
 
         String html = buildHtml(api);
-        // Usuń ewentualny BOM
         if (!html.isEmpty() && html.charAt(0) == '\uFEFF') {
             html = html.substring(1);
         }
@@ -38,7 +39,6 @@ public class PdfDocService {
             PdfRendererBuilder b = new PdfRendererBuilder();
             b.useFastMode();
 
-            // Czcionka z zasobów (UTF-8, polskie znaki)
             b.useFont(() -> {
                 var is = PdfDocService.class.getResourceAsStream("/fonts/times.ttf");
                 if (is == null) {
@@ -47,7 +47,6 @@ public class PdfDocService {
                 return is;
             }, "TimesCustom");
 
-            // baseUri nie może być null – podajemy schemat plikowy
             b.withHtmlContent(html, "file:/");
             b.toStream(os);
             b.run();
@@ -57,7 +56,6 @@ public class PdfDocService {
 
     // ————————————————————— HTML helpers —————————————————————
 
-    /** Proste escapowanie do HTML. */
     private static String esc(String s) {
         if (s == null) return "";
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
@@ -79,11 +77,11 @@ public class PdfDocService {
       pre{white-space:pre-wrap; word-break:break-word; margin:6px 0;}
       table{border-collapse:collapse;width:100%;margin-top:8px;font-size:10pt;}
       th,td{border:1px solid #eee;padding:6px;text-align:left;vertical-align:top;}
+      .schemas h3{margin-top:16px}
     """;
 
     private String buildHtml(OpenAPI api) {
-        // Uwaga: BEZ doctype – czysty XHTML
-        StringBuilder sb = new StringBuilder(32_000);
+        StringBuilder sb = new StringBuilder(48_000);
         sb.append("<html xmlns=\"http://www.w3.org/1999/xhtml\"><head>")
           .append("<meta charset=\"utf-8\" />")
           .append("<style>").append(CSS).append("</style>")
@@ -111,6 +109,9 @@ public class PdfDocService {
                 renderOp(sb, "DELETE",pathItem.getDelete(), path);
             });
         }
+
+        // —— NOWE: pełna sekcja components/schemas na końcu dokumentu ——
+        renderComponents(sb, api.getComponents());
 
         sb.append("</body></html>");
         return sb.toString();
@@ -141,7 +142,7 @@ public class PdfDocService {
         if (op.getParameters() != null && !op.getParameters().isEmpty()) {
             sb.append("<div style='margin-top:8px'><strong>Parametry</strong>");
             sb.append("<table><thead><tr><th>Nazwa</th><th>W</th><th>Typ</th><th>Wymagany</th><th>Opis</th></tr></thead><tbody>");
-            op.getParameters().forEach(p -> {
+            for (Parameter p : op.getParameters()) {
                 String typ = p.getSchema() != null
                         ? (p.getSchema().getType() == null ? "" : p.getSchema().getType())
                         : "";
@@ -152,20 +153,27 @@ public class PdfDocService {
                   .append("<td>").append(Boolean.TRUE.equals(p.getRequired()) ? "tak" : "nie").append("</td>")
                   .append("<td>").append(esc(p.getDescription())).append("</td>")
                   .append("</tr>");
-            });
+            }
             sb.append("</tbody></table></div>");
         }
 
-        // RequestBody
+        // RequestBody (application/json)
         if (op.getRequestBody() != null && op.getRequestBody().getContent() != null) {
             Content c = op.getRequestBody().getContent();
             var mt = c.get("application/json");
             if (mt != null) {
                 sb.append("<div style='margin-top:8px'><strong>Body (application/json)</strong>");
-                if (mt.getSchema() != null && mt.getSchema().get$ref() != null) {
-                    sb.append("<div>Schema: <code>")
-                      .append(esc(mt.getSchema().get$ref()))
-                      .append("</code></div>");
+                if (mt.getSchema() != null) {
+                    Schema<?> s = mt.getSchema();
+                    if (s.get$ref() != null) {
+                        sb.append("<div>Schema: <code>")
+                          .append(esc(s.get$ref()))
+                          .append("</code></div>");
+                    } else if (s.getType() != null) {
+                        sb.append("<div>Schema: <code>")
+                          .append(esc(s.getType()))
+                          .append("</code></div>");
+                    }
                 }
                 if (mt.getExample() != null) {
                     String ex = toPrettyJson(mt.getExample());
@@ -177,22 +185,37 @@ public class PdfDocService {
             }
         }
 
-        // Responses (z przykładami)
+        // Responses (schema + przykłady)
         if (op.getResponses() != null && !op.getResponses().isEmpty()) {
             sb.append("<div style='margin-top:8px'><strong>Odpowiedzi</strong>");
-            sb.append("<table><thead><tr><th>Status</th><th>Opis</th><th>Przykład</th></tr></thead><tbody>");
-            op.getResponses().forEach((code, resp) -> {
-                String ex = "";
-                if (resp.getContent() != null && resp.getContent().get("application/json") != null) {
-                    var mt = resp.getContent().get("application/json");
-                    if (mt.getExample() != null) ex = toPrettyJson(mt.getExample());
+            sb.append("<table><thead><tr><th>Status</th><th>Opis</th><th>Schema</th><th>Przykład</th></tr></thead><tbody>");
+            for (Map.Entry<String, ApiResponse> e : op.getResponses().entrySet()) {
+                String code = e.getKey();
+                ApiResponse resp = e.getValue();
+
+                String schemaTxt = "";
+                String exTxt = "";
+                if (resp.getContent() != null) {
+                    MediaType mt = resp.getContent().get("application/json");
+                    if (mt != null) {
+                        Schema<?> s = mt.getSchema();
+                        if (s != null) {
+                            if (s.get$ref() != null) schemaTxt = s.get$ref();
+                            else if (s.getType() != null) schemaTxt = s.getType();
+                        }
+                        if (mt.getExample() != null) {
+                            exTxt = toPrettyJson(mt.getExample());
+                        }
+                    }
                 }
+
                 sb.append("<tr>")
                   .append("<td>").append(esc(code)).append("</td>")
                   .append("<td>").append(esc(resp.getDescription())).append("</td>")
-                  .append("<td>").append(ex.isEmpty() ? "" : "<pre><code>"+esc(ex)+"</code></pre>").append("</td>")
+                  .append("<td>").append(schemaTxt.isEmpty() ? "" : "<code>"+esc(schemaTxt)+"</code>").append("</td>")
+                  .append("<td>").append(exTxt.isEmpty() ? "" : "<pre><code>"+esc(exTxt)+"</code></pre>").append("</td>")
                   .append("</tr>");
-            });
+            }
             sb.append("</tbody></table></div>");
         }
 
@@ -223,6 +246,55 @@ public class PdfDocService {
                 sb.append("</div>");
             }
         }
+
+        sb.append("</div>");
+    }
+
+    private void renderComponents(StringBuilder sb, Components components) {
+        if (components == null || components.getSchemas() == null || components.getSchemas().isEmpty()) return;
+
+        sb.append("<h2>Components / Schemas</h2>");
+        sb.append("<div class='schemas'>");
+
+        components.getSchemas().forEach((name, schema) -> {
+            sb.append("<h3>").append(esc(name)).append("</h3>");
+            // pokaż ogólny typ/ref
+            if (schema.get$ref() != null) {
+                sb.append("<div>Ref: <code>").append(esc(schema.get$ref())).append("</code></div>");
+            } else if (schema.getType() != null) {
+                sb.append("<div>Type: <code>").append(esc(schema.getType())).append("</code></div>");
+            }
+
+            // jeśli obiekt – pokaż pola
+            if (schema instanceof ObjectSchema obj) {
+                Map<String, Schema> props = obj.getProperties();
+                if (props != null && !props.isEmpty()) {
+                    sb.append("<table><thead><tr><th>Pole</th><th>Typ</th><th>Opis</th></tr></thead><tbody>");
+                    props.forEach((propName, propSchema) -> {
+                        String t = propSchema.get$ref() != null
+                                ? propSchema.get$ref()
+                                : (propSchema.getType() != null ? propSchema.getType() : "");
+                        String desc = propSchema.getDescription() != null ? propSchema.getDescription() : "";
+                        sb.append("<tr>")
+                          .append("<td>").append(esc(propName)).append("</td>")
+                          .append("<td>").append(t.isEmpty() ? "" : "<code>"+esc(t)+"</code>").append("</td>")
+                          .append("<td>").append(esc(desc)).append("</td>")
+                          .append("</tr>");
+                    });
+                    sb.append("</tbody></table>");
+                }
+            }
+
+            // jeśli tablica – pokaż typ elementu
+            if (schema instanceof ArraySchema arr) {
+                Schema<?> items = arr.getItems();
+                String it = (items != null && items.get$ref() != null) ? items.get$ref()
+                        : (items != null && items.getType() != null) ? items.getType() : "";
+                if (!it.isEmpty()) {
+                    sb.append("<div>Items: <code>").append(esc(it)).append("</code></div>");
+                }
+            }
+        });
 
         sb.append("</div>");
     }

@@ -4,18 +4,16 @@ import com.mariia.javaapi.code.CodeToDocsService;
 import com.mariia.javaapi.code.JavaSpringParser;
 import com.mariia.javaapi.code.ir.EndpointIR;
 import com.mariia.javaapi.uploads.UploadStorage;
+import com.mariia.javaapi.docs.PdfDocService;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import com.mariia.javaapi.docs.PdfDocService;
-
 
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -23,15 +21,16 @@ import java.util.zip.ZipOutputStream;
 @RequestMapping("/api/projects")
 public class ProjectDocsFromCodeController {
 
-
     private final UploadStorage storage;
     private final CodeToDocsService code2docs;
     private final JavaSpringParser parser = new JavaSpringParser();
     private final PdfDocService pdfDocService;
 
-
-
-    public ProjectDocsFromCodeController(UploadStorage storage, CodeToDocsService code2docs, PdfDocService pdfDocService) {
+    public ProjectDocsFromCodeController(
+            UploadStorage storage,
+            CodeToDocsService code2docs,
+            PdfDocService pdfDocService
+    ) {
         this.storage = storage;
         this.code2docs = code2docs;
         this.pdfDocService = pdfDocService;
@@ -41,7 +40,6 @@ public class ProjectDocsFromCodeController {
      * Generuje OpenAPI z kodu i zwraca:
      *  - mode=plain|rules|ai  -> pojedynczy YAML (attachment)
      *  - mode=all             -> ZIP z trzema plikami YAML (attachment)
-     *
      * level: short|medium|long (dla opisów)
      */
     @PostMapping(value = "/{id}/docs/from-code")
@@ -50,7 +48,6 @@ public class ProjectDocsFromCodeController {
             @RequestParam(defaultValue = "all") String mode,
             @RequestParam(defaultValue = "medium") String level
     ) throws Exception {
-
         Path projectDir = storage.resolveProjectDir(id);
         if (!Files.exists(projectDir)) {
             return ResponseEntity.status(404)
@@ -72,7 +69,6 @@ public class ProjectDocsFromCodeController {
         Path zipPath   = projectDir.resolve("openapi.all.zip");
 
         String m = (mode == null) ? "all" : mode.trim().toLowerCase(Locale.ROOT);
-
         switch (m) {
             case "plain": {
                 code2docs.generateYamlFromCode(
@@ -125,6 +121,124 @@ public class ProjectDocsFromCodeController {
         }
     }
 
+    /**
+     * Generuje PDF z wybranego trybu YAML (ai|rules|plain) lub ZIP z trzema PDF-ami (mode=all).
+     * Jeśli YAML nie istnieje – najpierw jest generowany.
+     */
+    @PostMapping(value = "/{id}/docs/pdf")
+    public ResponseEntity<byte[]> pdfFrom(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "ai") String mode,
+            @RequestParam(defaultValue = "medium") String level
+    ) throws Exception {
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body(("Project not found: " + id).getBytes());
+        }
+
+        // Ścieżki docelowe
+        Path plainYaml = projectDir.resolve("openapi.plain.yaml");
+        Path rulesYaml = projectDir.resolve("openapi.rules.yaml");
+        Path aiYaml    = projectDir.resolve("openapi.ai.yaml");
+
+        Path plainPdf = projectDir.resolve("openapi.plain.pdf");
+        Path rulesPdf = projectDir.resolve("openapi.rules.pdf");
+        Path aiPdf    = projectDir.resolve("openapi.ai.pdf");
+
+        // Jeśli któryś YAML nie istnieje, to generujemy
+        List<EndpointIR> endpoints = null; // parse tylko wtedy, gdy potrzebne
+        String m = (mode == null) ? "ai" : mode.trim().toLowerCase(Locale.ROOT);
+
+        if ("all".equals(m)) {
+            // Upewnij się, że wszystkie YAML-e są
+            if (!Files.exists(plainYaml) || !Files.exists(rulesYaml) || !Files.exists(aiYaml)) {
+                if (endpoints == null) endpoints = parser.parseProject(projectDir);
+                if (endpoints.isEmpty()) {
+                    return ResponseEntity.badRequest()
+                            .contentType(MediaType.TEXT_PLAIN)
+                            .body("No endpoints found in source code.".getBytes());
+                }
+                if (!Files.exists(plainYaml)) {
+                    code2docs.generateYamlFromCode(endpoints, "Project " + id, "none",   plainYaml, projectDir, CodeToDocsService.DescribeMode.PLAIN);
+                }
+                if (!Files.exists(rulesYaml)) {
+                    code2docs.generateYamlFromCode(endpoints, "Project " + id, level,   rulesYaml, projectDir, CodeToDocsService.DescribeMode.RULES);
+                }
+                if (!Files.exists(aiYaml)) {
+                    code2docs.generateYamlFromCode(endpoints, "Project " + id, level,   aiYaml,    projectDir, CodeToDocsService.DescribeMode.AI);
+                }
+            }
+
+            // Renderuj wszystkie PDF-y
+            pdfDocService.renderPdfFromYaml(plainYaml, plainPdf);
+            pdfDocService.renderPdfFromYaml(rulesYaml, rulesPdf);
+            pdfDocService.renderPdfFromYaml(aiYaml,    aiPdf);
+
+            // Zrób ZIP-a z PDF-ów
+            Path outZip = projectDir.resolve("openapi.all.pdf.zip");
+            zipFiles(outZip,
+                    new Path[]{plainPdf, rulesPdf, aiPdf},
+                    new String[]{"openapi.plain.pdf", "openapi.rules.pdf", "openapi.ai.pdf"});
+            return asAttachment(outZip, "openapi.all.pdf.zip", "application/zip");
+        }
+
+        // Jeden tryb: sprawdź YAML, ew. wygeneruj
+        Path yaml;
+        Path pdf;
+        String filename;
+
+        switch (m) {
+            case "plain":
+                yaml = plainYaml; pdf = plainPdf; filename = "openapi.plain.pdf";
+                if (!Files.exists(yaml)) {
+                    if (endpoints == null) endpoints = parser.parseProject(projectDir);
+                    if (endpoints.isEmpty()) {
+                        return ResponseEntity.badRequest()
+                                .contentType(MediaType.TEXT_PLAIN)
+                                .body("No endpoints found in source code.".getBytes());
+                    }
+                    code2docs.generateYamlFromCode(endpoints, "Project " + id, "none", yaml, projectDir, CodeToDocsService.DescribeMode.PLAIN);
+                }
+                break;
+            case "rules":
+                yaml = rulesYaml; pdf = rulesPdf; filename = "openapi.rules.pdf";
+                if (!Files.exists(yaml)) {
+                    if (endpoints == null) endpoints = parser.parseProject(projectDir);
+                    if (endpoints.isEmpty()) {
+                        return ResponseEntity.badRequest()
+                                .contentType(MediaType.TEXT_PLAIN)
+                                .body("No endpoints found in source code.".getBytes());
+                    }
+                    code2docs.generateYamlFromCode(endpoints, "Project " + id, level, yaml, projectDir, CodeToDocsService.DescribeMode.RULES);
+                }
+                break;
+            case "ai":
+            default:
+                yaml = aiYaml; pdf = aiPdf; filename = "openapi.ai.pdf";
+                if (!Files.exists(yaml)) {
+                    if (endpoints == null) endpoints = parser.parseProject(projectDir);
+                    if (endpoints.isEmpty()) {
+                        return ResponseEntity.badRequest()
+                                .contentType(MediaType.TEXT_PLAIN)
+                                .body("No endpoints found in source code.".getBytes());
+                    }
+                    code2docs.generateYamlFromCode(endpoints, "Project " + id, level, yaml, projectDir, CodeToDocsService.DescribeMode.AI);
+                }
+                break;
+        }
+
+        // Render jednego PDF-a
+        pdfDocService.renderPdfFromYaml(yaml, pdf);
+        byte[] bytes = Files.readAllBytes(pdf);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .contentType(MediaType.APPLICATION_PDF)
+                .body(bytes);
+    }
+
     // —— helpers ——
     private static ResponseEntity<byte[]> asAttachment(Path path, String filename, String contentType) throws IOException {
         byte[] bytes = Files.readAllBytes(path);
@@ -150,42 +264,4 @@ public class ProjectDocsFromCodeController {
             }
         }
     }
-
-    @PostMapping(value = "/{id}/docs/pdf")
-    public ResponseEntity<byte[]> pdfFromAi(
-            @PathVariable String id,
-            @RequestParam(defaultValue = "ai") String mode // na przyszłość
-    ) throws Exception {
-        Path projectDir = storage.resolveProjectDir(id);
-        if (!Files.exists(projectDir)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body(("Project not found: " + id).getBytes());
-        }
-        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
-        if (!Files.exists(aiYaml)) {
-            // Jeżeli nie ma jeszcze AI-YAML, spróbuj wygenerować:
-            List<EndpointIR> endpoints = parser.parseProject(projectDir);
-            if (endpoints.isEmpty()) {
-                return ResponseEntity.badRequest()
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body("No endpoints found in source code.".getBytes());
-            }
-            code2docs.generateYamlFromCode(
-                    endpoints, "Project " + id, "medium",
-                    aiYaml, projectDir, CodeToDocsService.DescribeMode.AI
-            );
-        }
-
-        Path outPdf = projectDir.resolve("openapi.ai.pdf");
-        pdfDocService.renderPdfFromYaml(aiYaml, outPdf);
-
-        byte[] bytes = Files.readAllBytes(outPdf);
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"openapi.ai.pdf\"")
-                .header(HttpHeaders.CACHE_CONTROL, "no-store")
-                .contentType(MediaType.APPLICATION_PDF)
-                .body(bytes);
-    }
-
 }

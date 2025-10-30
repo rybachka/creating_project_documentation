@@ -71,16 +71,41 @@ def _rule_based(payload: DescribeIn) -> DescribeOut:
 # =========================
 #   PROMPT → OLLAMA
 # =========================
-SCHEMA_TEXT = """Zwróć TYLKO poprawny JSON o schemacie:
-{
-  "mediumDescription": "string (1–3 zdania, po polsku, zwięźle)",
-  "notes": ["string","string","string"],
-  "examples": {
-    "requests": [{"curl": "curl -X ..."}],
-    "response": {"status": 200, "body": {}}
-  }
-}
-Reguły: dla endpointów tworzących zasoby użyj statusu 201; zawsze zwróć przynajmniej 1 przykład 'curl'.
+SCHEMA_TEXT = f"""
+Jesteś asystentem do tworzenia *krótkich i zrozumiałych* opisów API po polsku.
+
+WEJŚCIE (IR):
+- operationId: {{operation_id}}
+- method: {{method}}   # GET/POST/PUT/PATCH/DELETE
+- path: {{path}}
+- params: {{params_json}}        # lista: name, in, type, required, description?
+- requestBody: {{request_body_json}}  # schema + hinty (jeśli są)
+- returns: {{returns_json}}      # typ/description (jeśli są)
+- notes: {{notes_json}}          # krótkie punkty z komentarzy/Javadoc
+
+WYMAGANIA:
+1) Nigdy nie zwracaj placeholderów typu: "string (1–3 zdania…)" ani podobnych.
+   Jeśli brakuje danych, napisz krótki opis na podstawie nazwy endpointu i ścieżki.
+2) Zwróć JSON **dokładnie** w schemacie:
+{{
+  "mediumDescription": "1–3 zdania, naturalny polski, bez metatekstu",
+  "notes": ["• zwięzłe punkty (0–5) albo pusta lista"],
+  "examples": {{
+    "requests": ["curl ...", "... (0–2 szt.)"],
+    "response": {{"status": 200, "body": {{}}}}  # jeśli DELETE → preferuj 204 bez body
+  }}
+}}
+3) Statusy:
+   - POST: preferuj 201, jeśli tworzenie zasobu.
+   - DELETE: preferuj 204 bez body.
+4) Spójność parametrów:
+   - Jeśli method ∈ [POST, PUT, PATCH] i istnieje schema w requestBody → nie umieszczaj danych
+     domenowych w query (parametry o nazwach "request", "payload", "body", "dto", "file",
+     "avatar", "avatarFile" traktuj jako część body).
+5) Przykłady curl zwracaj jako wielolinijkowe polecenia (z backslashami).
+6) Bez komentarzy, bez dodatkowego tekstu – tylko JSON.
+
+ZWRÓĆ TYLKO JSON.
 """
 
 
