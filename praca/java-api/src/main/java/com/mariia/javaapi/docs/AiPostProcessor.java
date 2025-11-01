@@ -2,17 +2,15 @@ package com.mariia.javaapi.docs;
 
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.PathItem;
-import io.swagger.v3.oas.models.Paths;
 import io.swagger.v3.oas.models.Operation;
+import io.swagger.v3.oas.models.media.*;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.parameters.RequestBody;
-import io.swagger.v3.oas.models.media.Content;
-import io.swagger.v3.oas.models.media.MediaType;
-import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.responses.ApiResponses;
 import io.swagger.v3.oas.models.responses.ApiResponse;
 
 import java.util.*;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class AiPostProcessor {
@@ -26,15 +24,15 @@ public class AiPostProcessor {
 
     private static final Set<String> BODYish_NAMES = Set.of(
             "request","payload","body","dto","data","json",
-            "file","avatar","avatarFile","upload","content"
+            "file","avatar","avatarFile","avatarfile","upload","content"
     );
 
     public void apply(OpenAPI api) {
         if (api == null || api.getPaths() == null) return;
 
-        for (Map.Entry<String, io.swagger.v3.oas.models.PathItem> e : api.getPaths().entrySet()) {
+        for (Map.Entry<String, PathItem> e : api.getPaths().entrySet()) {
             final String path = e.getKey();
-            final io.swagger.v3.oas.models.PathItem pi = e.getValue();
+            final PathItem pi = e.getValue();
             if (pi == null) continue;
 
             processOperation(path, "GET",    pi.getGet(),    pi);
@@ -48,23 +46,29 @@ public class AiPostProcessor {
         }
     }
 
-    private void processOperation(String path, String method, Operation op, io.swagger.v3.oas.models.PathItem pi) {
+    private void processOperation(String path, String method, Operation op, PathItem pi) {
         if (op == null) return;
 
-        // 1) Placeholdery → usuń lub podmień krótkim opisem
+        // 1) Placeholdery → usuń / skróć
         scrubPlaceholders(op, path, method);
 
         // 2) Deduplikacja summary/description
         dedupeSummaryDescription(op);
 
-        // 3) Query vs Body (jeśli jest body, usuwamy „request/payload…” z query)
+        // 3) Query vs Body (jeśli jest body, usuń „request/payload…” z query)
         cleanupQueryVsBody(method, op);
 
-        // 4) Normalizacja examples/cURL
+        // 4) Normalizacja cURL
         normalizeCurlExamples(op);
 
-        // 5) Kody odpowiedzi (POST -> 201 gdy brak sensownej treści; DELETE -> 204)
+        // 4b) Walidacja cURL + filtr (po normalizacji)
+        validateAndFilterCurlExamples(method, path, op);
+
+        // 5) Kody odpowiedzi (POST→201 gdy pusto; DELETE→204)
         fixStatusesByHeuristics(method, op);
+
+        // 6) Delikatne doprecyzowania opisów dziedzinowych (orders/users) + sensowny summary
+        enrichDomainDescriptions(method, path, op);
     }
 
     // ————— 1) Placeholdery —————
@@ -75,13 +79,11 @@ public class AiPostProcessor {
         if (isPlaceholder(s)) s = "";
         if (isPlaceholder(d)) d = "";
 
-        // Jeżeli oba puste po czyszczeniu — zbuduj zwięzły opis z sygnatury
         if (s.isBlank() && d.isBlank()) {
             String base = humanizeFromPath(method, path);
             s = base;
-            d = ""; // pojedyncze zdanie zostawiamy jako summary; description niepotrzebny
+            d = "";
         }
-
         if (!Objects.equals(s, op.getSummary())) op.setSummary(blankToNull(s));
         if (!Objects.equals(d, op.getDescription())) op.setDescription(blankToNull(d));
     }
@@ -97,7 +99,6 @@ public class AiPostProcessor {
     }
 
     private String humanizeFromPath(String method, String path) {
-        // bardzo prosty humanizer
         String p = path == null ? "/" : path.trim();
         if (p.equals("/")) return method + " /";
         if (method.equalsIgnoreCase("GET")) {
@@ -111,7 +112,7 @@ public class AiPostProcessor {
         return method + " " + path;
     }
 
-    // ————— 2) Deduplikacja summary/description —————
+    // ————— 2) Deduplikacja —————
     private void dedupeSummaryDescription(Operation op) {
         String summary = safe(op.getSummary());
         String desc = safe(op.getDescription());
@@ -119,7 +120,6 @@ public class AiPostProcessor {
         if (summary.isBlank() && desc.isBlank()) return;
 
         if (summary.isBlank() && !desc.isBlank()) {
-            // summary = pierwsze zdanie opisu
             String[] sentences = splitSentences(desc);
             if (sentences.length <= 1) {
                 op.setSummary(desc.trim());
@@ -133,12 +133,10 @@ public class AiPostProcessor {
         }
 
         if (!summary.isBlank() && desc.isBlank()) {
-            // zostaw tylko summary
             op.setDescription(null);
             return;
         }
 
-        // obie istnieją — jeśli równe lub description zaczyna się summary → skróć
         String firstSentence = "";
         {
             String[] sentences = splitSentences(desc);
@@ -148,17 +146,16 @@ public class AiPostProcessor {
         if (summary.equals(desc) || summary.equals(firstSentence) || desc.startsWith(summary)) {
             String[] sentences = splitSentences(desc);
             if (sentences.length <= 1) {
-                op.setDescription(null); // jedno zdanie → tylko summary
+                op.setDescription(null);
             } else {
                 op.setSummary((sentences[0] + ".").trim());
-                op.setDescription(desc.trim()); // pełny opis zostaje
+                op.setDescription(desc.trim());
             }
         }
     }
 
     private String[] splitSentences(String text) {
         if (text == null || text.isBlank()) return new String[0];
-        // ostrożny split: kropka + spacja / koniec
         return text.trim().split("\\.\\s+|\\.$");
     }
 
@@ -171,7 +168,6 @@ public class AiPostProcessor {
         boolean hasJsonBody = bodyContent != null && bodyContent.get("application/json") != null;
 
         if (hasJsonBody) {
-            // usuń parametry w query, które wyglądają jak „body”
             List<Parameter> params = op.getParameters();
             if (params != null && !params.isEmpty()) {
                 List<Parameter> kept = new ArrayList<>();
@@ -180,7 +176,7 @@ public class AiPostProcessor {
                     String loc = safe(p.getIn());
                     String name = safe(p.getName());
                     if ("query".equals(loc) && BODYish_NAMES.contains(name)) {
-                        // pomijamy (usuwamy z query)
+                        // drop
                     } else {
                         kept.add(p);
                     }
@@ -188,8 +184,6 @@ public class AiPostProcessor {
                 op.setParameters(kept.isEmpty() ? null : kept);
             }
         } else if (isWrite) {
-            // brak body, a metoda jest „write” — jeżeli w query są parametry „request/payload…”
-            // utworzymy puste JSON body, a parametry zostawimy w query (bez migracji treści — to by wymagało mapowania typów).
             if (op.getParameters() != null) {
                 boolean foundBodyishInQuery = false;
                 for (Parameter p : op.getParameters()) {
@@ -202,7 +196,7 @@ public class AiPostProcessor {
                 if (foundBodyishInQuery) {
                     RequestBody newRb = new RequestBody();
                     Content c = new Content();
-                    c.addMediaType("application/json", new MediaType().schema(new Schema<>().type("object")));
+                    c.addMediaType("application/json", new io.swagger.v3.oas.models.media.MediaType().schema(new Schema<>().type("object")));
                     newRb.setContent(c);
                     op.setRequestBody(newRb);
                 }
@@ -225,10 +219,9 @@ public class AiPostProcessor {
             if (o == null) continue;
             String s = Objects.toString(o, "");
             s = s.replace("\\n", "\n").replace("\\\"", "\"").trim();
-            String multi = toMultilineCurl(s);
-            if (!multi.isBlank()) normalized.add(multi);
+            String t = toMultilineCurl(s);
+            if (!t.isBlank()) normalized.add(t);
         }
-
         if (!normalized.isEmpty()) {
             op.addExtension("x-request-examples", normalized);
         }
@@ -239,8 +232,6 @@ public class AiPostProcessor {
         if (t.isEmpty()) return t;
         if (!t.startsWith("curl")) return t;
 
-        // rozbij po -H / -d / -X / 'http'
-        // proste heurystyki: wstawiamy backslash na końcach linii
         List<String> parts = new ArrayList<>();
         StringBuilder cur = new StringBuilder();
         String[] tokens = t.split("\\s+");
@@ -264,35 +255,131 @@ public class AiPostProcessor {
         return out.toString();
     }
 
-    // ————— 5) Statusy dla odpowiedzi —————
+    // ————— 4b) Validator cURL + filtr —————
+    @SuppressWarnings("unchecked")
+    private void validateAndFilterCurlExamples(String method, String pathTemplate, Operation op) {
+        if (op.getExtensions() == null) return;
+        Object raw = op.getExtensions().get("x-request-examples");
+        if (!(raw instanceof List)) return;
+        List<?> src = (List<?>) raw;
+        if (src.isEmpty()) return;
+
+        List<String> ok = new ArrayList<>();
+        for (Object o : src) {
+            String curl = Objects.toString(o, "").trim();
+            if (curl.isEmpty()) continue;
+            if (isValidCurlExample(curl, method, pathTemplate)) ok.add(curl);
+        }
+        if (ok.isEmpty()) {
+            // usuń całkowicie, żeby PDF nie renderował „śmieci”
+            op.getExtensions().remove("x-request-examples");
+        } else {
+            op.addExtension("x-request-examples", ok);
+        }
+    }
+
+    private boolean isValidCurlExample(String curl, String expectedMethod, String pathTemplate) {
+        // 1) Zakaz '#' w host/path
+        if (curl.contains("://") && curl.contains("#")) return false;
+
+        // 2) Ustal metodę z -X <METHOD> lub domyślnie GET
+        String method = "GET";
+        Matcher m = Pattern.compile("(?i)\\s-?X\\s+([A-Z]+)").matcher(curl);
+        if (m.find()) method = m.group(1).toUpperCase(Locale.ROOT);
+        if (!curl.contains(" -X ") && curl.toLowerCase(Locale.ROOT).contains("--request")) {
+            Matcher m2 = Pattern.compile("(?i)--request\\s+([A-Z]+)").matcher(curl);
+            if (m2.find()) method = m2.group(1).toUpperCase(Locale.ROOT);
+        }
+        if (!method.equalsIgnoreCase(expectedMethod)) return false;
+
+        // 3) Wyciągnij URL
+        Matcher mu = Pattern.compile("(https?://\\S+)").matcher(curl);
+        if (!mu.find()) return false;
+        String url = mu.group(1);
+
+        // 4) Jeśli pathTemplate zawiera {var}, wymagamy segmentu zamiast query '?id='
+        // Budujemy regex na podstawie template: {xxx} -> ([^/]+)
+        String regexPath = Pattern.quote(pathTemplate);
+        regexPath = regexPath.replace("\\{", "{").replace("}", "}");
+        regexPath = regexPath.replaceAll("\\{[^}/]+}", "([^/]+)");
+        // Pozwól na prefix bazowego URL (domena itp.)
+        // np. https://api.example.com + /api/orders/123/items
+        String mustMatch = "https?://[^\\s]+?" + regexPath + "(?:\\?|$)";
+        if (!url.matches(mustMatch)) return false;
+
+        // 5) Dodatkowo: gdy w template występuje {id|orderId|userId}, zabroń '?id=' dla tego endpointu
+        if (pathTemplate.matches(".*\\{[^}]*id[^}]*}.*") && url.matches(".*\\?.*\\bid=.*")) return false;
+
+        return true;
+    }
+
+    // ————— 5) Statusy —————
     private void fixStatusesByHeuristics(String method, Operation op) {
         ApiResponses rs = op.getResponses();
         if (rs == null || rs.isEmpty()) return;
 
-        // Jeżeli POST i tylko 200 z pustą treścią → przemapuj na 201 Created
+        // POST: 200 (puste) → 201
         if ("POST".equalsIgnoreCase(method)) {
             ApiResponse r200 = rs.get("200");
             if (r200 != null && isEffectivelyEmpty(r200)) {
                 ApiResponse created = copyResponse(r200);
-                if (created.getDescription() == null || created.getDescription().isBlank()) {
-                    created.setDescription("Created");
-                }
+                if (safe(created.getDescription()).isBlank()) created.setDescription("Created");
                 rs.remove("200");
                 rs.addApiResponse("201", created);
             }
         }
 
-        // Jeżeli DELETE i odpowiedź ma puste body → pozwól 204 No Content
+        // DELETE: puste body → 204; usuń pozostałe 2xx
         if ("DELETE".equalsIgnoreCase(method)) {
             ApiResponse r200 = rs.get("200");
             if (r200 != null && isEffectivelyEmpty(r200)) {
-                ApiResponse noContent = new ApiResponse().description("No Content");
                 rs.remove("200");
-                rs.addApiResponse("204", noContent);
             }
+            if (rs.get("204") == null) {
+                rs.addApiResponse("204", new ApiResponse().description("No Content"));
+            }
+            rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
         }
     }
 
+    // ————— 6) Delikatne doprecyzowanie opisów —————
+    private void enrichDomainDescriptions(String method, String path, Operation op) {
+        String s = safe(op.getSummary());
+        String d = safe(op.getDescription());
+
+        boolean isOrders = path != null && path.contains("/api/orders");
+        boolean isUsers  = path != null && path.contains("/api/users");
+
+        if (isOrders) {
+            if (method.equalsIgnoreCase("GET") && path.endsWith("}")) {
+                if (s.isBlank()) op.setSummary("Pobierz zamówienie po identyfikatorze (UUID).");
+            }
+            if (method.equalsIgnoreCase("DELETE")) {
+                if (s.isBlank()) op.setSummary("Usuń zamówienie po identyfikatorze (UUID).");
+            }
+            if (method.equalsIgnoreCase("POST") && path.endsWith("/items")) {
+                if (s.isBlank()) op.setSummary("Dodaj pozycję do zamówienia.");
+                if (d.isBlank()) op.setDescription("Tworzy nową pozycję w zamówieniu wskazanym przez {orderId}. Prześlij JSON z polami „sku” i „qty”.");
+            }
+        }
+        if (isUsers) {
+            if (method.equalsIgnoreCase("GET") && path.endsWith("}")) {
+                if (s.isBlank()) op.setSummary("Pobierz użytkownika po identyfikatorze (UUID).");
+            }
+            if (method.equalsIgnoreCase("POST") && path.endsWith("/users")) {
+                if (s.isBlank()) op.setSummary("Utwórz nowego użytkownika.");
+                if (d.isBlank()) op.setDescription("Tworzy użytkownika na podstawie JSON w formacie CreateUserRequest.");
+            }
+        }
+
+        // jeżeli summary puste, spróbuj z 1. zdania description
+        if ((op.getSummary() == null || op.getSummary().isBlank()) && op.getDescription() != null && !op.getDescription().isBlank()) {
+            String fs = firstSentenceOf(op.getDescription());
+            if (!fs.isBlank()) op.setSummary(trim100(fs + "."));
+        }
+    }
+
+    // ————— Utils —————
     private boolean isEffectivelyEmpty(ApiResponse r) {
         if (r == null) return true;
         Content c = r.getContent();
@@ -300,8 +387,7 @@ public class AiPostProcessor {
         MediaType mt = c.get("application/json");
         if (mt == null) return true;
         Schema<?> s = mt.getSchema();
-        // bardzo ostrożna heurystyka: pusty object schema lub brak example
-        return (s == null) || ("object".equalsIgnoreCase(String.valueOf(s.getType())) && (mt.getExample() == null));
+        return (s == null) || ("object".equalsIgnoreCase(String.valueOf(s.getType())) && mt.getExample() == null);
     }
 
     private ApiResponse copyResponse(ApiResponse src) {
@@ -330,11 +416,14 @@ public class AiPostProcessor {
         return dst;
     }
 
-    // ————— Utils —————
-    private static String safe(String s) {
-        return s == null ? "" : s.trim();
-    }
-    private static String blankToNull(String s) {
-        return (s == null || s.isBlank()) ? null : s;
+    private static String safe(String s) { return s == null ? "" : s.trim(); }
+    private static String blankToNull(String s) { return (s == null || s.isBlank()) ? null : s; }
+    private static String trim100(String s) { return (s != null && s.length() > 100) ? s.substring(0, 100) + "…" : s; }
+    private static String firstSentenceOf(String text) {
+        if (text == null) return "";
+        String t = text.trim();
+        int idx = t.indexOf('.');
+        if (idx < 0) return t;
+        return t.substring(0, idx).trim();
     }
 }

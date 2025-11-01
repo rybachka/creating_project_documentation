@@ -1,24 +1,33 @@
 import React, { useEffect, useRef, useState } from "react";
 
 type HelloResponse = { message: string };
+
+// Zgodne z backendem (app.py -> DescribeOut)
 type DescribeOut = {
-  shortDescription: string;
   mediumDescription: string;
-  longDescription: string;
   paramDocs: { name: string; doc: string }[];
   returnDoc?: string | null;
-  // opcjonalnie: from AI
   notes?: string[];
-  examples?: any;
+  examples?: {
+    requests?: { curl: string }[];
+    response?: { status: number; body: any };
+  } | null;
 };
 
+// /nlp/healthz w aktualnym backendzie zwraca więcej pól; zostawiamy luźny kształt
 type Healthz = {
   status: string;
-  llm?: string;        // np. "llama3.1:8b-instruct-q4_K_M"
-  provider?: string;   // "ollama"
-  device?: string;     // np. "Apple M4 / Metal"
-  model_loaded?: boolean;
+  mode?: string;
+  debug?: boolean;
+  ollama?: {
+    base_url?: string;
+    model?: string;
+    options?: Record<string, unknown>;
+  };
 };
+
+type Level = "beginner" | "intermediate" | "advanced";
+type Mode = "plain" | "rules" | "ai" | "all";
 
 export default function App() {
   const [hello, setHello] = useState<HelloResponse | null>(null);
@@ -27,7 +36,7 @@ export default function App() {
   const [comment, setComment] = useState(
     "Zwraca użytkownika po ID. 404 gdy nie znaleziono."
   );
-  const [level, setLevel] = useState<"short" | "medium" | "long">("short");
+  const [level, setLevel] = useState<Level>("intermediate");
 
   // UI: status + licznik
   const [status, setStatus] = useState<string>("gotowa.");
@@ -57,9 +66,6 @@ export default function App() {
       .catch(console.error);
   }, [name]);
 
-  const audienceOf = (lvl: "short" | "medium" | "long") =>
-    lvl === "short" ? "beginner" : lvl === "long" ? "advanced" : "intermediate";
-
   const runNlp = async () => {
     const body = {
       symbol: "getUserById",
@@ -69,39 +75,58 @@ export default function App() {
       language: "pl",
       http: "GET",
       pathTemplate: "/api/users/{id}",
-      params: [{ name: "id", in: "path", type: "string", required: true, description: "Identyfikator" }],
+      params: [
+        {
+          name: "id",
+          in: "path",
+          type: "string",
+          required: true,
+          description: "Identyfikator",
+        },
+      ],
       returns: { type: "UserResponse", description: "Obiekt użytkownika" },
       notes: [],
-      todos: []
+      todos: [],
     };
 
     setNlp(null);
     setStatus("sprawdzam usługę NLP…");
     startTimer();
 
-    // healthcheck (Ollama LLM)
-    let health: Healthz | null = null;
+    // healthcheck
     try {
       const hr = await fetch("/nlp/healthz");
-      if (hr.ok) health = await hr.json();
-    } catch {}
-
-    if (!health) setStatus("usługa NLP niedostępna – spróbuję mimo to…");
-    else if (!health.model_loaded)
-      setStatus("rozgrzewam LLM (pierwsze wywołanie może potrwać)…");
-    else
-      setStatus(`LLM: ${health.llm ?? "unknown"} (${health.device ?? "cpu"}) – generuję opis…`);
+      if (hr.ok) {
+        const health: Healthz = await hr.json();
+        if (health?.ollama?.model) {
+          setStatus(
+            `LLM: ${health.ollama.model} – generuję opis dla poziomu ${level}…`
+          );
+        } else {
+          setStatus("usługa NLP osiągalna – generuję opis…");
+        }
+      } else {
+        setStatus("usługa NLP niedostępna – spróbuję mimo to…");
+      }
+    } catch {
+      setStatus("usługa NLP niedostępna – spróbuję mimo to…");
+    }
 
     try {
-      const r = await fetch(`/nlp/describe?mode=ollama&audience=${encodeURIComponent(audienceOf(level))}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
+      const r = await fetch(
+        `/nlp/describe?mode=ollama&audience=${encodeURIComponent(level)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }
+      );
 
       if (!r.ok) {
         if (r.status === 504) {
-          setStatus("serwer przekroczył czas oczekiwania (504) – model mógł się rozgrzewać.");
+          setStatus(
+            "serwer przekroczył czas oczekiwania (504) – model mógł się rozgrzewać."
+          );
         } else {
           setStatus(`błąd: ${r.status} ${r.statusText}`);
         }
@@ -119,14 +144,7 @@ export default function App() {
     }
   };
 
-  const pick = (d?: DescribeOut | null) =>
-    !d
-      ? ""
-      : level === "short"
-      ? d.shortDescription
-      : level === "medium"
-      ? d.mediumDescription
-      : d.longDescription;
+  const pickedText = (d?: DescribeOut | null) => (!d ? "" : d.mediumDescription || "");
 
   return (
     <div style={{ maxWidth: 900, margin: "2rem auto", fontFamily: "sans-serif" }}>
@@ -173,19 +191,57 @@ export default function App() {
         </label>
 
         <div style={{ marginBottom: 8 }}>
-          Poziom szczegółowości:&nbsp;
-          <select value={level} onChange={(e) => setLevel(e.target.value as any)}>
-            <option value="short">krótki</option>
-            <option value="medium">średni</option>
-            <option value="long">długi</option>
+          Poziom odbiorcy:&nbsp;
+          <select value={level} onChange={(e) => setLevel(e.target.value as Level)}>
+            <option value="beginner">beginner</option>
+            <option value="intermediate">intermediate</option>
+            <option value="advanced">advanced</option>
           </select>
           &nbsp;
           <button onClick={runNlp}>Generuj opis</button>
         </div>
 
-        <pre style={{ whiteSpace: "pre-wrap", background: "#f4f4f4", padding: 12 }}>
-          {pick(nlp) || 'Brak danych – kliknij „Generuj opis”.'}
-        </pre>
+        <div style={{ background: "#f4f4f4", padding: 12, borderRadius: 8 }}>
+          <h3 style={{ marginTop: 0 }}>Opis</h3>
+          <pre style={{ whiteSpace: "pre-wrap", marginTop: 0 }}>
+            {pickedText(nlp) || 'Brak danych – kliknij „Generuj opis”.'}
+          </pre>
+
+          {nlp?.notes && nlp.notes.length > 0 && (
+            <>
+              <h4>Notatki</h4>
+              <ul>
+                {nlp.notes.map((n, i) => (
+                  <li key={i}>{n}</li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {nlp?.examples && (
+            <>
+              {Array.isArray(nlp.examples.requests) &&
+                nlp.examples.requests.length > 0 && (
+                  <>
+                    <h4>Przykłady wywołań</h4>
+                    {nlp.examples.requests.map((r: any, i: number) => (
+                      <pre key={i} style={{ whiteSpace: "pre-wrap" }}>
+                        {(r && r.curl) || ""}
+                      </pre>
+                    ))}
+                  </>
+                )}
+              {nlp.examples.response && (
+                <>
+                  <h4>Przykładowa odpowiedź</h4>
+                  <pre style={{ whiteSpace: "pre-wrap" }}>
+                    {JSON.stringify(nlp.examples.response, null, 2)}
+                  </pre>
+                </>
+              )}
+            </>
+          )}
+        </div>
       </section>
 
       <section style={{ marginTop: 24 }}>
@@ -223,16 +279,23 @@ function UploadBox({
   const [res, setRes] = React.useState<UploadResult | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [genBusy, setGenBusy] = React.useState(false);
-  const [level, setLevel] = React.useState<"short" | "medium" | "long">("medium");
-  const [mode, setMode] = React.useState<"plain" | "rules" | "ai" | "all">("all");
 
-  // ⬇⬇⬇ DODANE: pobieranie PDF (AI)
-  const downloadPdfAi = async () => {
+  const [level, setLevel] = React.useState<Level | "all">("intermediate");
+  const [mode, setMode] = React.useState<Mode>("all");
+
+  // Pobieranie PDF (poziom + tryb jak w kontrolerze)
+  const downloadPdf = async () => {
     if (!res?.id) return;
-    parentSetStatus("generuję PDF (AI) z OpenAPI…");
+    parentSetStatus("generuję PDF…");
     parentStartTimer();
     try {
-      const r = await fetch(`/api/projects/${res.id}/docs/pdf`, { method: "POST" });
+      const params = new URLSearchParams();
+      params.set("mode", mode);
+      params.set("level", level as string); // "all" też dozwolone na backendzie
+
+      const r = await fetch(`/api/projects/${res.id}/docs/pdf?${params}`, {
+        method: "POST",
+      });
       if (!r.ok) {
         const text = await r.text().catch(() => "");
         parentSetStatus(`błąd generowania PDF: ${r.status}`);
@@ -240,9 +303,7 @@ function UploadBox({
         return;
       }
       const blob = await r.blob();
-      const cd = r.headers.get("Content-Disposition") || "";
-      const m = cd.match(/filename="?([^"]+)"?/i);
-      const filename = m?.[1] || "openapi.ai.pdf";
+      const filename = filenameFromCD(r, "openapi.pdf");
 
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -253,15 +314,13 @@ function UploadBox({
       a.remove();
       URL.revokeObjectURL(url);
 
-      parentSetStatus("PDF (AI) wygenerowany i pobrany ✓");
+      parentSetStatus("PDF pobrany ✓");
     } catch (e) {
       parentSetStatus(`błąd sieci podczas generowania PDF: ${String(e)}`);
     } finally {
       parentStopTimer();
     }
   };
-  // ⬆⬆⬆ KONIEC DODANEGO
-
 
   const onUpload = async () => {
     if (!file) return;
@@ -291,6 +350,8 @@ function UploadBox({
 
   const openEnriched = () => {
     if (!res?.id) return;
+    // backend enrichment (jeśli masz taki endpoint) może nadal używać short/medium/long;
+    // tu przekazujemy "level" w nowej skali (beginner/intermediate/advanced)
     window.open(`/api/projects/${res.id}/spec/enriched?level=${level}`, "_blank");
   };
 
@@ -304,8 +365,8 @@ function UploadBox({
     if (!res?.id) return;
     parentSetStatus(
       mode === "all"
-        ? "generuję dokumentację z kodu… (ZIP z 3 plikami)"
-        : `generuję dokumentację z kodu… (${mode})`
+        ? "generuję dokumentację z kodu… (ZIP trybów)"
+        : `generuję dokumentację z kodu… (${mode}${level === "all" ? ", all-levels" : ""})`
     );
     parentStartTimer();
     setGenBusy(true);
@@ -313,7 +374,7 @@ function UploadBox({
       const r = await fetch(
         `/api/projects/${res.id}/docs/from-code?mode=${encodeURIComponent(
           mode
-        )}&level=${encodeURIComponent(level)}`,
+        )}&level=${encodeURIComponent(level as string)}`,
         { method: "POST" }
       );
       if (!r.ok) {
@@ -328,51 +389,24 @@ function UploadBox({
       }
 
       const ct = r.headers.get("Content-Type") || "";
-      if (ct.includes("application/zip")) {
-        const blob = await r.blob();
-        const filename = filenameFromCD(r, "openapi.all.zip");
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-        parentSetStatus("ZIP pobrany ✓");
-        return;
-      }
-
-      const yamlText = await r.text();
-      if (yamlText.startsWith("{") || yamlText.startsWith("[")) {
-        console.warn("Otrzymano JSON — możliwe, że to mapa ścieżek plików.");
-        const blob = new Blob([yamlText], { type: "application/json" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "openapi.generated.json";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-        parentSetStatus("plik JSON pobrany (zamiast YAML) ✓");
-        return;
-      }
-
-      const blob = new Blob([yamlText], { type: "text/yaml" });
-      const filename =
-        mode === "plain"
+      const blob = await r.blob();
+      const filename = filenameFromCD(
+        r,
+        ct.includes("application/zip")
+          ? "openapi.zip"
+          : mode === "plain"
           ? "openapi.plain.yaml"
           : mode === "rules"
-          ? "openapi.rules.yaml"
+          ? `openapi.rules.${level}.yaml`
           : mode === "ai"
-          ? "openapi.ai.yaml"
-          : "openapi.generated.yaml";
-      const url = URL.createObjectURL(blob);
+          ? `openapi.ai.${level}.yaml`
+          : "openapi.generated.yaml"
+      );
 
+      const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = filenameFromCD(r, filename);
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -409,11 +443,12 @@ function UploadBox({
           </div>
 
           <div style={{ marginTop: 8 }}>
-            Poziom opisu:&nbsp;
+            Poziom odbiorcy:&nbsp;
             <select value={level} onChange={(e) => setLevel(e.target.value as any)}>
-              <option value="short">krótki</option>
-              <option value="medium">średni</option>
-              <option value="long">długi</option>
+              <option value="beginner">beginner</option>
+              <option value="intermediate">intermediate</option>
+              <option value="advanced">advanced</option>
+              <option value="all">all</option>
             </select>
           </div>
 
@@ -423,7 +458,7 @@ function UploadBox({
               <option value="plain">plain (bez opisów)</option>
               <option value="rules">rules (reguły)</option>
               <option value="ai">ai (Ollama / LLM)</option>
-              <option value="all">all (ZIP 3 plików)</option>
+              <option value="all">all (ZIP trybów)</option>
             </select>
           </div>
 
@@ -437,9 +472,9 @@ function UploadBox({
             <button onClick={generateFromCode} disabled={!res?.id || genBusy}>
               {genBusy ? "Generuję z kodu…" : "Wygeneruj z kodu"}
             </button>
-          <button onClick={downloadPdfAi} disabled={!res?.id}>
-            Pobierz PDF (AI)
-          </button>
+            <button onClick={downloadPdf} disabled={!res?.id}>
+              Pobierz PDF
+            </button>
           </div>
         </div>
       )}

@@ -61,6 +61,42 @@ public class PdfDocService {
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
+    private static String nz(String s) { return (s == null) ? "" : s; }
+
+    private static String getInfoLevel(OpenAPI api) {
+        if (api.getInfo() != null && api.getInfo().getExtensions() != null) {
+            Object v = api.getInfo().getExtensions().get("x-user-level");
+            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
+        }
+        return "intermediate";
+    }
+
+    private static String getOpLevel(Operation op, String fallback) {
+        if (op != null && op.getExtensions() != null) {
+            Object v = op.getExtensions().get("x-user-level");
+            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
+        }
+        return fallback;
+    }
+
+    private static String levelLabelPl(String lvl) {
+        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
+            case "beginner":    return "Poziom: początkujący";
+            case "advanced":    return "Poziom: zaawansowany";
+            case "intermediate":
+            default:            return "Poziom: średniozaawansowany";
+        }
+    }
+
+    private static String levelClass(String lvl) {
+        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
+            case "beginner":    return "lvl-beginner";
+            case "advanced":    return "lvl-advanced";
+            case "intermediate":
+            default:            return "lvl-intermediate";
+        }
+    }
+
     private static final String CSS = """
       @page { size: A4; margin: 24mm; }
       body{font-family: 'TimesCustom', serif; margin:0; color:#111; font-size:12pt;}
@@ -70,6 +106,10 @@ public class PdfDocService {
       h2{margin:18px 0 6px; padding-bottom:4px; border-bottom:1px solid #ddd; font-size:14pt;}
       .op{border:1px solid #e6e6e6;border-radius:8px;padding:10px;margin:8px 0}
       .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10pt;background:#eef}
+      .lvl-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10pt;margin-left:8px;border:1px solid #ddd}
+      .lvl-beginner{background:#e9f8ec}        /* delikatna zieleń */
+      .lvl-intermediate{background:#eef4ff}    /* delikatny niebieski */
+      .lvl-advanced{background:#fff2e6}        /* delikatny pomarańcz */
       .method{font-weight:700}
       .path{font-family: monospace}
       .notes,.examples{background:#fafafa;border:1px solid #eee;border-radius:6px;padding:8px;margin-top:8px}
@@ -87,9 +127,12 @@ public class PdfDocService {
           .append("<style>").append(CSS).append("</style>")
           .append("</head><body>");
 
-        String title = api.getInfo() != null ? api.getInfo().getTitle() : "API";
-        String ver   = api.getInfo() != null ? api.getInfo().getVersion() : "";
+        String title = api.getInfo() != null ? nz(api.getInfo().getTitle()) : "API";
+        String ver   = api.getInfo() != null ? nz(api.getInfo().getVersion()) : "";
         String spec  = api.getOpenapi() != null ? api.getOpenapi() : "3.x";
+
+        // poziom z Info.x-user-level
+        String infoLevel = getInfoLevel(api);
 
         sb.append("<header>");
         sb.append("<h1>").append(esc(title)).append("</h1>");
@@ -97,28 +140,35 @@ public class PdfDocService {
         if (!ver.isBlank()) {
             sb.append("<div class='muted'>Wersja: ").append(esc(ver)).append("</div>");
         }
+        // badge poziomu
+        sb.append("<div class='lvl-badge ").append(levelClass(infoLevel)).append("'>")
+          .append(esc(levelLabelPl(infoLevel)))
+          .append("</div>");
         sb.append("</header>");
 
         if (api.getPaths() != null) {
             api.getPaths().forEach((path, pathItem) -> {
                 sb.append("<h2><span class='path'>").append(esc(path)).append("</span></h2>");
-                renderOp(sb, "GET",   pathItem.getGet(),    path);
-                renderOp(sb, "POST",  pathItem.getPost(),   path);
-                renderOp(sb, "PUT",   pathItem.getPut(),    path);
-                renderOp(sb, "PATCH", pathItem.getPatch(),  path);
-                renderOp(sb, "DELETE",pathItem.getDelete(), path);
+                renderOp(sb, "GET",   pathItem.getGet(),    path, infoLevel);
+                renderOp(sb, "POST",  pathItem.getPost(),   path, infoLevel);
+                renderOp(sb, "PUT",   pathItem.getPut(),    path, infoLevel);
+                renderOp(sb, "PATCH", pathItem.getPatch(),  path, infoLevel);
+                renderOp(sb, "DELETE",pathItem.getDelete(), path, infoLevel);
             });
         }
 
-        // —— NOWE: pełna sekcja components/schemas na końcu dokumentu ——
+        // —— sekcja components/schemas na końcu dokumentu ——
         renderComponents(sb, api.getComponents());
 
         sb.append("</body></html>");
         return sb.toString();
     }
 
-    private void renderOp(StringBuilder sb, String method, Operation op, String path) {
+    private void renderOp(StringBuilder sb, String method, Operation op, String path, String infoLevel) {
         if (op == null) return;
+
+        // poziom dla tej operacji (nadpisuje nagłówny, jeśli ustawiony)
+        String opLevel = getOpLevel(op, infoLevel);
 
         sb.append("<div class='op'>");
         sb.append("<div class='badge'><span class='method'>")
@@ -126,6 +176,11 @@ public class PdfDocService {
           .append("</span> <span class='path'>")
           .append(esc(path))
           .append("</span></div>");
+
+        // badge poziomu per operacja
+        sb.append("<span class='lvl-badge ").append(levelClass(opLevel)).append("'>")
+          .append(esc(levelLabelPl(opLevel)))
+          .append("</span>");
 
         if (op.getSummary() != null && !op.getSummary().isBlank()) {
             sb.append("<div style='margin-top:6px'><strong>")
@@ -143,7 +198,7 @@ public class PdfDocService {
             sb.append("<div style='margin-top:8px'><strong>Parametry</strong>");
             sb.append("<table><thead><tr><th>Nazwa</th><th>W</th><th>Typ</th><th>Wymagany</th><th>Opis</th></tr></thead><tbody>");
             for (Parameter p : op.getParameters()) {
-                String typ = p.getSchema() != null
+                String typ = (p.getSchema() != null)
                         ? (p.getSchema().getType() == null ? "" : p.getSchema().getType())
                         : "";
                 sb.append("<tr>")

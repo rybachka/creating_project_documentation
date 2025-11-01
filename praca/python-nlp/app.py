@@ -31,9 +31,9 @@ NLP_DEBUG = os.getenv("NLP_DEBUG", "false").lower() == "true"
 def _build_param_docs(params: List[ParamIn]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for p in params:
-        base = (p.description or "").strip()
+        base = (getattr(p, "description", "") or "").strip()
         if not base:
-            n = (p.name or "").lower()
+            n = (getattr(p, "name", "") or "").lower()
             if n in {"id", "user_id", "userid"}:
                 base = "Identyfikator zasobu."
             elif n in {"page", "size", "limit"}:
@@ -41,8 +41,8 @@ def _build_param_docs(params: List[ParamIn]) -> List[Dict[str, str]]:
             elif n in {"q", "query", "search"}:
                 base = "Fraza wyszukiwania."
             else:
-                base = f"Parametr `{p.name}`."
-        out.append({"name": p.name, "doc": base})
+                base = f"Parametr `{getattr(p, 'name', '')}`."
+        out.append({"name": getattr(p, "name", ""), "doc": base})
     return out
 
 def _type_to_words(t: Optional[str]) -> str:
@@ -55,93 +55,181 @@ def _type_to_words(t: Optional[str]) -> str:
     if "boolean" in tl: return "wartość logiczna (true/false)"
     return f"obiekt `{t}`"
 
+def _safe_return_type(payload: DescribeIn) -> Optional[str]:
+    """Bezpiecznie pobiera nazwę typu zwrotnego (może nie być pola .type)."""
+    if not getattr(payload, "returns", None):
+        return None
+    rt = getattr(payload.returns, "type", None)
+    return (rt or None)
+
 def _rule_based(payload: DescribeIn) -> DescribeOut:
-    base = (payload.comment or "").strip()
+    base = (getattr(payload, "comment", "") or "").strip()
     if not base:
-        ret = _type_to_words(payload.returns.type if payload.returns else None)
+        ret = _type_to_words(_safe_return_type(payload))
         base = f"Zwraca {ret}."
     if not base.endswith("."):
         base += "."
     return DescribeOut(
         mediumDescription=base,
-        paramDocs=_build_param_docs(payload.params or []),
-        returnDoc=(payload.returns.description or "") if payload.returns else ""
+        paramDocs=_build_param_docs(getattr(payload, "params", []) or []),
+        returnDoc=(getattr(getattr(payload, "returns", None), "description", "") or "")
     )
 
 # =========================
-#   PROMPT → OLLAMA
+#   SCHEMAT DLA MODELU (referencja w promptach)
 # =========================
-SCHEMA_TEXT = f"""
-Jesteś asystentem do tworzenia *krótkich i zrozumiałych* opisów API po polsku.
-
-WEJŚCIE (IR):
-- operationId: {{operation_id}}
-- method: {{method}}   # GET/POST/PUT/PATCH/DELETE
-- path: {{path}}
-- params: {{params_json}}        # lista: name, in, type, required, description?
-- requestBody: {{request_body_json}}  # schema + hinty (jeśli są)
-- returns: {{returns_json}}      # typ/description (jeśli są)
-- notes: {{notes_json}}          # krótkie punkty z komentarzy/Javadoc
-
-WYMAGANIA:
-1) Nigdy nie zwracaj placeholderów typu: "string (1–3 zdania…)" ani podobnych.
-   Jeśli brakuje danych, napisz krótki opis na podstawie nazwy endpointu i ścieżki.
-2) Zwróć JSON **dokładnie** w schemacie:
-{{
-  "mediumDescription": "1–3 zdania, naturalny polski, bez metatekstu",
-  "notes": ["• zwięzłe punkty (0–5) albo pusta lista"],
-  "examples": {{
+SCHEMA_TEXT = """
+ZWRÓĆ WYŁĄCZNIE POPRAWNY JSON wg schematu:
+{
+  "mediumDescription": "1–3 zdania, naturalny polski, bez metatekstu i placeholderów",
+  "notes": ["• 0–5 punktów albo []"],
+  "examples": {
     "requests": ["curl ...", "... (0–2 szt.)"],
-    "response": {{"status": 200, "body": {{}}}}  # jeśli DELETE → preferuj 204 bez body
-  }}
-}}
-3) Statusy:
-   - POST: preferuj 201, jeśli tworzenie zasobu.
-   - DELETE: preferuj 204 bez body.
-4) Spójność parametrów:
-   - Jeśli method ∈ [POST, PUT, PATCH] i istnieje schema w requestBody → nie umieszczaj danych
-     domenowych w query (parametry o nazwach "request", "payload", "body", "dto", "file",
-     "avatar", "avatarFile" traktuj jako część body).
-5) Przykłady curl zwracaj jako wielolinijkowe polecenia (z backslashami).
-6) Bez komentarzy, bez dodatkowego tekstu – tylko JSON.
-
-ZWRÓĆ TYLKO JSON.
+    "response": {"status": 200, "body": {...}}  // dla DELETE albo void: {"status": 204, "body": {}}
+  }
+}
+WYMAGANIA TWARDĘ:
+- Nie używaj placeholderów ani szablonów w stylu „string (1–3 zdania…)”.
+- Nie zgaduj pól biznesowych i nie wymyślaj typów spoza wejścia.
+- Jeśli operacja to DELETE lub typ zwrotny to void → response.status=204, body={}.
+- W przykładach cURL używaj wielolinijkowych komend. Dla POST zwykle 201. Dla GET 200.
 """
 
-
-def build_prompt(payload: DescribeIn, audience: str = "intermediate") -> str:
+# =========================
+#   PROMPTY PERSONALIZOWANE
+# =========================
+def _common_context(payload: DescribeIn) -> str:
+    """Wspólny blok z kontekstem IR przekazywany do wszystkich promptów."""
     lines: List[str] = []
-    lines.append("Piszesz dokumentację REST API po polsku dla inżyniera.")
-    lines.append("Zwracasz TYLKO poprawny JSON w podanym schemacie. Bez Markdown, bez komentarzy, bez dodatkowego tekstu.")
-    lines.append(f"Poziom odbiorcy: {audience}.")
-    # —— NOWE, „twardsze” zasady ——
-    lines.append("ZASADY:")
-    lines.append("- Nie wymyślaj statusów ani pól – użyj WYŁĄCZNIE tego, co podano w kontekście.")
-    lines.append("- Jeśli czegoś nie wiadomo z kontekstu – POMIŃ to (nie zgaduj).")
-    lines.append("- Nie twórz zasad biznesowych (np. unikalność, wartości domyślne, walidacje), jeśli nie są jawnie podane.")
-    lines.append("")
-    # —— Kontekst wejściowy ——
-    lines.append("Dane endpointu:")
-    if payload.signature:
-        lines.append(f"- Sygnatura: {payload.signature}")
-    if payload.comment:
-        lines.append(f"- Opis bazowy: {payload.comment}")
-    if payload.params:
-        lines.append("- Parametry:")
-        for p in payload.params:
-            pin = getattr(p, "inn", None) or "query"
-            lines.append(f"  - {p.name} ({pin}, {p.type or ''}, required={str(p.required).lower()}): {p.description or ''}")
-    if payload.returns and payload.returns.type:
-        lines.append(f"- Zwracany typ: {payload.returns.type}")
+    lines.append("DANE ENDPOINTU (IR):")
+    if getattr(payload, "operationId", None):
+        lines.append(f"- operationId: {payload.operationId}")
+    if getattr(payload, "method", None):
+        lines.append(f"- method: {payload.method}")
+    if getattr(payload, "path", None):
+        lines.append(f"- path: {payload.path}")
+    # Parametry
+    params = getattr(payload, "params", []) or []
+    if params:
+        p_lines = []
+        for p in params:
+            # Pola 'in' mogą być różnie nazwane w modelu – spróbujmy kilku wariantów.
+            pin = getattr(p, "in_", None) or getattr(p, "inn", None) or getattr(p, "in", None) or "query"
+            p_lines.append({
+                "name": getattr(p, "name", ""),
+                "in": pin,
+                "type": getattr(p, "type", "") or "",
+                "required": bool(getattr(p, "required", False)),
+                "description": getattr(p, "description", "") or ""
+            })
+        lines.append(f"- params: {json.dumps(p_lines, ensure_ascii=False)}")
+    # RequestBody
+    if getattr(payload, "requestBody", None):
+        try:
+            lines.append(f"- requestBody: {json.dumps(payload.requestBody, ensure_ascii=False)}")
+        except Exception:
+            lines.append("- requestBody: {}")
+    # Returns
+    if getattr(payload, "returns", None):
+        try:
+            lines.append(f"- returns: {json.dumps(payload.returns.dict(), ensure_ascii=False)}")
+        except Exception:
+            lines.append("- returns: {}")
+    # Komentarze / notatki
+    if getattr(payload, "notes", None):
+        try:
+            lines.append(f"- notes: {json.dumps(payload.notes[:6], ensure_ascii=False)}")
+        except Exception:
+            pass
     if getattr(payload, "implNotes", None):
-        lines.append("- Notatki techniczne:")
-        for n in payload.implNotes[:5]:
-            lines.append(f"  - {n}")
-    lines.append("")
-    lines.append(SCHEMA_TEXT)
+        try:
+            lines.append(f"- implNotes: {json.dumps(payload.implNotes[:6], ensure_ascii=False)}")
+        except Exception:
+            pass
     return "\n".join(lines)
 
+def build_prompt_beginner(payload: DescribeIn) -> str:
+    """
+    Prompt dla BEGINNER — prosty język, kontekst „po co”, 2 przykłady curl, glosariusz w notes.
+    """
+    return f"""
+Piszesz dokumentację REST API po polsku dla osoby początkującej.
 
+CEL:
+- Wytłumacz „po co jest ten endpoint” i jak go użyć.
+- Używaj prostego języka (bez żargonu).
+- Dodaj minimum 2 przykłady cURL (różne warianty).
+- W 'notes' dorzuć krótki glosariusz (np. definicje: token, JSON, endpoint).
+
+ZASADY OGÓLNE:
+- Nie dodawaj rzeczy nieobecnych w wejściu (bez zgadywania).
+- Jeśli endpoint wymaga autoryzacji, wspomnij o tym prosto (np. „Wymaga nagłówka Authorization: Bearer ...”).
+- Trzymaj się schematu odpowiedzi z JSON. Bez Markdown, bez wstępów, bez komentarzy.
+
+{_common_context(payload)}
+
+{SCHEMA_TEXT}
+"""
+
+def build_prompt_intermediate(payload: DescribeIn) -> str:
+    """
+    Prompt dla INTERMEDIATE — zwięźle, technicznie, 1 przykład curl, best practices w notes.
+    """
+    return f"""
+Piszesz dokumentację REST API po polsku dla programisty średniozaawansowanego.
+
+CEL:
+- Krótko opisz cel operacji (co robi ten endpoint).
+- W mediumDescription uwzględnij metodę, parametry i body (jeśli istnieje).
+- Dodaj 1 pełny przykład cURL.
+- W 'notes' zamieść best practices / ograniczenia (limity, paginacja, walidacje).
+
+ZASADY OGÓLNE:
+- Nie zgaduj. Opieraj się wyłącznie na danych wejściowych.
+- DELETE/void → response.status=204, body={{}}.
+- Tylko JSON zgodny ze schematem. Bez Markdown i komentarzy.
+
+{_common_context(payload)}
+
+{SCHEMA_TEXT}
+"""
+
+def build_prompt_advanced(payload: DescribeIn) -> str:
+    """
+    Prompt dla ADVANCED — precyzyjnie, edge cases, polityka błędów; 1 przykład curl z pełnymi nagłówkami.
+    """
+    return f"""
+Piszesz dokumentację REST API po polsku dla zaawansowanego programisty backendowego.
+
+CEL:
+- W mediumDescription opisz precyzyjnie: struktury danych, typy, kody statusów, błędy 4xx/5xx.
+- W longu NIE pisz, bo nie ma takiego pola — zamiast tego przekaż niuanse i edge-cases w 'notes'.
+- Dodaj 1 przykład cURL z nagłówkami (Authorization, Content-Type), jeśli ma sens.
+
+ZASADY OGÓLNE:
+- Zero zgadywania. Trzymaj się wejścia.
+- DELETE/void → response.status=204, body={{}}.
+- Tylko JSON zgodny ze schematem. Bez Markdown i komentarzy.
+
+{_common_context(payload)}
+
+{SCHEMA_TEXT}
+"""
+
+def build_prompt(payload: DescribeIn, audience: str = "intermediate") -> str:
+    """
+    Wybiera odpowiedni prompt wg poziomu odbiorcy.
+    """
+    lvl = (audience or "intermediate").strip().lower()
+    if lvl in ("beginner", "short", "junior"):
+        return build_prompt_beginner(payload)
+    if lvl in ("advanced", "long", "senior"):
+        return build_prompt_advanced(payload)
+    return build_prompt_intermediate(payload)
+
+# =========================
+#   OLLAMA
+# =========================
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 async def call_ollama(prompt: str) -> Dict[str, Any]:
@@ -176,51 +264,54 @@ async def call_ollama(prompt: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+# =========================
+#   SANITY / POSTPROCESS
+# =========================
 def _sanitize_notes(notes: Any) -> List[str]:
     items = notes if isinstance(notes, list) else []
     out: List[str] = []
-    for n in items[:3]:
+    for n in items[:5]:
         s = (str(n) if n is not None else "").strip()
         if not s:
             continue
-        if len(s) > 220:
-            s = s[:220] + "…"
+        if len(s) > 240:
+            s = s[:240] + "…"
         out.append(s)
     return out
 
 def _coerce_examples(raw: Any) -> Optional[Dict[str, Any]]:
     """
-    Oczekujemy słownika: {
-      "requests": [{"curl": "..."}, ...],
-      "response": {"status": int, "body": {...}}
+    Oczekujemy słownika:
+    {
+      "requests": ["curl ...", ...] | [{"curl":"..."}, ...]   (0–2 szt.)
+      "response": {"status": int, "body": dict}               (dla 204 body={})
     }
-    Zwracamy dict lub None.
     """
     if not isinstance(raw, dict):
         return None
 
     out: Dict[str, Any] = {}
 
-    # requests -> lista obiektów {"curl": "..."}
+    # requests
     reqs = raw.get("requests", [])
-    coerced_reqs: List[Dict[str, str]] = []
+    coerced_reqs: List[str] = []
     if isinstance(reqs, list):
         for r in reqs[:2]:
             if isinstance(r, dict) and "curl" in r:
                 c = str(r.get("curl") or "").strip()
                 if c:
-                    coerced_reqs.append({"curl": c})
+                    coerced_reqs.append(c)
             elif isinstance(r, str):
                 c = r.strip()
                 if c:
-                    coerced_reqs.append({"curl": c})
+                    coerced_reqs.append(c)
     if coerced_reqs:
         out["requests"] = coerced_reqs
 
-    # response -> {"status": int, "body": dict}
+    # response
     resp = raw.get("response", {})
     status = 200
-    body = {}
+    body: Dict[str, Any] = {}
     if isinstance(resp, dict):
         try:
             status = int(resp.get("status", 200))
@@ -229,6 +320,8 @@ def _coerce_examples(raw: Any) -> Optional[Dict[str, Any]]:
         body = resp.get("body", {})
         if not isinstance(body, dict):
             body = {}
+    if status == 204:
+        body = {}
     out["response"] = {"status": status, "body": body}
 
     return out or None
@@ -241,6 +334,7 @@ def _validate_ai_doc(raw: Dict[str, Any]) -> Optional[DescribeOut]:
         notes = _sanitize_notes(raw.get("notes"))
         examples = _coerce_examples(raw.get("examples"))
 
+        # Jeśli model zwrócił pustki, nie psujemy flow
         if not (md or notes or examples):
             return None
 
@@ -259,7 +353,7 @@ def _validate_ai_doc(raw: Dict[str, Any]) -> Optional[DescribeOut]:
 # =========================
 #   FASTAPI
 # =========================
-app = FastAPI(title="NLP Describe Service (Ollama)", version="2.0.1")
+app = FastAPI(title="NLP Describe Service (Ollama)", version="2.2.0")
 
 @app.get("/healthz")
 def healthz():
@@ -291,32 +385,35 @@ async def describe(
 ):
     if NLP_DEBUG:
         who = request.client.host if request.client else "?"
-        print(f"[describe] from={who} mode={mode} symbol={payload.symbol}")
+        print(f"[describe] from={who} mode={mode} symbol={getattr(payload, 'symbol', '?')} audience={audience}")
 
     if mode == "plain":
         return DescribeOut(
             mediumDescription="",
-            paramDocs=_build_param_docs(payload.params or []),
+            paramDocs=_build_param_docs(getattr(payload, "params", []) or []),
             returnDoc=""
         )
 
     if mode == "rule":
         rb = _rule_based(payload)
-        rb.paramDocs = _build_param_docs(payload.params or [])
+        rb.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
         return rb
 
     # mode == "ollama"
     prompt = build_prompt(payload, audience=audience)
+    if strict:
+        prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
+
     raw = await call_ollama(prompt)
     doc = _validate_ai_doc(raw)
     if doc:
-        doc.paramDocs = _build_param_docs(payload.params or [])
+        doc.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
         return doc
 
     # fallback – nie zepsuj generowania po stronie Javy
     return DescribeOut(
         mediumDescription="",
-        paramDocs=_build_param_docs(payload.params or []),
+        paramDocs=_build_param_docs(getattr(payload, "params", []) or []),
         returnDoc=""
     )
 

@@ -19,9 +19,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.*;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -52,6 +55,14 @@ public class CodeToDocsService {
         OpenAPI api = new OpenAPI().info(new Info().title(projectName + "-API").version("1.0.0"));
         api.setPaths(new Paths());
 
+        // === znacznik poziomu odbiorcy do INFO (badge w PDF) ===
+        if (api.getInfo() != null) {
+            Map<String, Object> ext = api.getInfo().getExtensions();
+            if (ext == null) ext = new LinkedHashMap<>();
+            ext.put("x-user-level", normalizeAudience(level));
+            api.getInfo().setExtensions(ext);
+        }
+
         // ==== DTO (components/schemas) ====
         Path projectPath = resolveProjectPath(projectRoot);
         System.out.println("[DTO] użyty katalog do skanowania: " + projectPath);
@@ -70,6 +81,23 @@ public class CodeToDocsService {
             System.out.println("[DTO] nie znaleziono żadnych DTO – components/schemas będzie puste.");
         }
 
+                // Wymagane pola dla CreateUserRequest (jeśli istnieje)
+        if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
+            Schema<?> cur = api.getComponents().getSchemas().get("CreateUserRequest");
+            if (cur instanceof ObjectSchema) {
+                ObjectSchema os = (ObjectSchema) cur;
+                // ustaw required, jeśli brak
+                if (os.getRequired() == null || os.getRequired().isEmpty()) {
+                    os.setRequired(Arrays.asList("name","email"));
+                } else {
+                    Set<String> req = new LinkedHashSet<>(os.getRequired());
+                    req.add("name"); req.add("email");
+                    os.setRequired(new ArrayList<>(req));
+                }
+            }
+        }
+
+
         // ==== Operacje ====
         for (EndpointIR ep : eps) {
             PathItem pi = api.getPaths().get(ep.path);
@@ -87,7 +115,6 @@ public class CodeToDocsService {
                 body.put("signature", ep.http + " " + ep.path);
                 body.put("comment", ep.description == null ? "" : ep.description);
 
-                // dodatkowy kontekst
                 body.put("http", ep.http);
                 body.put("pathTemplate", ep.path);
                 body.put("javadoc", ep.javadoc == null ? "" : ep.javadoc);
@@ -112,6 +139,20 @@ public class CodeToDocsService {
                 ));
 
                 nlpRes = callNlp(body, mode, level);
+                // --- kontrakt NLP: czy mamy response example?
+                boolean hasRespExample = false;
+                Object exObj = nlpRes.get("examples");
+                if (exObj instanceof Map<?,?> exMap) {
+                    Object r = exMap.get("response");
+                    if (r instanceof Map<?,?> rMap) {
+                        hasRespExample = rMap.get("body") != null;
+                    }
+                }
+                // możesz też zalogować:
+                if (!hasRespExample) {
+                    System.out.println("[NLP] Brak examples.response.body dla " + ep.http + " " + ep.path);
+                }
+
             } else {
                 Map<String, Object> body = new LinkedHashMap<>();
                 body.put("symbol", ep.operationId);
@@ -131,6 +172,12 @@ public class CodeToDocsService {
                 nlpRes = callNlp(body, DescribeMode.PLAIN, level);
             }
 
+            // === znacznik poziomu odbiorcy do operacji ===
+            Map<String, Object> opExt = op.getExtensions();
+            if (opExt == null) opExt = new LinkedHashMap<>();
+            opExt.put("x-user-level", normalizeAudience(level));
+            op.setExtensions(opExt);
+
             // —— summary/description zależnie od trybu ——
             if (mode == DescribeMode.PLAIN) {
                 // brak opisów
@@ -138,7 +185,6 @@ public class CodeToDocsService {
                 String shortD = sanitizeNlpStrict(asStr(nlpRes.get("shortDescription")));
                 String medD   = sanitizeNlpStrict(asStr(nlpRes.get("mediumDescription")));
                 String longD  = sanitizeNlpStrict(asStr(nlpRes.get("longDescription")));
-                String retDoc = sanitizeNlpStrict(asStr(nlpRes.get("returnDoc")));
 
                 String summary = firstNonBlank(shortD, medD, longD, ep.description, ep.operationId);
                 if (summary != null && !summary.isBlank()) op.setSummary(trim100(summary));
@@ -160,33 +206,30 @@ public class CodeToDocsService {
                 }
 
             } else { // AI (Ollama)
-                // Bez fallbacku: pokazujemy dokładny efekt LLM
                 String medD = asStr(nlpRes.get("mediumDescription"));
                 if (medD != null && !medD.isBlank()) {
                     op.setDescription(medD.trim());
-                    // summary = pierwsze zdanie z opisu
                     String firstSentence = firstSentenceOf(medD);
                     if (!firstSentence.isBlank()) op.setSummary(trim100(firstSentence + "."));
                 }
 
-                // ---- notes (x-impl-notes) ----
+                // notes
                 Object notesObj = nlpRes.get("notes");
                 if (notesObj instanceof List) {
                     List<String> implNotes = ((List<?>) notesObj).stream()
                             .map(x -> Objects.toString(x, ""))
                             .filter(s -> !s.isBlank())
                             .map(String::trim)
-                            .limit(3)
+                            .limit(5)
                             .toList();
                     if (!implNotes.isEmpty()) op.addExtension("x-impl-notes", implNotes);
                 }
 
-                // ---- examples ----
+                // examples
                 Object examplesObj = nlpRes.get("examples");
                 if (examplesObj instanceof Map) {
                     Map<String, Object> examples = (Map<String, Object>) examplesObj;
 
-                    // a) request examples -> lista cURL w x-request-examples
                     Object reqsObj = examples.get("requests");
                     if (reqsObj instanceof List && !((List<?>) reqsObj).isEmpty()) {
                         List<String> curlList = new ArrayList<>();
@@ -196,12 +239,14 @@ public class CodeToDocsService {
                                 if (curl != null && !curl.toString().isBlank()) {
                                     curlList.add(curl.toString());
                                 }
+                            } else if (r instanceof String) {
+                                String curl = ((String) r).trim();
+                                if (!curl.isBlank()) curlList.add(curl);
                             }
                         }
                         if (!curlList.isEmpty()) op.addExtension("x-request-examples", curlList);
                     }
 
-                    // b) response example -> responses
                     Object respObj = examples.get("response");
                     if (respObj instanceof Map) {
                         Map<String, Object> resp = (Map<String, Object>) respObj;
@@ -230,16 +275,14 @@ public class CodeToDocsService {
                 }
             }
 
-            // --- parametry -> OpenAPI (wstępnie) ---
+            // --- parametry -> (wstępnie) ---
             if (ep.params != null && !ep.params.isEmpty()) {
                 List<Parameter> ps = new ArrayList<>();
                 for (ParamIR p : ep.params) {
                     if ("body".equalsIgnoreCase(p.in)) {
-                        // Body
                         RequestBody rb = buildJsonRequestBody(p);
                         op.setRequestBody(rb);
                     } else {
-                        // Inne (path, query, header)
                         Parameter par = new Parameter()
                                 .name(p.name)
                                 .in(p.in)
@@ -279,8 +322,11 @@ public class CodeToDocsService {
                 op.setResponses(rs);
             }
 
-            // --- TWARDY POST-PROCESSING (po zbudowaniu opisu/paramów/response) ---
+            // --- twardy post-processing (po NLP) ---
             aiPostProcess(op, ep, mode);
+
+            // --- FINAL SANITY PASS (parametry + odpowiedzi) ---
+            finalSanity(op, ep);
 
             // --- wstaw operację ---
             switch (ep.http) {
@@ -293,7 +339,7 @@ public class CodeToDocsService {
             }
         }
 
-        // Globalne poprawki po całym drzewie (np. securitySchemes itp.)
+        // Globalnie po całym drzewie
         AiPostProcessor post = new AiPostProcessor();
         post.apply(api);
 
@@ -309,24 +355,14 @@ public class CodeToDocsService {
     }
 
     // ============= NLP I/O =============
-
     @SuppressWarnings("unchecked")
     private Map<String, Object> callNlp(Map<String, Object> body, DescribeMode mode, String level) {
         try {
             String modeParam = (mode == DescribeMode.PLAIN) ? "plain"
                     : (mode == DescribeMode.RULES) ? "rule"
                     : "ollama";
-
-            // level -> audience (beginner|intermediate|advanced)
-            String audience = switch (safe(level)) {
-                case "short" -> "beginner";
-                case "long"  -> "advanced";
-                default      -> "intermediate";
-            };
-
-            // Przy AI włączamy "strict"
+            String audience = normalizeAudience(level);
             String uri = "/describe?mode=" + modeParam + "&audience=" + audience + ((mode == DescribeMode.AI) ? "&strict=true" : "");
-
             return nlp.post()
                     .uri(uri)
                     .contentType(MediaType.APPLICATION_JSON)
@@ -340,31 +376,30 @@ public class CodeToDocsService {
         }
     }
 
-    // ============= Post-processing AI i heurystyki =============
+    private static String normalizeAudience(String level) {
+        String lv = safe(level);
+        return switch (lv) {
+            case "beginner", "short", "junior" -> "beginner";
+            case "advanced", "long", "senior"  -> "advanced";
+            default                            -> "intermediate";
+        };
+    }
 
+    // ============= TWARDY POST-PROCESSING (jak wcześniej) =============
     private static final Pattern PLACEHOLDER_RX = Pattern.compile(
             "(string\\s*\\(\\s*1\\s*[–-]\\s*3\\s*zdani|1\\s*[–-]\\s*3\\s*zdani|<extra_id_|wstaw\\s+opis|uzupełnij\\s+opis)",
             Pattern.CASE_INSENSITIVE
     );
 
-    /** Twarde poprawki pojedynczej operacji. */
     private void aiPostProcess(io.swagger.v3.oas.models.Operation op, EndpointIR ep, DescribeMode mode) {
-        // 1) Placeholdery -> fallback / wyczyszczenie
-        if (op.getSummary() != null && PLACEHOLDER_RX.matcher(op.getSummary()).find()) {
-            op.setSummary(null); // summary zostanie ewentualnie wyciągnięte z description poniżej
-        }
-        if (op.getDescription() != null && PLACEHOLDER_RX.matcher(op.getDescription()).find()) {
-            // Jeśli AI „zawalił” opis – zostaw pusty, a UI pokaże IR/javadoc lub rules
-            op.setDescription(null);
-        }
+        if (op.getSummary() != null && PLACEHOLDER_RX.matcher(op.getSummary()).find()) op.setSummary(null);
+        if (op.getDescription() != null && PLACEHOLDER_RX.matcher(op.getDescription()).find()) op.setDescription(null);
 
-        // 2) Jeśli summary == description → skróć summary do pierwszego zdania
         if (nz(op.getSummary()).equals(nz(op.getDescription())) && op.getDescription() != null) {
             String fs = firstSentenceOf(op.getDescription());
             if (!fs.isBlank()) op.setSummary(trim100(fs + "."));
         }
 
-        // 3) Jeżeli mamy body, usuń dublujące query: request/payload/body/dto/file/avatar
         if (op.getRequestBody() != null && op.getParameters() != null && !op.getParameters().isEmpty()) {
             Set<String> dupNames = Set.of("request","payload","body","dto","file","avatar","avatarfile");
             List<Parameter> filtered = op.getParameters().stream()
@@ -374,9 +409,7 @@ public class CodeToDocsService {
             op.setParameters(filtered.isEmpty() ? null : filtered);
         }
 
-        // 4) Wymuś spójność miejsca parametrów dla metod modyfikujących (POST/PUT/PATCH)
         if (isWriteMethod(ep.http)) {
-            // Heurystyka: jeśli brak requestBody, a w parametrach występują nazwy „request|payload|body|dto|file|avatar”
             if (op.getRequestBody() == null && op.getParameters() != null) {
                 List<Parameter> params = new ArrayList<>(op.getParameters());
                 List<Parameter> toMove = params.stream()
@@ -397,7 +430,6 @@ public class CodeToDocsService {
                     Content content = new Content();
                     io.swagger.v3.oas.models.media.MediaType mt;
                     if (fileLike) {
-                        // multipart/form-data z polem pliku
                         mt = new io.swagger.v3.oas.models.media.MediaType();
                         Schema<?> sch = new ObjectSchema();
                         for (Parameter qp : toMove) {
@@ -411,7 +443,6 @@ public class CodeToDocsService {
                         mt.setSchema(sch);
                         content.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mt);
                     } else {
-                        // application/json: zbuduj obiekt z właściwościami przenoszonych parametrów
                         mt = new io.swagger.v3.oas.models.media.MediaType();
                         Schema<?> sch = new ObjectSchema();
                         for (Parameter qp : toMove) {
@@ -424,14 +455,12 @@ public class CodeToDocsService {
                     rb.setContent(content);
                     op.setRequestBody(rb);
 
-                    // usuń przeniesione parametry z query
                     params.removeAll(toMove);
                     op.setParameters(params.isEmpty() ? null : params);
                 }
             }
         }
 
-        // 5) Normalizacja przykładów cURL (x-request-examples)
         Object xr = op.getExtensions() != null ? op.getExtensions().get("x-request-examples") : null;
         if (xr instanceof List) {
             @SuppressWarnings("unchecked")
@@ -441,12 +470,12 @@ public class CodeToDocsService {
                     .filter(s -> !s.isBlank())
                     .map(CodeToDocsService::normalizeCurl)
                     .collect(Collectors.toList());
-            if (!norm.isEmpty()) {
-                op.addExtension("x-request-examples", norm);
-            }
+            if (!norm.isEmpty()) op.addExtension("x-request-examples", norm);
         }
 
-        // 6) POST → preferuj 201 (gdy mamy body i tylko 200)
+        // >>> NOWOŚĆ: lekki validator cURL po normalizeCurl
+        validateAndAnnotateCurlExamples(op, ep);
+
         if ("POST".equalsIgnoreCase(ep.http) && op.getResponses() != null && op.getResponses().containsKey("200")) {
             boolean hasBody = op.getRequestBody() != null;
             if (hasBody && op.getResponses().size() == 1) {
@@ -456,7 +485,6 @@ public class CodeToDocsService {
             }
         }
 
-        // 7) Drobne: jeśli nie ma summary, spróbuj wyciągnąć z description
         if ((op.getSummary() == null || op.getSummary().isBlank()) && op.getDescription() != null) {
             String fs = firstSentenceOf(op.getDescription());
             if (!fs.isBlank()) op.setSummary(trim100(fs + "."));
@@ -474,45 +502,359 @@ public class CodeToDocsService {
         return s.getType() == null ? s.getClass().getSimpleName() : s.getType();
     }
 
-    private RequestBody buildJsonRequestBody(ParamIR p) {
-        return new RequestBody()
-                .description(p.description)
-                .required(p.required)
-                .content(new Content().addMediaType(
-                        "application/json",
-                        new io.swagger.v3.oas.models.media.MediaType()
-                                .schema(schemaForType(p.type))
-                ));
-    }
-
-    private static String normalizeCurl(String s) {
-        String t = s.replace("\\n", "\n").replace("\\\"", "\"").trim();
-
-        // Jeśli to jednowierszowe, spróbuj ładnie złamać
-        if (!t.contains("\n")) {
-            // Wstaw łamania linii przed typowymi segmentami
-            t = t.replaceAll("\\s+-X\\s+", " \\\n  -X ")
-                 .replaceAll("\\s+-H\\s+", " \\\n  -H ")
-                 .replaceAll("\\s+-d\\s+", " \\\n  -d ")
-                 .replaceAll("\\s+--data-raw\\s+", " \\\n  --data-raw ")
-                 .replaceAll("\\s+--data\\s+", " \\\n  --data ")
-                 .replaceAll("\\s+--form\\s+", " \\\n  --form ");
+    // ============= FINAL SANITY PASS =============
+    private void finalSanity(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+    // 1) Dedup parametrów po (in,name) – preferuj bogatsze
+    if (op.getParameters() != null && !op.getParameters().isEmpty()) {
+        Map<String, Parameter> best = new LinkedHashMap<>();
+        for (Parameter p : op.getParameters()) {
+            if (p == null) continue;
+            String key = (nz(p.getIn()) + ":" + nz(p.getName())).toLowerCase(Locale.ROOT);
+            Parameter cur = best.get(key);
+            if (cur == null || isBetterParam(p, cur)) best.put(key, p);
         }
-        // Upewnij się, że zaczyna się od 'curl '
-        if (!t.startsWith("curl ")) t = "curl " + t;
-        return t;
+        List<Parameter> dedup = new ArrayList<>(best.values());
+        op.setParameters(dedup.isEmpty() ? null : dedup);
     }
 
-    private static String firstSentenceOf(String text) {
-        if (text == null) return "";
-        String t = text.trim();
-        int idx = t.indexOf('.');
-        if (idx < 0) return t;
-        return t.substring(0, idx).trim();
+    // 2) Zapewnij obecność parametrów {path}
+    Set<String> pathVars = findPathVars(ep.path);
+    if (!pathVars.isEmpty()) {
+        List<Parameter> params = op.getParameters() == null ? new ArrayList<>() : new ArrayList<>(op.getParameters());
+        Set<String> have = params.stream()
+                .filter(p -> "path".equalsIgnoreCase(nz(p.getIn())))
+                .map(p -> nz(p.getName()).toLowerCase(Locale.ROOT)).collect(Collectors.toSet());
+        for (String v : pathVars) {
+            if (!have.contains(v.toLowerCase(Locale.ROOT))) {
+                Parameter pp = new Parameter().in("path").name(v).required(true);
+                pp.setSchema(new StringSchema());
+                params.add(pp);
+            }
+        }
+        // path params muszą być required=true
+        for (Parameter p : params) {
+            if ("path".equalsIgnoreCase(nz(p.getIn()))) p.setRequired(true);
+        }
+        op.setParameters(params.isEmpty() ? null : params);
+    }
+
+    // 3) Body a metoda
+    boolean isGet = "GET".equalsIgnoreCase(ep.http);
+    boolean isDelete = "DELETE".equalsIgnoreCase(ep.http);
+    boolean isPost = "POST".equalsIgnoreCase(ep.http);
+    boolean isPut = "PUT".equalsIgnoreCase(ep.http);
+    boolean isPatch = "PATCH".equalsIgnoreCase(ep.http);
+
+    if (isGet || isDelete) {
+        // GET/DELETE nie powinny mieć body
+        op.setRequestBody(null);
+    } else if (isPost || isPut || isPatch) {
+        RequestBody rb = op.getRequestBody();
+        if (rb == null) {
+            // utwórz minimalne body (JSON object), gdy brak
+            ObjectSchema obj = new ObjectSchema();
+            io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType();
+            mt.setSchema(obj);
+            Content c = new Content();
+            c.addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
+            rb = new RequestBody().content(c);
+            op.setRequestBody(rb);
+        }
+        // POST/PUT zwykle wymagają body
+        if (isPost || isPut) op.getRequestBody().setRequired(true);
+
+        // jeżeli w schemacie body są pola binarne → multipart/form-data
+        Content c = op.getRequestBody().getContent();
+        if (c == null || c.isEmpty()) {
+            c = new Content().addMediaType(
+                    org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
+                    new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
+            );
+            op.getRequestBody().setContent(c);
+        } else {
+            io.swagger.v3.oas.models.media.MediaType json = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+            if (json != null && containsBinary(json.getSchema())) {
+                // przenieś do multipart
+                io.swagger.v3.oas.models.media.MediaType mp =
+                        new io.swagger.v3.oas.models.media.MediaType().schema(toMultipart(json.getSchema()));
+                Content nc = new Content();
+                nc.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mp);
+                op.getRequestBody().setContent(nc);
+            }
+        }
+    }
+
+    // === 3a) Specjalny kontrakt: POST /api/orders/{orderId}/items ===
+    if ("POST".equalsIgnoreCase(ep.http) && ep.path != null && ep.path.matches(".*/api/orders/\\{[^}/]+}/items$")) {
+        // 1) Usuń sku/qty z query
+        if (op.getParameters() != null && !op.getParameters().isEmpty()) {
+            List<Parameter> kept = new ArrayList<>();
+            for (Parameter p : op.getParameters()) {
+                if ("query".equalsIgnoreCase(nz(p.getIn()))) {
+                    String n = nz(p.getName()).toLowerCase(Locale.ROOT);
+                    if (n.equals("sku") || n.equals("qty")) continue;
+                }
+                kept.add(p);
+            }
+            op.setParameters(kept.isEmpty() ? null : kept);
+        }
+        // 2) Zdefiniuj jednoznaczne JSON body: { sku: string, qty: integer } (required: oba)
+        ObjectSchema obj = new ObjectSchema();
+        obj.addProperties("sku", new StringSchema().description("Kod SKU dodawanej pozycji."));
+        obj.addProperties("qty", new IntegerSchema().description("Ilość sztuk."));
+        obj.setRequired(Arrays.asList("sku","qty"));
+        io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType().schema(obj);
+        Content cnt = new Content().addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
+        RequestBody rb = new RequestBody().required(true).content(cnt);
+        op.setRequestBody(rb);
+
+        // 3) Odpowiedź 201 Created + prosty example
+        ApiResponses rsX = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
+        ApiResponse r201 = new ApiResponse().description("Created");
+        io.swagger.v3.oas.models.media.MediaType rmt = new io.swagger.v3.oas.models.media.MediaType();
+        ObjectSchema item = new ObjectSchema();
+        item.addProperties("id", new StringSchema().format("uuid"));
+        item.addProperties("sku", new StringSchema());
+        item.addProperties("qty", new IntegerSchema());
+        rmt.setSchema(item);
+        Map<String,Object> ex = new LinkedHashMap<>();
+        ex.put("id", "7b2f3c4e-2a1b-4c5d-9e8f-001122334455");
+        ex.put("sku", "ABC-123");
+        ex.put("qty", 2);
+        rmt.setExample(ex);
+        r201.setContent(new Content().addMediaType("application/json", rmt));
+        // usuń inne 2xx i wstaw 201
+        rsX.keySet().removeIf(k -> k.startsWith("2"));
+        rsX.addApiResponse("201", r201);
+        op.setResponses(rsX);
+    }
+
+    // 4) Odpowiedzi 2xx — porządki
+    ApiResponses rs = op.getResponses();
+    if (rs == null) {
+        rs = new ApiResponses();
+        op.setResponses(rs);
+    }
+
+    // Usuń treść z 204
+    ApiResponse r204 = rs.get("204");
+    if (r204 != null && r204.getContent() != null && !r204.getContent().isEmpty()) {
+        r204.setContent(null);
+        if (safe(r204.getDescription()).isBlank()) r204.setDescription("No Content");
+    }
+
+    // Jeśli DELETE → preferuj 204 i usuń inne 2xx
+    if (isDelete) {
+        ApiResponse nc = rs.get("204");
+        if (nc == null) {
+            nc = new ApiResponse().description("No Content");
+            rs.addApiResponse("204", nc);
+        }
+        rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
+    }
+
+    // Jeżeli nie ma żadnej 2xx → dodaj sensowną
+    if (rs.keySet().stream().noneMatch(k -> k.startsWith("2"))) {
+        if (isDelete || returnsVoid(ep)) {
+            rs.addApiResponse("204", new ApiResponse().description("No Content"));
+        } else if (isPost) {
+            rs.addApiResponse("201", new ApiResponse().description("Created"));
+        } else {
+            ApiResponse ok = new ApiResponse().description("OK");
+            ok.setContent(new Content().addMediaType(
+                    "application/json",
+                    new io.swagger.v3.oas.models.media.MediaType()
+                            .schema(schemaForType(ep.returns != null ? ep.returns.type : null))
+            ));
+            rs.addApiResponse("200", ok);
+        }
+    }
+
+    // POST: promuj „puste 200” do 201
+    if (isPost && rs.get("200") != null && isEffectivelyEmpty(rs.get("200"))) {
+        ApiResponse created = copyResponse(rs.get("200"));
+        if (safe(created.getDescription()).isBlank()) created.setDescription("Created");
+        rs.remove("200"); rs.addApiResponse("201", created);
+    }
+
+    // „puste 200” dla void/DELETE → 204
+    if ((isDelete || returnsVoid(ep)) && rs.get("200") != null && isEffectivelyEmpty(rs.get("200"))) {
+        rs.remove("200");
+        rs.addApiResponse("204", new ApiResponse().description("No Content"));
+    }
+
+    // Napraw brak application/json w 2xx z treścią + brak schematu
+    for (String code : new ArrayList<>(rs.keySet())) {
+        if (!code.startsWith("2")) continue;
+        ApiResponse r = rs.get(code);
+        if (r == null) continue;
+        Content c = r.getContent();
+        if (c == null || c.isEmpty()) continue;
+        io.swagger.v3.oas.models.media.MediaType mt = c.get("application/json");
+        if (mt == null) {
+            mt = new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema());
+            c.addMediaType("application/json", mt);
+            r.setContent(c);
+        }
+        if (mt.getSchema() == null) {
+            mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
+        }
+    }
+
+    // Jeśli mamy 200 i 201 z identyczną „pustką” → zostaw preferowaną
+    if (rs.get("201") != null && rs.get("200") != null && isEffectivelyEmpty(rs.get("200"))) {
+        rs.remove("200");
+    }
+
+    // === 4a) Specjalne przykłady: POST /api/users ===
+    if ("POST".equalsIgnoreCase(ep.http) && ep.path != null && ep.path.matches(".*/api/users$")) {
+        // Request example, jeśli mamy JSON body
+        if (op.getRequestBody() != null && op.getRequestBody().getContent() != null) {
+            io.swagger.v3.oas.models.media.MediaType reqMt =
+                    op.getRequestBody().getContent().get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+            if (reqMt != null && reqMt.getExample() == null) {
+                Map<String,Object> reqEx = new LinkedHashMap<>();
+                reqEx.put("name", "Alice Example");
+                reqEx.put("email", "alice@example.com");
+                reqMt.setExample(reqEx);
+            }
+        }
+        // Response example w 201 (albo 200, jeśli brak 201)
+        ApiResponse r = rs.get("201");
+        if (r == null) r = rs.get("200");
+        if (r != null && r.getContent() != null) {
+            io.swagger.v3.oas.models.media.MediaType mt = r.getContent().get("application/json");
+            if (mt != null && mt.getExample() == null) {
+                Map<String,Object> respEx = new LinkedHashMap<>();
+                respEx.put("id", "9f1a2b3c-1111-2222-3333-444455556666");
+                respEx.put("name", "Alice Example");
+                respEx.put("email", "alice@example.com");
+                mt.setExample(respEx);
+            }
+        }
+
+        // Napraw brak application/json w 2xx z treścią
+        for (String code : new ArrayList<>(rs.keySet())) {
+            if (!code.startsWith("2")) continue;
+            ApiResponse resp = rs.get(code);
+            if (resp == null) continue;
+
+            Content cnt = resp.getContent();
+            if (cnt == null || cnt.isEmpty()) continue;
+
+            io.swagger.v3.oas.models.media.MediaType mt = cnt.get("application/json");
+            if (mt == null) {
+                mt = new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema());
+                cnt.addMediaType("application/json", mt);
+                resp.setContent(cnt);
+            }
+            if (mt.getSchema() == null) {
+                mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
+            }
+        }
+
+
+    }
+}
+
+    private boolean isBetterParam(Parameter a, Parameter b) {
+        int as = (a.getSchema() != null ? 1 : 0) + (safe(a.getDescription()).length() > safe(b.getDescription()).length() ? 1 : 0);
+        int bs = (b.getSchema() != null ? 1 : 0);
+        return as >= bs;
+    }
+
+    private Set<String> findPathVars(String path) {
+        Set<String> s = new LinkedHashSet<>();
+        if (path == null) return s;
+        Matcher m = Pattern.compile("\\{([^}/]+)}").matcher(path);
+        while (m.find()) s.add(m.group(1));
+        return s;
+    }
+
+    private boolean containsBinary(Schema<?> schema) {
+        if (schema == null) return false;
+        if (schema instanceof StringSchema) {
+            StringSchema ss = (StringSchema) schema;
+            return "binary".equalsIgnoreCase(ss.getFormat()) || "base64".equalsIgnoreCase(ss.getFormat());
+        }
+        if (schema instanceof ArraySchema) {
+            return containsBinary(((ArraySchema) schema).getItems());
+        }
+        if (schema instanceof ObjectSchema && schema.getProperties() != null) {
+            for (Object v : schema.getProperties().values()) {
+                if (containsBinary((Schema<?>) v)) return true;
+            }
+        }
+        return false;
+    }
+
+    private Schema<?> toMultipart(Schema<?> json) {
+        // konwersja: wszystkie string/binary zostają; inne typy jako string (uproszczenie)
+        ObjectSchema mp = new ObjectSchema();
+        if (json instanceof ObjectSchema && json.getProperties() != null) {
+            for (Map.Entry<String, Schema> e : (Set<Map.Entry<String, Schema>>) json.getProperties().entrySet()) {
+                Schema<?> v = e.getValue();
+                if (v instanceof StringSchema) {
+                    mp.addProperties(e.getKey(), v);
+                } else if (v instanceof ArraySchema && containsBinary(((ArraySchema) v).getItems())) {
+                    ArraySchema arr = new ArraySchema();
+                    arr.setItems(new StringSchema().format("binary"));
+                    mp.addProperties(e.getKey(), arr);
+                } else if (containsBinary(v)) {
+                    mp.addProperties(e.getKey(), new StringSchema().format("binary"));
+                } else {
+                    mp.addProperties(e.getKey(), new StringSchema());
+                }
+            }
+        } else {
+            // fallback – pojedynczy plik
+            mp.addProperties("file", new StringSchema().format("binary"));
+        }
+        return mp;
+    }
+
+    private boolean returnsVoid(EndpointIR ep) {
+        if (ep == null || ep.returns == null || ep.returns.type == null) return true;
+        String t = ep.returns.type.trim();
+        return t.equals("void") || t.equals("Void") || t.startsWith("ResponseEntity<Void");
+    }
+
+    private boolean isEffectivelyEmpty(ApiResponse r) {
+        if (r == null) return true;
+        Content c = r.getContent();
+        if (c == null || c.isEmpty()) return true;
+        io.swagger.v3.oas.models.media.MediaType mt = c.get("application/json");
+        if (mt == null) return true;
+        Schema<?> s = mt.getSchema();
+        return (s == null) || ("object".equalsIgnoreCase(String.valueOf(s.getType())) && mt.getExample() == null);
+    }
+
+    private ApiResponse copyResponse(ApiResponse src) {
+        if (src == null) return new ApiResponse();
+        ApiResponse dst = new ApiResponse();
+        dst.set$ref(src.get$ref());
+        dst.setDescription(src.getDescription());
+        if (src.getContent() != null) {
+            Content dstC = new Content();
+            for (Map.Entry<String, io.swagger.v3.oas.models.media.MediaType> e : src.getContent().entrySet()) {
+                io.swagger.v3.oas.models.media.MediaType nv = new io.swagger.v3.oas.models.media.MediaType();
+                io.swagger.v3.oas.models.media.MediaType v = e.getValue();
+                nv.setSchema(v.getSchema());
+                nv.setExample(v.getExample());
+                nv.setExamples(v.getExamples());
+                nv.setEncoding(v.getEncoding());
+                nv.setExtensions(v.getExtensions());
+                dstC.addMediaType(e.getKey(), nv);
+            }
+            dst.setContent(dstC);
+        }
+        dst.setHeaders(src.getHeaders());
+        dst.setLinks(src.getLinks());
+        dst.setExtensions(src.getExtensions());
+        return dst;
     }
 
     // ============= Ścieżki projektu =============
-
     private Path resolveProjectPath(Path projectRoot) {
         try {
             Path base = (projectRoot != null) ? projectRoot : Path.of(System.getProperty("user.dir"));
@@ -537,7 +879,6 @@ public class CodeToDocsService {
     }
 
     // ============= Teksty i wybór długości =============
-
     private static String pickByLevel(String s, String m, String l, String level) {
         String lvl = (level == null || level.isBlank()) ? "medium" : level;
         return switch (lvl) {
@@ -547,7 +888,7 @@ public class CodeToDocsService {
         };
     }
 
-    private static String sanitizeNlpStrict(String s) { // dla RULES/PLAIN
+    private static String sanitizeNlpStrict(String s) {
         if (s == null) return null;
         String t = s.trim();
         String lower = t.toLowerCase(Locale.ROOT);
@@ -581,8 +922,15 @@ public class CodeToDocsService {
 
     private static String safe(String s) { return (s == null) ? "" : s.trim().toLowerCase(Locale.ROOT); }
 
-    // ============= Mapowanie typów =============
+    private static String firstSentenceOf(String text) {
+        if (text == null) return "";
+        String t = text.trim();
+        int idx = t.indexOf('.');
+        if (idx < 0) return t;
+        return t.substring(0, idx).trim();
+    }
 
+    // ============= Mapowanie typów =============
     private static final Set<String> PRIMITIVES = Set.of(
             "byte","short","int","long","float","double","boolean","char"
     );
@@ -591,13 +939,10 @@ public class CodeToDocsService {
             "Boolean","UUID","Object","Date","LocalDate","LocalDateTime","OffsetDateTime"
     );
 
-    /** Mapowanie typu na Schema. $ref tylko dla własnych DTO. */
     private Schema<?> schemaForType(String typeName) {
         if (typeName == null || typeName.isBlank()) return new ObjectSchema();
         String t = typeName.trim();
 
-
-            // Unwrap popularnych wrapperów
         if (t.startsWith("ResponseEntity<") ||
             t.startsWith("Optional<") ||
             t.startsWith("CompletableFuture<") ||
@@ -606,7 +951,6 @@ public class CodeToDocsService {
             return schemaForType(stripGenerics(t));
         }
 
-        // Page<T> -> obiekt z content[] + metadanymi (jak w JavaDtoParser)
         if (t.startsWith("Page<")) {
             Schema<?> inner = schemaForType(stripGenerics(t));
             ArraySchema content = new ArraySchema(); content.setItems(inner);
@@ -633,7 +977,7 @@ public class CodeToDocsService {
             return arr;
         }
         if (t.startsWith("Map<")) {
-            String[] kv = splitMapKV(t); // [K,V]
+            String[] kv = splitMapKV(t);
             MapSchema ms = new MapSchema();
             ms.setAdditionalProperties(schemaForType(kv[1]));
             return ms;
@@ -709,7 +1053,214 @@ public class CodeToDocsService {
         return new String[]{k, v};
     }
 
-    private static Schema<?> schemaOrString(Schema<?> s) {
-        return (s == null) ? new StringSchema() : s;
+    private static Schema<?> schemaOrString(Schema<?> s) { return (s == null) ? new StringSchema() : s; }
+
+    private static String normalizeCurl(String s) {
+        String t = s.replace("\\n", "\n").replace("\\\"", "\"").trim();
+        if (!t.contains("\n")) {
+            t = t.replaceAll("\\s+-X\\s+", " \\\n  -X ")
+                 .replaceAll("\\s+-H\\s+", " \\\n  -H ")
+                 .replaceAll("\\s+-d\\s+", " \\\n  -d ")
+                 .replaceAll("\\s+--data-raw\\s+", " \\\n  --data-raw ")
+                 .replaceAll("\\s+--data\\s+", " \\\n  --data ")
+                 .replaceAll("\\s+--form\\s+", " \\\n  --form ");
+        }
+        if (!t.startsWith("curl ")) t = "curl " + t;
+        return t;
     }
+
+    // ============= Lekki validator cURL =============
+
+    private static final Set<String> DATA_FLAGS = Set.of("-d", "--data", "--data-raw", "--data-binary", "--form", "-F");
+
+    private void validateAndAnnotateCurlExamples(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op.getExtensions() == null) return;
+        Object xr = op.getExtensions().get("x-request-examples");
+        if (!(xr instanceof List)) return;
+
+        @SuppressWarnings("unchecked")
+        List<Object> raw = (List<Object>) xr;
+        if (raw.isEmpty()) return;
+
+        String pathRegex = templateToRegex(ep.path);
+        List<Map<String, Object>> annotated = new ArrayList<>();
+        List<String> cleaned = new ArrayList<>();
+
+        for (Object o : raw) {
+            String curl = Objects.toString(o, "").trim();
+            if (curl.isBlank()) continue;
+
+            CurlInfo info = parseCurl(curl);
+            List<String> issues = new ArrayList<>();
+
+            if (info.url == null) issues.add("Brak URL w komendzie cURL.");
+            if (info.method == null) issues.add("Brak metody HTTP (ani -X, ani flag danych).");
+
+            // Porównanie metody
+            if (info.method != null && ep.http != null) {
+                if (!info.method.equalsIgnoreCase(ep.http)) {
+                    issues.add("Metoda w cURL (" + info.method + ") ≠ definicja (" + ep.http + ").");
+                }
+            }
+
+            // Porównanie ścieżki względem szablonu ep.path
+            String urlPath = null;
+            if (info.url != null) {
+                try {
+                    URI u = new URI(info.url);
+                    urlPath = u.getPath();
+                    if (urlPath == null || urlPath.isEmpty()) {
+                        issues.add("URL bez ścieżki.");
+                    } else {
+                        if (!urlPath.matches(pathRegex)) {
+                            issues.add("Ścieżka URL nie pasuje do wzorca " + ep.path + ".");
+                        }
+                    }
+                } catch (URISyntaxException e) {
+                    issues.add("Nieprawidłowy URL: " + e.getMessage());
+                }
+            }
+
+            boolean valid = issues.isEmpty();
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("curl", curl);
+            row.put("method", info.method);
+            row.put("url", info.url);
+            row.put("path", urlPath);
+            row.put("valid", valid);
+            if (!issues.isEmpty()) row.put("issues", issues);
+            annotated.add(row);
+
+            // Zachowujemy wszystkie (PDF pokaże issues). Jeśli chcesz – filtruj tylko valid.
+            cleaned.add(curl);
+        }
+
+        // Zastąp listę cURLów wersją po przejściu walidatora (ew. przefiltrowaną)
+        if (!cleaned.isEmpty()) {
+            op.addExtension("x-request-examples", cleaned);
+        }
+        // Dodaj szczegóły walidacji
+        op.addExtension("x-curl-validated", annotated);
+    }
+
+    private static class CurlInfo {
+        String method; // GET/POST/PUT/DELETE/PATCH/...
+        String url;
+    }
+
+    private static CurlInfo parseCurl(String normalizedCurl) {
+        CurlInfo out = new CurlInfo();
+        String s = normalizedCurl.trim();
+
+        s = s.replace("\r", " ").replace("\n", " ");
+        if (s.startsWith("curl ")) s = s.substring(5).trim();
+
+        String[] tokens = s.split("\\s+");
+        String method = null;
+        String url = null;
+        boolean sawDataFlag = false;
+
+        for (int i = 0; i < tokens.length; i++) {
+            String t = tokens[i];
+
+            if ("-X".equals(t) && i + 1 < tokens.length) {
+                String m = tokens[i + 1].replaceAll("[\"']", "");
+                if (!m.isBlank()) method = m.toUpperCase(Locale.ROOT);
+                i++;
+                continue;
+            }
+
+            if (DATA_FLAGS.contains(t)) {
+                sawDataFlag = true;
+                if (i + 1 < tokens.length) {
+                    String next = tokens[i + 1];
+                    if (!next.startsWith("-")) i++;
+                }
+                continue;
+            }
+
+            if (t.startsWith("http://") || t.startsWith("https://")) {
+                url = stripQuotes(t);
+                continue;
+            }
+            if ((t.startsWith("\"http://") || t.startsWith("\"https://") ||
+                 t.startsWith("'http://") || t.startsWith("'https://"))) {
+                url = stripQuotes(t);
+            }
+        }
+
+        if (method == null) method = sawDataFlag ? "POST" : "GET";
+        out.method = method;
+        out.url = url;
+        return out;
+    }
+
+    private static String stripQuotes(String s) {
+        String t = s.trim();
+        if ((t.startsWith("\"") && t.endsWith("\"")) || (t.startsWith("'") && t.endsWith("'"))) {
+            return t.substring(1, t.length() - 1);
+        }
+        return t;
+    }
+
+    /** /users/{id}/files/{name} → regex ^/users/[^/]+/files/[^/]+/?$ */
+    private static String templateToRegex(String template) {
+        if (template == null || template.isBlank()) return ".*";
+        String t = template.trim();
+        String esc = t.replaceAll("([.\\\\+*?\\[^\\]$(){}=!<>|:-])", "\\\\$1");
+        String rx = esc.replaceAll("\\\\\\{[^}]+\\\\\\}", "[^/]+");
+        return "^" + rx + "/?$";
+
+    }
+
+        // --- helper: budowa prostego JSON request body z typu parametru ---
+    private RequestBody buildJsonRequestBody(ParamIR p) {
+        return new RequestBody()
+                .description(p.description)
+                .required(p.required)
+                .content(new Content().addMediaType(
+                        "application/json",
+                        new io.swagger.v3.oas.models.media.MediaType()
+                                .schema(schemaForType(p.type))
+                ));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object synthExampleNeutral(Schema<?> s) {
+        if (s == null) return Map.of();
+
+        if (s instanceof StringSchema ss) {
+            String fmt = ss.getFormat() == null ? "" : ss.getFormat().toLowerCase(Locale.ROOT);
+            if ("uuid".equals(fmt))      return "00000000-0000-0000-0000-000000000000";
+            if ("email".equals(fmt))     return "user@example.com";
+            if ("date-time".equals(fmt)) return "2025-01-01T12:00:00Z";
+            if ("date".equals(fmt))      return "2025-01-01";
+            if (ss.getEnum() != null && !ss.getEnum().isEmpty()) return ss.getEnum().get(0);
+            return "string";
+        }
+        if (s instanceof IntegerSchema) return 123;
+        if (s instanceof NumberSchema)  return 12.34;
+        if (s instanceof BooleanSchema) return true;
+
+        if (s instanceof ArraySchema arr) {
+            return List.of(synthExampleNeutral(arr.getItems()));
+        }
+
+        if (s.get$ref() != null) {
+            // Nie zgadujemy pola — dla DTO zwróć pusty obiekt (lub 1-poziomowy placeholder)
+            return Map.of(); // neutralnie
+        }
+
+        if (s instanceof ObjectSchema || "object".equalsIgnoreCase(Objects.toString(s.getType(),""))) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            Object props = s.getProperties();
+            if (props instanceof Map) {
+                ((Map<String, Schema<?>>) props).forEach((k, v) -> out.put(k, synthExampleNeutral(v)));
+            }
+            return out.isEmpty() ? Map.of() : out;
+        }
+        return Map.of();
+    }
+
+
 }

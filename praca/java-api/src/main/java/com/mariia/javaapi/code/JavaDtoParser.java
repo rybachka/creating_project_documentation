@@ -4,17 +4,23 @@ import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParseResult;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.EnumDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
-import io.swagger.v3.oas.models.media.*;
+import com.github.javaparser.ast.body.RecordDeclaration;
+import io.swagger.v3.oas.models.media.ArraySchema;
+import io.swagger.v3.oas.models.media.BooleanSchema;
+import io.swagger.v3.oas.models.media.IntegerSchema;
+import io.swagger.v3.oas.models.media.MapSchema;
+import io.swagger.v3.oas.models.media.NumberSchema;
+import io.swagger.v3.oas.models.media.ObjectSchema;
+import io.swagger.v3.oas.models.media.Schema;
+import io.swagger.v3.oas.models.media.StringSchema;
 
 import java.io.IOException;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
-import com.github.javaparser.ast.body.RecordDeclaration;
-import io.swagger.v3.oas.models.media.*;
-import com.github.javaparser.ast.body.EnumDeclaration;
-
 
 public class JavaDtoParser {
 
@@ -50,8 +56,8 @@ public class JavaDtoParser {
 
             CompilationUnit cu = result.getResult().get();
 
+            // --- klasy DTO (pomijamy interfejsy i kontrolery) ---
             for (ClassOrInterfaceDeclaration clazz : cu.findAll(ClassOrInterfaceDeclaration.class)) {
-                // pomijamy interfejsy i kontrolery
                 if (clazz.isInterface() || clazz.getAnnotations().stream()
                         .anyMatch(a -> a.getNameAsString().matches("RestController|Controller")))
                     continue;
@@ -73,8 +79,7 @@ public class JavaDtoParser {
                 sink.put(className, schema);
             }
 
-
-
+            // --- rekordy Java ---
             for (RecordDeclaration rec : cu.findAll(RecordDeclaration.class)) {
                 String className = rec.getNameAsString();
                 ObjectSchema schema = new ObjectSchema();
@@ -82,13 +87,14 @@ public class JavaDtoParser {
 
                 Map<String, Schema> props = new LinkedHashMap<>();
                 rec.getParameters().forEach(p ->
-                    props.put(p.getNameAsString(), mapType(p.getType().asString()))
+                        props.put(p.getNameAsString(), mapType(p.getType().asString()))
                 );
 
                 schema.setProperties(props);
                 sink.put(className, schema);
             }
 
+            // --- enumy ---
             for (EnumDeclaration en : cu.findAll(EnumDeclaration.class)) {
                 String n = en.getNameAsString();
                 StringSchema s = new StringSchema();
@@ -98,7 +104,6 @@ public class JavaDtoParser {
                 s.setEnum(values);
                 sink.put(n, s);
             }
-
 
         } catch (Exception e) {
             System.err.println("Błąd parsowania DTO: " + file + " -> " + e.getMessage());
@@ -118,12 +123,13 @@ public class JavaDtoParser {
     private Schema mapType(String t) {
         if (t == null || t.isBlank()) return new ObjectSchema();
         String type = t.trim();
+
         // 1) Zdejmij najczęstsze wrappery generyczne:
         if (type.startsWith("ResponseEntity<") ||
-            type.startsWith("Optional<") ||
-            type.startsWith("CompletableFuture<") ||
-            type.startsWith("Mono<") ||
-            type.startsWith("Flux<")) {
+                type.startsWith("Optional<") ||
+                type.startsWith("CompletableFuture<") ||
+                type.startsWith("Mono<") ||
+                type.startsWith("Flux<")) {
             return mapType(stripGenerics(type)); // np. ResponseEntity<List<X>> -> List<X>
         }
 
@@ -138,13 +144,14 @@ public class JavaDtoParser {
             props.put("content", content);
             props.put("page", new IntegerSchema());
             props.put("size", new IntegerSchema());
-            props.put("totalElements", new IntegerSchema()); // możesz użyć IntegerSchema/NumberSchema
+            props.put("totalElements", new IntegerSchema());
             props.put("totalPages", new IntegerSchema());
             props.put("last", new BooleanSchema());
             page.setProperties(props);
             page.setName("Page«" + simpleName(stripGenerics(type)) + "»");
             return page;
         }
+
         if (type.endsWith("[]")) {
             ArraySchema arr = new ArraySchema();
             arr.setItems(mapType(type.substring(0, type.length() - 2)));
@@ -197,7 +204,8 @@ public class JavaDtoParser {
             case "LocalDateTime":
             case "OffsetDateTime":
             case "Date": return new StringSchema().format("date-time");
-            case "Object": default: return new ObjectSchema();
+            case "Object":
+            default: return new ObjectSchema();
         }
     }
 
@@ -208,12 +216,15 @@ public class JavaDtoParser {
         int dot = s.lastIndexOf('.');
         return (dot >= 0) ? s.substring(dot + 1) : s;
     }
+
     private static String stripGenerics(String g) {
         int lt = g.indexOf('<');
         int gt = g.lastIndexOf('>');
         if (lt >= 0 && gt > lt) return g.substring(lt + 1, gt).trim();
         return g;
     }
+
+    /** Rozdziela "Map<K,V>" na ["K","V"] z uwzględnieniem zagnieżdżeń. */
     private static String[] splitMapKV(String g) {
         String inner = stripGenerics(g);
         int depth = 0, commaPos = -1;
