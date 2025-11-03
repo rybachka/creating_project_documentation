@@ -38,6 +38,7 @@ public class ProjectDocsFromCodeController {
     /**
      * Generuje OpenAPI (AI) z kodu i zwraca pojedynczy plik: openapi.ai.yaml
      * Parametr level: beginner | intermediate | advanced (domyślnie: intermediate)
+     * Zwraca jako ZAŁĄCZNIK (download).
      */
     @PostMapping(value = "/{id}/docs/from-code")
     public ResponseEntity<byte[]> fromCode(
@@ -72,9 +73,9 @@ public class ProjectDocsFromCodeController {
     }
 
     /**
-     * Renderuje i zwraca PDF na podstawie AI YAML: openapi.ai.pdf
+     * Renderuje i ZWRACA PDF jako ZAŁĄCZNIK (download).
      * Jeżeli YAML nie istnieje – najpierw go generuje (AI).
-     * Parametr level: beginner | intermediate | advanced (domyślnie: intermediate)
+     * Parametr level: beginner | intermediate | advanced
      */
     @PostMapping(value = "/{id}/docs/pdf")
     public ResponseEntity<byte[]> pdfFrom(
@@ -91,7 +92,6 @@ public class ProjectDocsFromCodeController {
         Path aiYaml = projectDir.resolve("openapi.ai.yaml");
         Path aiPdf  = projectDir.resolve("openapi.ai.pdf");
 
-        // Jeśli YAML nie istnieje – wygeneruj go w AI dla wybranego poziomu
         if (!Files.exists(aiYaml)) {
             List<EndpointIR> endpoints = parser.parseProject(projectDir);
             if (endpoints.isEmpty()) {
@@ -109,6 +109,90 @@ public class ProjectDocsFromCodeController {
         // Render PDF z YAML
         pdfDocService.renderPdfFromYaml(aiYaml, aiPdf);
         return asAttachment(aiPdf, "openapi.ai.pdf", MediaType.APPLICATION_PDF_VALUE);
+    }
+
+    /* =========================
+       NOWE endpointy do PODGLĄDU
+       ========================= */
+
+    /**
+     * Web-podgląd PDF (Content-Disposition: inline).
+     * Jeśli PDF/YAML nie istnieją – generuje jak w /docs/pdf.
+     */
+    @GetMapping(value = "/{id}/docs/pdf", produces = MediaType.APPLICATION_PDF_VALUE)
+    public ResponseEntity<byte[]> viewPdfInline(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "intermediate") String level
+    ) throws Exception {
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body(("Project not found: " + id).getBytes());
+        }
+
+        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
+        Path aiPdf  = projectDir.resolve("openapi.ai.pdf");
+
+        if (!Files.exists(aiYaml)) {
+            List<EndpointIR> endpoints = parser.parseProject(projectDir);
+            if (endpoints.isEmpty()) {
+                return ResponseEntity.badRequest()
+                        .contentType(MediaType.TEXT_PLAIN)
+                        .body("No endpoints found in source code.".getBytes());
+            }
+            code2docs.generateYamlFromCode(
+                    endpoints, "Project " + id, normalizeAudience(level),
+                    aiYaml, projectDir,
+                    CodeToDocsService.DescribeMode.AI
+            );
+        }
+
+        if (!Files.exists(aiPdf)) {
+            pdfDocService.renderPdfFromYaml(aiYaml, aiPdf);
+        }
+
+        return asInline(aiPdf, "openapi.ai.pdf", MediaType.APPLICATION_PDF_VALUE);
+    }
+
+    /**
+     * Web-podgląd YAML (inline).
+     */
+    @GetMapping(value = "/{id}/docs/yaml", produces = "text/yaml")
+    public ResponseEntity<byte[]> viewYamlInline(@PathVariable String id) throws IOException {
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body(("Project not found: " + id).getBytes());
+        }
+        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
+        if (!Files.exists(aiYaml)) {
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body("YAML not found. Generate it first.".getBytes());
+        }
+        return asInline(aiYaml, "openapi.ai.yaml", "text/yaml");
+    }
+
+    /**
+     * Pobierz YAML (download) – wygodny bliźniaczy endpoint.
+     */
+    @GetMapping(value = "/{id}/docs/yaml/download")
+    public ResponseEntity<byte[]> downloadYaml(@PathVariable String id) throws IOException {
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body(("Project not found: " + id).getBytes());
+        }
+        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
+        if (!Files.exists(aiYaml)) {
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body("YAML not found. Generate it first.".getBytes());
+        }
+        return asAttachment(aiYaml, "openapi.ai.yaml", "text/yaml");
     }
 
     // —— helpers ——
@@ -129,6 +213,15 @@ public class ProjectDocsFromCodeController {
         byte[] bytes = Files.readAllBytes(path);
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .contentType(MediaType.parseMediaType(contentType))
+                .body(bytes);
+    }
+
+    private static ResponseEntity<byte[]> asInline(Path path, String filename, String contentType) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")
                 .header(HttpHeaders.CACHE_CONTROL, "no-store")
                 .contentType(MediaType.parseMediaType(contentType))
                 .body(bytes);

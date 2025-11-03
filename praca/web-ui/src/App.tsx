@@ -8,10 +8,13 @@ type DescribeOut = {
   paramDocs: { name: string; doc: string }[];
   returnDoc?: string | null;
   notes?: string[];
-  examples?: {
-    requests?: { curl: string }[];
-    response?: { status: number; body: any };
-  } | null;
+  examples?:
+    | {
+        // w UI obsługujemy tablicę obiektów { curl }, ale backend może odesłać też listę stringów
+        requests?: ({ curl: string } | string)[];
+        response?: { status: number; body: any };
+      }
+    | null;
 };
 
 // /nlp/healthz w aktualnym backendzie zwraca więcej pól; zostawiamy luźny kształt
@@ -144,7 +147,8 @@ export default function App() {
     }
   };
 
-  const pickedText = (d?: DescribeOut | null) => (!d ? "" : d.mediumDescription || "");
+  const pickedText = (d?: DescribeOut | null) =>
+    !d ? "" : d.mediumDescription || "";
 
   return (
     <div style={{ maxWidth: 900, margin: "2rem auto", fontFamily: "sans-serif" }}>
@@ -224,11 +228,14 @@ export default function App() {
                 nlp.examples.requests.length > 0 && (
                   <>
                     <h4>Przykłady wywołań</h4>
-                    {nlp.examples.requests.map((r: any, i: number) => (
-                      <pre key={i} style={{ whiteSpace: "pre-wrap" }}>
-                        {(r && r.curl) || ""}
-                      </pre>
-                    ))}
+                    {nlp.examples.requests.map((r: any, i: number) => {
+                      const curl = typeof r === "string" ? r : (r && r.curl) || "";
+                      return (
+                        <pre key={i} style={{ whiteSpace: "pre-wrap" }}>
+                          {curl}
+                        </pre>
+                      );
+                    })}
                   </>
                 )}
               {nlp.examples.response && (
@@ -322,6 +329,127 @@ function UploadBox({
     }
   };
 
+// NOWE: pokazanie PDF w nowej karcie z ekranem "generuję..." i licznikem
+const showPdfWeb = async () => {
+  if (!res?.id) return;
+
+  // 1) Pre-open karta (ominie blokadę popupów) i narysuj ekran "generuję..."
+  const newTab = window.open("", "_blank");
+  let tick: number | null = null;
+
+  const paintLoading = () => {
+    if (!newTab) return;
+    newTab.document.open();
+    newTab.document.write(`
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Generuję dokumentację…</title>
+          <style>
+            body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
+            .wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;background:#111827;color:#e5e7eb}
+            .box{padding:24px 28px;border-radius:12px;background:#1f2937;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+            .msg{font-size:18px}
+            .time{opacity:.8;margin-left:.35rem}
+            .dot{display:inline-block;width:.5rem;height:.5rem;background:#60a5fa;border-radius:9999px;margin-left:.35rem;animation:bounce 1s infinite alternate}
+            @keyframes bounce{to{transform:translateY(-3px)}}
+          </style>
+        </head>
+        <body>
+          <div class="wrap">
+            <div class="box">
+              <div class="msg">
+                Generuję PDF… <span id="t" class="time">0.0s</span><span class="dot"></span>
+              </div>
+            </div>
+          </div>
+        </body>
+      </html>
+    `);
+    newTab.document.close();
+  };
+
+  const startTickInNewTab = () => {
+    if (!newTab) return;
+    const t0 = Date.now();
+    stopTickInNewTab();
+    tick = window.setInterval(() => {
+      try {
+        const el = newTab.document.getElementById("t");
+        if (el) el.textContent = ((Date.now() - t0) / 1000).toFixed(1) + "s";
+      } catch {
+        // ignoruj: user mógł zamknąć kartę
+        stopTickInNewTab();
+      }
+    }, 100);
+  };
+  const stopTickInNewTab = () => {
+    if (tick) {
+      clearInterval(tick);
+      tick = null;
+    }
+  };
+
+  paintLoading();
+  startTickInNewTab();
+
+  // 2) Status w głównym UI
+  parentSetStatus("generuję PDF…");
+  parentStartTimer();
+
+  try {
+    const params = new URLSearchParams();
+    params.set("mode", mode);
+    params.set("level", level as string);
+
+    const r = await fetch(`/api/projects/${res.id}/docs/pdf?${params}`, {
+      method: "POST",
+    });
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      parentSetStatus(`błąd generowania PDF: ${r.status}`);
+      alert(`Błąd generowania PDF: ${r.status} ${r.statusText}\n${text}`);
+      if (newTab && !newTab.closed) newTab.close();
+      return;
+    }
+
+    // 3) Mamy PDF — wstaw go do tej samej karty jako <embed>, bez nawigacji
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+
+    if (newTab && !newTab.closed) {
+      stopTickInNewTab();
+      newTab.document.open();
+      newTab.document.write(`
+        <html>
+          <head><meta charset="utf-8"><title>Dokumentacja</title>
+            <style>html,body{height:100%;margin:0} .pdf{width:100%;height:100%;border:0}</style>
+          </head>
+          <body>
+            <embed class="pdf" src="${url}" type="application/pdf" />
+          </body>
+        </html>
+      `);
+      newTab.document.close();
+      newTab.focus();
+      parentSetStatus("PDF otwarty w nowej karcie ✓");
+      // Revoke po chwili, by nie odciąć renderera PDF
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } else {
+      // fallback: pop-up zablokowany – otwórz w tej karcie
+      window.location.href = url;
+    }
+  } catch (e) {
+    parentSetStatus(`błąd sieci podczas generowania PDF: ${String(e)}`);
+    if (newTab && !newTab.closed) newTab.close();
+  } finally {
+    stopTickInNewTab();
+    parentStopTimer();
+  }
+};
+
+
   const onUpload = async () => {
     if (!file) return;
     setBusy(true);
@@ -350,9 +478,12 @@ function UploadBox({
 
   const openEnriched = () => {
     if (!res?.id) return;
-    // backend enrichment (jeśli masz taki endpoint) może nadal używać short/medium/long;
-    // tu przekazujemy "level" w nowej skali (beginner/intermediate/advanced)
-    window.open(`/api/projects/${res.id}/spec/enriched?level=${level}`, "_blank");
+    // backend enrichment może nadal używać short/medium/long; tu przekazujemy nową skalę
+    window.open(
+      `/api/projects/${res.id}/spec/enriched?level=${level}`,
+      "_blank",
+      "noopener"
+    );
   };
 
   const filenameFromCD = (r: Response, fallback: string) => {
@@ -366,7 +497,9 @@ function UploadBox({
     parentSetStatus(
       mode === "all"
         ? "generuję dokumentację z kodu… (ZIP trybów)"
-        : `generuję dokumentację z kodu… (${mode}${level === "all" ? ", all-levels" : ""})`
+        : `generuję dokumentację z kodu… (${mode}${
+            level === "all" ? ", all-levels" : ""
+          })`
     );
     parentStartTimer();
     setGenBusy(true);
@@ -474,6 +607,9 @@ function UploadBox({
             </button>
             <button onClick={downloadPdf} disabled={!res?.id}>
               Pobierz PDF
+            </button>
+            <button onClick={showPdfWeb} disabled={!res?.id}>
+              Pokaż dokumentację
             </button>
           </div>
         </div>
