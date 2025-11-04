@@ -3,6 +3,7 @@ package com.mariia.javaapi.docs;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.PathItem;
 import io.swagger.v3.oas.models.Operation;
+import io.swagger.v3.oas.models.headers.Header;
 import io.swagger.v3.oas.models.media.*;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.parameters.RequestBody;
@@ -55,7 +56,7 @@ public class AiPostProcessor {
         // 2) Deduplikacja summary/description
         dedupeSummaryDescription(op);
 
-        // 3) Query vs Body (jeśli jest body, usuń „request/payload…” z query)
+        // 3) GET/POST body & query porządek + ostrzeżenia
         cleanupQueryVsBody(method, op);
 
         // 4) Normalizacja cURL
@@ -64,7 +65,7 @@ public class AiPostProcessor {
         // 4b) Walidacja cURL + filtr (po normalizacji)
         validateAndFilterCurlExamples(method, path, op);
 
-        // 5) Kody odpowiedzi (POST→201 gdy pusto; DELETE→204)
+        // 5) Kody odpowiedzi (POST→201 + Location; DELETE→204)
         fixStatusesByHeuristics(method, op);
 
         // 6) Delikatne doprecyzowania opisów dziedzinowych (orders/users) + sensowny summary
@@ -159,15 +160,24 @@ public class AiPostProcessor {
         return text.trim().split("\\.\\s+|\\.$");
     }
 
-    // ————— 3) Query vs Body —————
+    // ————— 3) Query vs Body + ostrzeżenia (krok 2) —————
     private void cleanupQueryVsBody(String method, Operation op) {
         boolean isWrite = "POST".equalsIgnoreCase(method) || "PUT".equalsIgnoreCase(method) || "PATCH".equalsIgnoreCase(method);
 
         RequestBody rb = op.getRequestBody();
         Content bodyContent = (rb != null) ? rb.getContent() : null;
-        boolean hasJsonBody = bodyContent != null && bodyContent.get("application/json") != null;
+        boolean hasBody = bodyContent != null && !bodyContent.isEmpty();
+        boolean hasJsonBody = hasBody && bodyContent.get("application/json") != null;
 
-        if (hasJsonBody) {
+        // [RULE] GET nie może mieć body → usuń body + warning
+        if ("GET".equalsIgnoreCase(method) && hasBody) {
+            op.setRequestBody(null);
+            addOpWarning(op, "GET body removed: filtry przenieś do query.");
+            return;
+        }
+
+        // [RULE] jeśli mamy body JSON w metodzie zapisu → usuń zduplikowane 'request/payload' w query
+        if (hasJsonBody && isWrite) {
             List<Parameter> params = op.getParameters();
             if (params != null && !params.isEmpty()) {
                 List<Parameter> kept = new ArrayList<>();
@@ -176,32 +186,40 @@ public class AiPostProcessor {
                     String loc = safe(p.getIn());
                     String name = safe(p.getName());
                     if ("query".equals(loc) && BODYish_NAMES.contains(name)) {
-                        // drop
+                        // drop param
                     } else {
                         kept.add(p);
                     }
                 }
                 op.setParameters(kept.isEmpty() ? null : kept);
             }
-        } else if (isWrite) {
-            if (op.getParameters() != null) {
-                boolean foundBodyishInQuery = false;
-                for (Parameter p : op.getParameters()) {
-                    if (p == null) continue;
-                    if ("query".equalsIgnoreCase(safe(p.getIn())) && BODYish_NAMES.contains(safe(p.getName()))) {
-                        foundBodyishInQuery = true;
-                        break;
-                    }
-                }
-                if (foundBodyishInQuery) {
-                    RequestBody newRb = new RequestBody();
-                    Content c = new Content();
-                    c.addMediaType("application/json", new io.swagger.v3.oas.models.media.MediaType().schema(new Schema<>().type("object")));
-                    newRb.setContent(c);
-                    op.setRequestBody(newRb);
-                }
+            return;
+        }
+
+        // [HINT] POST bez body i same query → ostrzeż, że to wygląda na GET/search
+        if ("POST".equalsIgnoreCase(method) && !hasBody) {
+            boolean anyQuery = op.getParameters() != null
+                    && op.getParameters().stream().anyMatch(p -> "query".equalsIgnoreCase(safe(p.getIn())));
+            if (anyQuery) {
+                addOpWarning(op, "POST bez body, z filtrami w query — rozważ GET (lub POST /.../search z body dla filtrów złożonych).");
             }
         }
+    }
+
+    private void addOpWarning(Operation op, String msg) {
+        if (op == null) return;
+        Map<String, Object> ext = op.getExtensions();
+        if (ext == null) { ext = new LinkedHashMap<>(); op.setExtensions(ext); }
+        List<String> warns;
+        Object existing = ext.get("x-warnings");
+        if (existing instanceof List) {
+            //noinspection unchecked
+            warns = new ArrayList<>((List<String>) existing);
+        } else {
+            warns = new ArrayList<>();
+        }
+        warns.add(msg);
+        ext.put("x-warnings", warns);
     }
 
     // ————— 4) Normalizacja cURL —————
@@ -298,39 +316,29 @@ public class AiPostProcessor {
         String url = mu.group(1);
 
         // 4) Jeśli pathTemplate zawiera {var}, wymagamy segmentu zamiast query '?id='
-        // Budujemy regex na podstawie template: {xxx} -> ([^/]+)
         String regexPath = Pattern.quote(pathTemplate);
         regexPath = regexPath.replace("\\{", "{").replace("}", "}");
         regexPath = regexPath.replaceAll("\\{[^}/]+}", "([^/]+)");
-        // Pozwól na prefix bazowego URL (domena itp.)
-        // np. https://api.example.com + /api/orders/123/items
         String mustMatch = "https?://[^\\s]+?" + regexPath + "(?:\\?|$)";
         if (!url.matches(mustMatch)) return false;
 
-        // 5) Dodatkowo: gdy w template występuje {id|orderId|userId}, zabroń '?id=' dla tego endpointu
+        // 5) Dodatkowo: dla szablonu z {id...} zabroń '?id='
         if (pathTemplate.matches(".*\\{[^}]*id[^}]*}.*") && url.matches(".*\\?.*\\bid=.*")) return false;
 
         return true;
     }
 
-    // ————— 5) Statusy —————
+    // ————— 5) Statusy (krok 2): POST→201 (+Location), DELETE→204, 204 bez treści —————
     private void fixStatusesByHeuristics(String method, Operation op) {
+        if (op == null) return;
         ApiResponses rs = op.getResponses();
         if (rs == null || rs.isEmpty()) return;
 
-        // POST: 200 (puste) → 201
-        if ("POST".equalsIgnoreCase(method)) {
-            ApiResponse r200 = rs.get("200");
-            if (r200 != null && isEffectivelyEmpty(r200)) {
-                ApiResponse created = copyResponse(r200);
-                if (safe(created.getDescription()).isBlank()) created.setDescription("Created");
-                rs.remove("200");
-                rs.addApiResponse("201", created);
-            }
-        }
+        boolean isDelete = "DELETE".equalsIgnoreCase(method);
+        boolean isPost   = "POST".equalsIgnoreCase(method);
 
-        // DELETE: puste body → 204; usuń pozostałe 2xx
-        if ("DELETE".equalsIgnoreCase(method)) {
+        // DELETE: puste treści -> 204 i usuń inne 2xx
+        if (isDelete) {
             ApiResponse r200 = rs.get("200");
             if (r200 != null && isEffectivelyEmpty(r200)) {
                 rs.remove("200");
@@ -339,6 +347,68 @@ public class AiPostProcessor {
                 rs.addApiResponse("204", new ApiResponse().description("No Content"));
             }
             rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
+            return;
+        }
+
+        // POST: jeżeli „tworzy” (200 bez ciała lub brak 2xx) → 201 Created (+Location)
+        if (isPost) {
+            ApiResponse r200 = rs.get("200");
+            boolean promoteTo201 = false;
+
+            if (r200 != null && isEffectivelyEmpty(r200)) {
+                promoteTo201 = true;
+            }
+            boolean has2xx = rs.keySet().stream().anyMatch(k -> k.startsWith("2"));
+            if (!has2xx) {
+                promoteTo201 = true;
+            }
+
+            if (promoteTo201) {
+                ApiResponse created = (r200 != null) ? copyResponse(r200) : new ApiResponse();
+                if (safe(created.getDescription()).isBlank()) created.setDescription("Created");
+                ensureLocationHeader(created, null);
+                if (r200 != null) rs.remove("200");
+                rs.addApiResponse("201", created);
+            }
+
+            // Jeśli już mamy 201, dopnij Location
+            ApiResponse r201 = rs.get("201");
+            if (r201 != null) {
+                ensureLocationHeader(r201, null);
+            }
+        }
+
+        // 204 sanity — brak treści i opis
+        ApiResponse r204 = rs.get("204");
+        if (r204 != null) {
+            if (r204.getContent() != null && !r204.getContent().isEmpty()) {
+                r204.setContent(null);
+            }
+            if (safe(r204.getDescription()).isBlank()) {
+                r204.setDescription("No Content");
+            }
+        }
+    }
+
+    // Dodaje nagłówek Location do odpowiedzi 201/Created (jeśli jeszcze nie ma)
+    private void ensureLocationHeader(ApiResponse resp, String exampleUri) {
+        if (resp == null) return;
+        Map<String, Header> headers = resp.getHeaders();
+        if (headers == null) headers = new LinkedHashMap<>();
+
+        if (!headers.containsKey("Location")) {
+            Header h = new Header();
+            h.setDescription("Canonical URI nowo utworzonego zasobu.");
+            StringSchema s = new StringSchema();
+            s.setFormat("uri");
+            h.setSchema(s);
+            if (exampleUri != null && !exampleUri.isBlank()) {
+                Map<String, Object> ex = new LinkedHashMap<>();
+                ex.put("example", exampleUri);
+                h.setExtensions(ex);
+            }
+            headers.put("Location", h);
+            resp.setHeaders(headers);
         }
     }
 

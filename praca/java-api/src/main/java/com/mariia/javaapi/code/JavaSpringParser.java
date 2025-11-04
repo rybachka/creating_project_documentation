@@ -143,11 +143,20 @@ public class JavaSpringParser {
                     ep.params.add(pr);
                 });
 
-                // --- Typ zwracany ---
+                // --- Typ zwracany (ZNORMALIZOWANY) ---
                 ReturnIR r = new ReturnIR();
-                r.type = m.getType().asString();
+
+                String rawReturn = m.getType().asString();
+                String core = normalizeReturnType(rawReturn);
+
+                // Jeśli w Javadoc brak @return, ustaw sensowny opis (No Content dla void)
                 String retText = returnDocRef.get();
-                r.description = (retText != null && !retText.isBlank()) ? retText : "Zwraca odpowiedź.";
+                if (retText == null || retText.isBlank()) {
+                    retText = "void".equals(core) ? "No Content." : "Zwraca odpowiedź.";
+                }
+
+                r.type = core;
+                r.description = retText;
                 ep.returns = r;
 
                 sink.add(ep);
@@ -337,5 +346,51 @@ public class JavaSpringParser {
             if (!t.isBlank()) set.add(t);
         }
         return new ArrayList<>(set);
+    }
+
+    // ===== NOWE: normalizacja typu zwracanego (zdejmowanie wrapperów) =====
+
+    private static String normalizeReturnType(String rawType) {
+        if (rawType == null || rawType.trim().isEmpty()) return "void";
+        String t = rawType.trim();
+
+        // ResponseEntity<Void> → void
+        if (t.startsWith("ResponseEntity<")) {
+            String inner = stripGenerics(t);
+            if ("Void".equals(inner) || "void".equalsIgnoreCase(inner)) {
+                return "void";
+            }
+            // ResponseEntity<T> → T
+            t = inner;
+        }
+
+        // typowe asynch./reaktywne wrappery
+        t = unwrapKnownWrapper(t, "Optional");
+        t = unwrapKnownWrapper(t, "CompletableFuture");
+        t = unwrapKnownWrapper(t, "Mono");
+        t = unwrapKnownWrapper(t, "Flux");
+        t = unwrapKnownWrapper(t, "Callable");
+        t = unwrapKnownWrapper(t, "DeferredResult");
+
+        // nic nie zwraca
+        if ("void".equals(t) || "Void".equals(t)) return "void";
+
+        // zostaw dokładny zapis kolekcji/tabl. (np. List<X>, Set<Y>, Z[])
+        return t;
+    }
+
+    private static String unwrapKnownWrapper(String type, String wrapperSimpleName) {
+        String prefix = wrapperSimpleName + "<";
+        if (type.startsWith(prefix) && type.endsWith(">")) {
+            return stripGenerics(type);
+        }
+        return type;
+    }
+
+    private static String stripGenerics(String g) {
+        int lt = g.indexOf('<');
+        int gt = g.lastIndexOf('>');
+        if (lt >= 0 && gt > lt) return g.substring(lt + 1, gt).trim();
+        return g;
     }
 }

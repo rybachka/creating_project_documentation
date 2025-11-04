@@ -81,12 +81,11 @@ public class CodeToDocsService {
             System.out.println("[DTO] nie znaleziono żadnych DTO – components/schemas będzie puste.");
         }
 
-                // Wymagane pola dla CreateUserRequest (jeśli istnieje)
+        // Wymagane pola dla CreateUserRequest (jeśli istnieje)
         if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
             Schema<?> cur = api.getComponents().getSchemas().get("CreateUserRequest");
             if (cur instanceof ObjectSchema) {
                 ObjectSchema os = (ObjectSchema) cur;
-                // ustaw required, jeśli brak
                 if (os.getRequired() == null || os.getRequired().isEmpty()) {
                     os.setRequired(Arrays.asList("name","email"));
                 } else {
@@ -96,7 +95,6 @@ public class CodeToDocsService {
                 }
             }
         }
-
 
         // ==== Operacje ====
         for (EndpointIR ep : eps) {
@@ -148,7 +146,6 @@ public class CodeToDocsService {
                         hasRespExample = rMap.get("body") != null;
                     }
                 }
-                // możesz też zalogować:
                 if (!hasRespExample) {
                     System.out.println("[NLP] Brak examples.response.body dla " + ep.http + " " + ep.path);
                 }
@@ -343,6 +340,9 @@ public class CodeToDocsService {
         AiPostProcessor post = new AiPostProcessor();
         post.apply(api);
 
+        sanitizeOpenApi(api);       // << końcowa „miotła”
+        collectNameWarnings(api);   // << opcjonalny linter nazw
+
         Files.createDirectories(outFile.getParent());
         String yaml = Yaml.mapper().writeValueAsString(api);
         Files.writeString(outFile, yaml);
@@ -504,259 +504,274 @@ public class CodeToDocsService {
 
     // ============= FINAL SANITY PASS =============
     private void finalSanity(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-    // 1) Dedup parametrów po (in,name) – preferuj bogatsze
-    if (op.getParameters() != null && !op.getParameters().isEmpty()) {
-        Map<String, Parameter> best = new LinkedHashMap<>();
-        for (Parameter p : op.getParameters()) {
-            if (p == null) continue;
-            String key = (nz(p.getIn()) + ":" + nz(p.getName())).toLowerCase(Locale.ROOT);
-            Parameter cur = best.get(key);
-            if (cur == null || isBetterParam(p, cur)) best.put(key, p);
-        }
-        List<Parameter> dedup = new ArrayList<>(best.values());
-        op.setParameters(dedup.isEmpty() ? null : dedup);
-    }
+        // 0) Ułatwienia
+        final String path = nz(ep.path);
+        final String pathLc = path.toLowerCase(Locale.ROOT);
 
-    // 2) Zapewnij obecność parametrów {path}
-    Set<String> pathVars = findPathVars(ep.path);
-    if (!pathVars.isEmpty()) {
-        List<Parameter> params = op.getParameters() == null ? new ArrayList<>() : new ArrayList<>(op.getParameters());
-        Set<String> have = params.stream()
-                .filter(p -> "path".equalsIgnoreCase(nz(p.getIn())))
-                .map(p -> nz(p.getName()).toLowerCase(Locale.ROOT)).collect(Collectors.toSet());
-        for (String v : pathVars) {
-            if (!have.contains(v.toLowerCase(Locale.ROOT))) {
-                Parameter pp = new Parameter().in("path").name(v).required(true);
-                pp.setSchema(new StringSchema());
-                params.add(pp);
-            }
-        }
-        // path params muszą być required=true
-        for (Parameter p : params) {
-            if ("path".equalsIgnoreCase(nz(p.getIn()))) p.setRequired(true);
-        }
-        op.setParameters(params.isEmpty() ? null : params);
-    }
-
-    // 3) Body a metoda
-    boolean isGet = "GET".equalsIgnoreCase(ep.http);
-    boolean isDelete = "DELETE".equalsIgnoreCase(ep.http);
-    boolean isPost = "POST".equalsIgnoreCase(ep.http);
-    boolean isPut = "PUT".equalsIgnoreCase(ep.http);
-    boolean isPatch = "PATCH".equalsIgnoreCase(ep.http);
-
-    if (isGet || isDelete) {
-        // GET/DELETE nie powinny mieć body
-        op.setRequestBody(null);
-    } else if (isPost || isPut || isPatch) {
-        RequestBody rb = op.getRequestBody();
-        if (rb == null) {
-            // utwórz minimalne body (JSON object), gdy brak
-            ObjectSchema obj = new ObjectSchema();
-            io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType();
-            mt.setSchema(obj);
-            Content c = new Content();
-            c.addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
-            rb = new RequestBody().content(c);
-            op.setRequestBody(rb);
-        }
-        // POST/PUT zwykle wymagają body
-        if (isPost || isPut) op.getRequestBody().setRequired(true);
-
-        // jeżeli w schemacie body są pola binarne → multipart/form-data
-        Content c = op.getRequestBody().getContent();
-        if (c == null || c.isEmpty()) {
-            c = new Content().addMediaType(
-                    org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
-                    new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
-            );
-            op.getRequestBody().setContent(c);
-        } else {
-            io.swagger.v3.oas.models.media.MediaType json = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-            if (json != null && containsBinary(json.getSchema())) {
-                // przenieś do multipart
-                io.swagger.v3.oas.models.media.MediaType mp =
-                        new io.swagger.v3.oas.models.media.MediaType().schema(toMultipart(json.getSchema()));
-                Content nc = new Content();
-                nc.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mp);
-                op.getRequestBody().setContent(nc);
-            }
-        }
-    }
-
-    // === 3a) Specjalny kontrakt: POST /api/orders/{orderId}/items ===
-    if ("POST".equalsIgnoreCase(ep.http) && ep.path != null && ep.path.matches(".*/api/orders/\\{[^}/]+}/items$")) {
-        // 1) Usuń sku/qty z query
+        // 1) Dedup parametrów po (in,name) – preferuj bogatsze
         if (op.getParameters() != null && !op.getParameters().isEmpty()) {
-            List<Parameter> kept = new ArrayList<>();
+            Map<String, Parameter> best = new LinkedHashMap<>();
             for (Parameter p : op.getParameters()) {
-                if ("query".equalsIgnoreCase(nz(p.getIn()))) {
-                    String n = nz(p.getName()).toLowerCase(Locale.ROOT);
-                    if (n.equals("sku") || n.equals("qty")) continue;
+                if (p == null) continue;
+                String key = (nz(p.getIn()) + ":" + nz(p.getName())).toLowerCase(Locale.ROOT);
+                Parameter cur = best.get(key);
+                if (cur == null || isBetterParam(p, cur)) best.put(key, p);
+            }
+            List<Parameter> dedup = new ArrayList<>(best.values());
+            op.setParameters(dedup.isEmpty() ? null : dedup);
+        }
+
+        // 2) Zapewnij obecność parametrów {path}
+        Set<String> pathVars = findPathVars(ep.path);
+        if (!pathVars.isEmpty()) {
+            List<Parameter> params = (op.getParameters() == null)
+                    ? new ArrayList<Parameter>()
+                    : new ArrayList<Parameter>(op.getParameters());
+
+            Set<String> have = params.stream()
+                    .filter(p -> "path".equalsIgnoreCase(nz(p.getIn())))
+                    .map(p -> nz(p.getName()).toLowerCase(Locale.ROOT))
+                    .collect(Collectors.toSet());
+            for (String v : pathVars) {
+                if (!have.contains(v.toLowerCase(Locale.ROOT))) {
+                    Parameter pp = new Parameter().in("path").name(v).required(true);
+                    pp.setSchema(new StringSchema());
+                    params.add(pp);
                 }
-                kept.add(p);
             }
-            op.setParameters(kept.isEmpty() ? null : kept);
-        }
-        // 2) Zdefiniuj jednoznaczne JSON body: { sku: string, qty: integer } (required: oba)
-        ObjectSchema obj = new ObjectSchema();
-        obj.addProperties("sku", new StringSchema().description("Kod SKU dodawanej pozycji."));
-        obj.addProperties("qty", new IntegerSchema().description("Ilość sztuk."));
-        obj.setRequired(Arrays.asList("sku","qty"));
-        io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType().schema(obj);
-        Content cnt = new Content().addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
-        RequestBody rb = new RequestBody().required(true).content(cnt);
-        op.setRequestBody(rb);
-
-        // 3) Odpowiedź 201 Created + prosty example
-        ApiResponses rsX = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
-        ApiResponse r201 = new ApiResponse().description("Created");
-        io.swagger.v3.oas.models.media.MediaType rmt = new io.swagger.v3.oas.models.media.MediaType();
-        ObjectSchema item = new ObjectSchema();
-        item.addProperties("id", new StringSchema().format("uuid"));
-        item.addProperties("sku", new StringSchema());
-        item.addProperties("qty", new IntegerSchema());
-        rmt.setSchema(item);
-        Map<String,Object> ex = new LinkedHashMap<>();
-        ex.put("id", "7b2f3c4e-2a1b-4c5d-9e8f-001122334455");
-        ex.put("sku", "ABC-123");
-        ex.put("qty", 2);
-        rmt.setExample(ex);
-        r201.setContent(new Content().addMediaType("application/json", rmt));
-        // usuń inne 2xx i wstaw 201
-        rsX.keySet().removeIf(k -> k.startsWith("2"));
-        rsX.addApiResponse("201", r201);
-        op.setResponses(rsX);
-    }
-
-    // 4) Odpowiedzi 2xx — porządki
-    ApiResponses rs = op.getResponses();
-    if (rs == null) {
-        rs = new ApiResponses();
-        op.setResponses(rs);
-    }
-
-    // Usuń treść z 204
-    ApiResponse r204 = rs.get("204");
-    if (r204 != null && r204.getContent() != null && !r204.getContent().isEmpty()) {
-        r204.setContent(null);
-        if (safe(r204.getDescription()).isBlank()) r204.setDescription("No Content");
-    }
-
-    // Jeśli DELETE → preferuj 204 i usuń inne 2xx
-    if (isDelete) {
-        ApiResponse nc = rs.get("204");
-        if (nc == null) {
-            nc = new ApiResponse().description("No Content");
-            rs.addApiResponse("204", nc);
-        }
-        rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
-    }
-
-    // Jeżeli nie ma żadnej 2xx → dodaj sensowną
-    if (rs.keySet().stream().noneMatch(k -> k.startsWith("2"))) {
-        if (isDelete || returnsVoid(ep)) {
-            rs.addApiResponse("204", new ApiResponse().description("No Content"));
-        } else if (isPost) {
-            rs.addApiResponse("201", new ApiResponse().description("Created"));
-        } else {
-            ApiResponse ok = new ApiResponse().description("OK");
-            ok.setContent(new Content().addMediaType(
-                    "application/json",
-                    new io.swagger.v3.oas.models.media.MediaType()
-                            .schema(schemaForType(ep.returns != null ? ep.returns.type : null))
-            ));
-            rs.addApiResponse("200", ok);
-        }
-    }
-
-    // POST: promuj „puste 200” do 201
-    if (isPost && rs.get("200") != null && isEffectivelyEmpty(rs.get("200"))) {
-        ApiResponse created = copyResponse(rs.get("200"));
-        if (safe(created.getDescription()).isBlank()) created.setDescription("Created");
-        rs.remove("200"); rs.addApiResponse("201", created);
-    }
-
-    // „puste 200” dla void/DELETE → 204
-    if ((isDelete || returnsVoid(ep)) && rs.get("200") != null && isEffectivelyEmpty(rs.get("200"))) {
-        rs.remove("200");
-        rs.addApiResponse("204", new ApiResponse().description("No Content"));
-    }
-
-    // Napraw brak application/json w 2xx z treścią + brak schematu
-    for (String code : new ArrayList<>(rs.keySet())) {
-        if (!code.startsWith("2")) continue;
-        ApiResponse r = rs.get(code);
-        if (r == null) continue;
-        Content c = r.getContent();
-        if (c == null || c.isEmpty()) continue;
-        io.swagger.v3.oas.models.media.MediaType mt = c.get("application/json");
-        if (mt == null) {
-            mt = new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema());
-            c.addMediaType("application/json", mt);
-            r.setContent(c);
-        }
-        if (mt.getSchema() == null) {
-            mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
-        }
-    }
-
-    // Jeśli mamy 200 i 201 z identyczną „pustką” → zostaw preferowaną
-    if (rs.get("201") != null && rs.get("200") != null && isEffectivelyEmpty(rs.get("200"))) {
-        rs.remove("200");
-    }
-
-    // === 4a) Specjalne przykłady: POST /api/users ===
-    if ("POST".equalsIgnoreCase(ep.http) && ep.path != null && ep.path.matches(".*/api/users$")) {
-        // Request example, jeśli mamy JSON body
-        if (op.getRequestBody() != null && op.getRequestBody().getContent() != null) {
-            io.swagger.v3.oas.models.media.MediaType reqMt =
-                    op.getRequestBody().getContent().get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-            if (reqMt != null && reqMt.getExample() == null) {
-                Map<String,Object> reqEx = new LinkedHashMap<>();
-                reqEx.put("name", "Alice Example");
-                reqEx.put("email", "alice@example.com");
-                reqMt.setExample(reqEx);
+            // path params muszą być required=true
+            for (Parameter p : params) {
+                if ("path".equalsIgnoreCase(nz(p.getIn()))) p.setRequired(true);
             }
+            op.setParameters(params.isEmpty() ? null : params);
         }
-        // Response example w 201 (albo 200, jeśli brak 201)
-        ApiResponse r = rs.get("201");
-        if (r == null) r = rs.get("200");
-        if (r != null && r.getContent() != null) {
-            io.swagger.v3.oas.models.media.MediaType mt = r.getContent().get("application/json");
-            if (mt != null && mt.getExample() == null) {
-                Map<String,Object> respEx = new LinkedHashMap<>();
-                respEx.put("id", "9f1a2b3c-1111-2222-3333-444455556666");
-                respEx.put("name", "Alice Example");
-                respEx.put("email", "alice@example.com");
-                mt.setExample(respEx);
+
+        // 3) Semantyka metod / body
+        boolean isGet    = "GET".equalsIgnoreCase(ep.http);
+        boolean isDelete = "DELETE".equalsIgnoreCase(ep.http);
+        boolean isPost   = "POST".equalsIgnoreCase(ep.http);
+        boolean isPut    = "PUT".equalsIgnoreCase(ep.http);
+        boolean isPatch  = "PATCH".equalsIgnoreCase(ep.http);
+
+        // GET/DELETE nie powinny mieć body
+        if (isGet || isDelete) {
+            if (op.getRequestBody() != null) {
+                op.setRequestBody(null);
+                // ostrzeżenie — w rozszerzeniu operacji
+                Map<String, Object> ext = op.getExtensions();
+                if (ext == null) { ext = new LinkedHashMap<>(); op.setExtensions(ext); }
+                @SuppressWarnings("unchecked")
+                List<String> warns = (List<String>) ext.getOrDefault("x-warnings", new ArrayList<String>());
+                if (warns == null) warns = new ArrayList<>();
+                warns.add(isGet ? "GET body removed: filtry powinny być w query."
+                                : "DELETE nie przyjmuje body — usunięto.");
+                ext.put("x-warnings", warns);
             }
         }
 
-        // Napraw brak application/json w 2xx z treścią
-        for (String code : new ArrayList<>(rs.keySet())) {
+        // POST/PUT/PATCH – zapewnij body; POST/PUT zwykle wymagają body
+        if (isPost || isPut || isPatch) {
+            RequestBody rb = op.getRequestBody();
+            if (rb == null) {
+                rb = new RequestBody();
+                Content c0 = new Content().addMediaType(
+                        org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
+                        new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
+                );
+                rb.setContent(c0);
+                op.setRequestBody(rb);
+            }
+            if (isPost || isPut) op.getRequestBody().setRequired(true);
+
+            // jeżeli w schemacie body są pola binarne → multipart/form-data
+            Content c = op.getRequestBody().getContent();
+            if (c == null || c.isEmpty()) {
+                c = new Content().addMediaType(
+                        org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
+                        new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
+                );
+                op.getRequestBody().setContent(c);
+            } else {
+                io.swagger.v3.oas.models.media.MediaType json = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+                if (json != null && containsBinary(json.getSchema())) {
+                    // przenieś do multipart
+                    io.swagger.v3.oas.models.media.MediaType mp =
+                            new io.swagger.v3.oas.models.media.MediaType().schema(toMultipart(json.getSchema()));
+                    Content nc = new Content();
+                    nc.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mp);
+                    op.getRequestBody().setContent(nc);
+                }
+            }
+        }
+
+        // 4) Przygotuj odpowiedzi
+        ApiResponses responses = op.getResponses();
+        if (responses == null) {
+            responses = new ApiResponses();
+            op.setResponses(responses);
+        }
+
+        // Usuń treść z 204 i ustaw opis
+        ApiResponse r204 = responses.get("204");
+        if (r204 != null) {
+            if (r204.getContent() != null && !r204.getContent().isEmpty()) r204.setContent(null);
+            if (safe(r204.getDescription()).isBlank()) r204.setDescription("No Content");
+        }
+
+        // 5) Heurystyki zgodne z DoD
+
+        // 5a) LOGIN / SEARCH -> 200 OK
+        boolean isLogin  = pathLc.contains("/login") || pathLc.contains("/auth");
+        boolean isSearch = pathLc.contains("/search") || pathLc.contains("/find") || pathLc.endsWith("/list");
+        if (isLogin || isSearch) {
+            // usuń 201/204; wymuś 200 OK
+            responses.keySet().removeIf(k -> "201".equals(k) || "204".equals(k));
+            ApiResponse ok = responses.get("200");
+            if (ok == null) {
+                ok = new ApiResponse().description("OK");
+                Content cnt = new Content().addMediaType(
+                        "application/json",
+                        new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
+                );
+                ok.setContent(cnt);
+                responses.addApiResponse("200", ok);
+            }
+        }
+
+        // 5b) POST add/remove – bez nowego bytu -> 200 lub 204
+        boolean looksLikeAddRemove =
+                (pathLc.endsWith("/add") || pathLc.contains("/add/") || pathLc.endsWith("/remove") || pathLc.contains("/remove/"));
+        if (isPost && looksLikeAddRemove) {
+            boolean hasBodyContent = responses.values().stream().anyMatch(r ->
+                    r != null && r.getContent() != null && !r.getContent().isEmpty());
+            // wyczyść wszystkie 2xx i ustaw właściwą
+            final List<String> toDel = new ArrayList<>();
+            for (String k : responses.keySet()) if (k.startsWith("2")) toDel.add(k);
+            toDel.forEach(responses::remove);
+            if (hasBodyContent) {
+                ApiResponse ok = new ApiResponse().description("OK");
+                if (ok.getContent() == null) {
+                    ok.setContent(new Content().addMediaType(
+                            "application/json",
+                            new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
+                    ));
+                }
+                responses.addApiResponse("200", ok);
+            } else {
+                responses.addApiResponse("204", new ApiResponse().description("No Content"));
+            }
+        }
+
+        // 5c) POST tworzenie zasobu – promuj „puste 200” do 201 i dołóż Location
+        if (isPost) {
+            ApiResponse r200 = responses.get("200");
+            if (r200 != null && isEffectivelyEmpty(r200)) {
+                ApiResponse created = copyResponse(r200);
+                if (safe(created.getDescription()).isBlank()) created.setDescription("Created");
+                responses.remove("200");
+                responses.addApiResponse("201", created);
+            }
+            ApiResponse r201 = responses.get("201");
+            if (r201 != null) {
+                // nagłówek Location (jeśli nie ma)
+                Map<String, io.swagger.v3.oas.models.headers.Header> hs =
+                        (r201.getHeaders() == null) ? new LinkedHashMap<>() : new LinkedHashMap<>(r201.getHeaders());
+                if (!hs.containsKey("Location")) {
+                    io.swagger.v3.oas.models.headers.Header loc = new io.swagger.v3.oas.models.headers.Header()
+                            .description("URI nowo utworzonego zasobu.")
+                            .schema(new StringSchema().format("uri"));
+                    hs.put("Location", loc);
+                    r201.setHeaders(hs);
+                }
+                // jeżeli 200 i 201 są identycznie „puste” – preferuj 201
+                if (responses.get("200") != null && isEffectivelyEmpty(responses.get("200"))) {
+                    responses.remove("200");
+                }
+            }
+        }
+
+        // 5d) DELETE → preferuj 204 i usuń inne 2xx
+        if (isDelete) {
+            if (responses.get("204") == null) {
+                responses.addApiResponse("204", new ApiResponse().description("No Content"));
+            }
+            final List<String> toDel = new ArrayList<>();
+            for (String k : responses.keySet()) {
+                if (k.startsWith("2") && !"204".equals(k)) toDel.add(k);
+            }
+            toDel.forEach(responses::remove);
+        }
+
+        // 6) Napraw brak application/json w 2xx z treścią + brak schematu
+        for (String code : new ArrayList<>(responses.keySet())) {
             if (!code.startsWith("2")) continue;
-            ApiResponse resp = rs.get(code);
-            if (resp == null) continue;
-
-            Content cnt = resp.getContent();
-            if (cnt == null || cnt.isEmpty()) continue;
-
-            io.swagger.v3.oas.models.media.MediaType mt = cnt.get("application/json");
+            ApiResponse r = responses.get(code);
+            if (r == null) continue;
+            Content c = r.getContent();
+            if (c == null || c.isEmpty()) continue;
+            io.swagger.v3.oas.models.media.MediaType mt = c.get("application/json");
             if (mt == null) {
                 mt = new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema());
-                cnt.addMediaType("application/json", mt);
-                resp.setContent(cnt);
+                c.addMediaType("application/json", mt);
+                r.setContent(c);
             }
             if (mt.getSchema() == null) {
                 mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
             }
         }
 
+        // 7) Specjalny kontrakt: POST /api/orders/{orderId}/items
+        if (isPost && path != null && path.matches(".*/api/orders/\\{[^}/]+}/items$")) {
+            // 1) Usuń sku/qty z query
+            if (op.getParameters() != null && !op.getParameters().isEmpty()) {
+                List<Parameter> kept = new ArrayList<>();
+                for (Parameter p : op.getParameters()) {
+                    if ("query".equalsIgnoreCase(nz(p.getIn()))) {
+                        String n = nz(p.getName()).toLowerCase(Locale.ROOT);
+                        if (n.equals("sku") || n.equals("qty")) continue;
+                    }
+                    kept.add(p);
+                }
+                op.setParameters(kept.isEmpty() ? null : kept);
+            }
+            // 2) Body JSON: { sku, qty } (required)
+            ObjectSchema obj = new ObjectSchema();
+            obj.addProperties("sku", new StringSchema().description("Kod SKU dodawanej pozycji."));
+            obj.addProperties("qty", new IntegerSchema().description("Ilość sztuk."));
+            obj.setRequired(Arrays.asList("sku","qty"));
+            io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType().schema(obj);
+            Content cnt = new Content().addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
+            RequestBody rb = new RequestBody().required(true).content(cnt);
+            op.setRequestBody(rb);
 
+            // 3) 201 Created + example
+            ApiResponses rsX = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
+            ApiResponse r201x = new ApiResponse().description("Created");
+            io.swagger.v3.oas.models.media.MediaType rmt = new io.swagger.v3.oas.models.media.MediaType();
+            ObjectSchema item = new ObjectSchema();
+            item.addProperties("id", new StringSchema().format("uuid"));
+            item.addProperties("sku", new StringSchema());
+            item.addProperties("qty", new IntegerSchema());
+            rmt.setSchema(item);
+            Map<String,Object> ex = new LinkedHashMap<>();
+            ex.put("id", "7b2f3c4e-2a1b-4c5d-9e8f-001122334455");
+            ex.put("sku", "ABC-123");
+            ex.put("qty", 2);
+            rmt.setExample(ex);
+            r201x.setContent(new Content().addMediaType("application/json", rmt));
+            // usuń inne 2xx i wstaw 201
+            final List<String> toDel2 = new ArrayList<>();
+            for (String k : rsX.keySet()) if (k.startsWith("2")) toDel2.add(k);
+            toDel2.forEach(rsX::remove);
+            rsX.addApiResponse("201", r201x);
+            op.setResponses(rsX);
+        }
     }
-}
 
+
+
+
+    // ============= Pomocnicze do FINAL SANITY ============
     private boolean isBetterParam(Parameter a, Parameter b) {
         int as = (a.getSchema() != null ? 1 : 0) + (safe(a.getDescription()).length() > safe(b.getDescription()).length() ? 1 : 0);
         int bs = (b.getSchema() != null ? 1 : 0);
@@ -789,7 +804,6 @@ public class CodeToDocsService {
     }
 
     private Schema<?> toMultipart(Schema<?> json) {
-        // konwersja: wszystkie string/binary zostają; inne typy jako string (uproszczenie)
         ObjectSchema mp = new ObjectSchema();
         if (json instanceof ObjectSchema && json.getProperties() != null) {
             for (Map.Entry<String, Schema> e : (Set<Map.Entry<String, Schema>>) json.getProperties().entrySet()) {
@@ -807,7 +821,6 @@ public class CodeToDocsService {
                 }
             }
         } else {
-            // fallback – pojedynczy plik
             mp.addProperties("file", new StringSchema().format("binary"));
         }
         return mp;
@@ -944,10 +957,10 @@ public class CodeToDocsService {
         String t = typeName.trim();
 
         if (t.startsWith("ResponseEntity<") ||
-            t.startsWith("Optional<") ||
-            t.startsWith("CompletableFuture<") ||
-            t.startsWith("Mono<") ||
-            t.startsWith("Flux<")) {
+                t.startsWith("Optional<") ||
+                t.startsWith("CompletableFuture<") ||
+                t.startsWith("Mono<") ||
+                t.startsWith("Flux<")) {
             return schemaForType(stripGenerics(t));
         }
 
@@ -1096,14 +1109,12 @@ public class CodeToDocsService {
             if (info.url == null) issues.add("Brak URL w komendzie cURL.");
             if (info.method == null) issues.add("Brak metody HTTP (ani -X, ani flag danych).");
 
-            // Porównanie metody
             if (info.method != null && ep.http != null) {
                 if (!info.method.equalsIgnoreCase(ep.http)) {
                     issues.add("Metoda w cURL (" + info.method + ") ≠ definicja (" + ep.http + ").");
                 }
             }
 
-            // Porównanie ścieżki względem szablonu ep.path
             String urlPath = null;
             if (info.url != null) {
                 try {
@@ -1131,20 +1142,17 @@ public class CodeToDocsService {
             if (!issues.isEmpty()) row.put("issues", issues);
             annotated.add(row);
 
-            // Zachowujemy wszystkie (PDF pokaże issues). Jeśli chcesz – filtruj tylko valid.
             cleaned.add(curl);
         }
 
-        // Zastąp listę cURLów wersją po przejściu walidatora (ew. przefiltrowaną)
         if (!cleaned.isEmpty()) {
             op.addExtension("x-request-examples", cleaned);
         }
-        // Dodaj szczegóły walidacji
         op.addExtension("x-curl-validated", annotated);
     }
 
     private static class CurlInfo {
-        String method; // GET/POST/PUT/DELETE/PATCH/...
+        String method;
         String url;
     }
 
@@ -1184,7 +1192,7 @@ public class CodeToDocsService {
                 continue;
             }
             if ((t.startsWith("\"http://") || t.startsWith("\"https://") ||
-                 t.startsWith("'http://") || t.startsWith("'https://"))) {
+                    t.startsWith("'http://") || t.startsWith("'https://"))) {
                 url = stripQuotes(t);
             }
         }
@@ -1210,10 +1218,9 @@ public class CodeToDocsService {
         String esc = t.replaceAll("([.\\\\+*?\\[^\\]$(){}=!<>|:-])", "\\\\$1");
         String rx = esc.replaceAll("\\\\\\{[^}]+\\\\\\}", "[^/]+");
         return "^" + rx + "/?$";
-
     }
 
-        // --- helper: budowa prostego JSON request body z typu parametru ---
+    // --- helper: budowa prostego JSON request body z typu parametru ---
     private RequestBody buildJsonRequestBody(ParamIR p) {
         return new RequestBody()
                 .description(p.description)
@@ -1247,8 +1254,7 @@ public class CodeToDocsService {
         }
 
         if (s.get$ref() != null) {
-            // Nie zgadujemy pola — dla DTO zwróć pusty obiekt (lub 1-poziomowy placeholder)
-            return Map.of(); // neutralnie
+            return Map.of();
         }
 
         if (s instanceof ObjectSchema || "object".equalsIgnoreCase(Objects.toString(s.getType(),""))) {
@@ -1262,5 +1268,382 @@ public class CodeToDocsService {
         return Map.of();
     }
 
+    // ================== DODATKI: helper do rozpoznania metody w sanitizeOpenApi ==================
+    // Rozpoznaj metodę HTTP dla Operation, patrząc na referencję w PathItem
+    private static String methodOf(PathItem pi, io.swagger.v3.oas.models.Operation op) {
+        if (op == null || pi == null) return null;
+        if (op == pi.getGet())     return "GET";
+        if (op == pi.getPost())    return "POST";
+        if (op == pi.getPut())     return "PUT";
+        if (op == pi.getDelete())  return "DELETE";
+        if (op == pi.getPatch())   return "PATCH";
+        if (op == pi.getHead())    return "HEAD";
+        if (op == pi.getOptions()) return "OPTIONS";
+        if (op == pi.getTrace())   return "TRACE";
+        return null;
+    }
 
+    // === P0 SWEEP: brak „gołych” array, brak „schematów widmo”, każda 2xx z JSON ma schema ===
+    private void sanitizeOpenApi(OpenAPI api) {
+        if (api == null) return;
+
+        // === 1) Components.schemas – rekursyjne domknięcie i naprawy P0 ===
+        if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
+            api.getComponents().getSchemas().forEach((name, schema) -> {
+                // a) pełna rekursywna sanizacja
+                sanitizeSchemaTree(schema);
+                // b) domknij „gołe” tablice w components
+                if (schema instanceof ArraySchema arr && arr.getItems() == null) {
+                    arr.setItems(new ObjectSchema());
+                }
+                // c) usuń błędne $ref kończące się na "/?"
+                if (schema != null && schema.get$ref() != null && schema.get$ref().endsWith("/?")) {
+                    schema.set$ref(null);
+                    schema.setType("object");
+                }
+            });
+        }
+
+        // === 2) Paths/Operations – requestBody + responses ===
+        if (api.getPaths() != null) {
+            api.getPaths().forEach((p, pi) -> {
+                if (pi == null) return;
+
+                Arrays.asList(pi.getGet(), pi.getPost(), pi.getPut(), pi.getDelete(), pi.getPatch())
+                        .stream().filter(Objects::nonNull).forEach(op -> {
+
+                            // 2a) RequestBody – domknij schema + „gołe” array + fix $ref "/?"
+                            RequestBody rb = op.getRequestBody();
+                            if (rb != null && rb.getContent() != null) {
+                                rb.getContent().forEach((ct, mt) -> {
+                                    ensureMediaTypeHasSchema(mt);
+                                    Schema<?> s = mt.getSchema();
+                                    sanitizeSchemaTree(s);
+                                    if (s instanceof ArraySchema arr && arr.getItems() == null) {
+                                        arr.setItems(new ObjectSchema());
+                                    }
+                                    if (s != null && s.get$ref() != null && s.get$ref().endsWith("/?")) {
+                                        mt.setSchema(new ObjectSchema()); // zamieniamy błędny ref na obiekt
+                                    }
+                                });
+                            }
+
+                            // 2b) Responses – 204 bez contentu, 201 z opisem Created, domykanie schematów
+                            if (op.getResponses() != null) {
+                                op.getResponses().forEach((code, resp) -> {
+                                    if (resp == null) return;
+
+                                    // 204: bezwzględnie bez treści i z opisem "No Content"
+                                    if ("204".equals(code)) {
+                                        resp.setContent(null);
+                                        resp.setDescription("No Content");
+                                        return;
+                                    }
+
+                                    // Pozostałe kody – domknięcie contentu/schematów
+                                    if (resp.getContent() != null) {
+                                        resp.getContent().forEach((ct, mt) -> {
+                                            ensureMediaTypeHasSchema(mt);
+                                            Schema<?> s = mt.getSchema();
+                                            sanitizeSchemaTree(s);
+
+                                            // „gołe” array → dodaj items
+                                            if (s instanceof ArraySchema arr && arr.getItems() == null) {
+                                                arr.setItems(new ObjectSchema());
+                                            }
+                                            // błędny $ref → object
+                                            if (s != null && s.get$ref() != null && s.get$ref().endsWith("/?")) {
+                                                mt.setSchema(new ObjectSchema());
+                                            }
+                                        });
+                                    }
+                                });
+
+                                // Po pętli: kosmetyka opisów 201/OK → Created
+                                ApiResponse r201 = op.getResponses().get("201");
+                                if (r201 != null) {
+                                    String desc = r201.getDescription();
+                                    if (desc == null || desc.isBlank() || "OK".equalsIgnoreCase(desc.trim())) {
+                                        r201.setDescription("Created");
+                                    }
+                                }
+                            }
+
+                            // [P0] Specjalny kontrakt: POST /api/orders/{orderId}/items (bez zmian)
+                            String _method = methodOf(pi, op);
+                            if ("POST".equalsIgnoreCase(_method)
+                                    && p != null
+                                    && p.matches(".*/api/orders/\\{[^}/]+}/items$")) {
+
+                                // 1) Body musi być JSON: { sku: string, qty: integer } i oba required
+                                RequestBody rb2 = op.getRequestBody();
+                                boolean needsFix = true;
+                                ObjectSchema desired = new ObjectSchema();
+                                desired.addProperties("sku", new StringSchema().description("Kod SKU dodawanej pozycji."));
+                                desired.addProperties("qty", new IntegerSchema().description("Ilość sztuk."));
+                                desired.setRequired(java.util.List.of("sku","qty"));
+
+                                if (rb2 != null && rb2.getContent() != null) {
+                                    io.swagger.v3.oas.models.media.MediaType mt = rb2.getContent()
+                                            .get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+                                    if (mt != null && mt.getSchema() instanceof ObjectSchema os) {
+                                        Object props = os.getProperties();
+                                        if (props instanceof java.util.Map<?,?> map) {
+                                            needsFix = !(map.containsKey("sku") && map.containsKey("qty"));
+                                        }
+                                    }
+                                }
+                                if (rb2 == null || rb2.getContent() == null || needsFix) {
+                                    Content cnt = new Content().addMediaType(
+                                            org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
+                                            new io.swagger.v3.oas.models.media.MediaType().schema(desired)
+                                    );
+                                    op.setRequestBody(new RequestBody().content(cnt).required(true));
+                                }
+
+                                // 2) Odpowiedź: preferuj 201 Created z prostym schematem i przykładem
+                                ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
+
+                                ApiResponse r200 = rs.get("200");
+                                if (r200 != null) {
+                                    boolean empty200 = true;
+                                    if (r200.getContent() != null) {
+                                        io.swagger.v3.oas.models.media.MediaType mt = r200.getContent().get("application/json");
+                                        if (mt != null && mt.getSchema() != null) empty200 = false;
+                                    }
+                                    if (empty200) {
+                                        ApiResponse created = new ApiResponse()
+                                                .description((r200.getDescription() == null || r200.getDescription().isBlank())
+                                                        ? "Created" : r200.getDescription());
+                                        rs.remove("200");
+                                        rs.addApiResponse("201", created);
+                                    }
+                                }
+
+                                boolean has2xx = rs.keySet().stream().anyMatch(k -> k.startsWith("2"));
+                                if (!has2xx) {
+                                    rs.addApiResponse("201", new ApiResponse().description("Created"));
+                                }
+
+                                ApiResponse r201x = rs.get("201");
+                                if (r201x == null) {
+                                    r201x = new ApiResponse().description("Created");
+                                    rs.addApiResponse("201", r201x);
+                                }
+                                Content rc = (r201x.getContent() == null) ? new Content() : r201x.getContent();
+                                io.swagger.v3.oas.models.media.MediaType rmt = rc.get("application/json");
+                                if (rmt == null) {
+                                    rmt = new io.swagger.v3.oas.models.media.MediaType();
+                                    rc.addMediaType("application/json", rmt);
+                                }
+                                if (rmt.getSchema() == null) {
+                                    ObjectSchema item = new ObjectSchema();
+                                    item.addProperties("id", new StringSchema().format("uuid"));
+                                    item.addProperties("sku", new StringSchema());
+                                    item.addProperties("qty", new IntegerSchema());
+                                    rmt.setSchema(item);
+                                }
+                                if (rmt.getExample() == null) {
+                                    Map<String,Object> ex = new LinkedHashMap<>();
+                                    ex.put("id", "7b2f3c4e-2a1b-4c5d-9e8f-001122334455");
+                                    ex.put("sku", "ABC-123");
+                                    ex.put("qty", 2);
+                                    rmt.setExample(ex);
+                                }
+                                op.setResponses(rs);
+                            }
+                        });
+            });
+        }
+    }
+
+
+    /** Upewnij się, że MediaType ma schema; jeśli brak – wstaw ObjectSchema. */
+    private void ensureMediaTypeHasSchema(io.swagger.v3.oas.models.media.MediaType mt) {
+        if (mt == null) return;
+        if (mt.getSchema() == null) {
+            mt.setSchema(new ObjectSchema());
+        }
+    }
+
+    /** Rekursyjne domknięcie drzewka schematu: items w tablicach, additionalProperties w mapach itd. */
+    @SuppressWarnings("unchecked")
+    private void sanitizeSchemaTree(Schema<?> s) {
+        if (s == null) return;
+
+        // $ref – nie dłubiemy w środku
+        if (s.get$ref() != null && !s.get$ref().isBlank()) return;
+
+        // Array → MUSI mieć items
+        if (s instanceof ArraySchema arr) {
+            if (arr.getItems() == null) {
+                arr.setItems(new ObjectSchema());              // << koniec „gołych” array
+            } else {
+                sanitizeSchemaTree(arr.getItems());
+            }
+            return;
+        }
+
+        // Map → additionalProperties = schema (nie Boolean.TRUE)
+        if (s instanceof MapSchema ms) {
+            Object ap = ms.getAdditionalProperties();
+            if (ap == null || ap instanceof Boolean) {
+                ms.setAdditionalProperties(new ObjectSchema());
+            } else if (ap instanceof Schema) {
+                sanitizeSchemaTree((Schema<?>) ap);
+            }
+            return;
+        }
+
+        // Composed (oneOf/anyOf/allOf)
+        if (s instanceof ComposedSchema cs) {
+            if (cs.getAllOf() != null) cs.getAllOf().forEach(this::sanitizeSchemaTree);
+            if (cs.getAnyOf() != null) cs.getAnyOf().forEach(this::sanitizeSchemaTree);
+            if (cs.getOneOf() != null) cs.getOneOf().forEach(this::sanitizeSchemaTree);
+            return;
+        }
+
+        // Object → przejdź po properties
+        if (s instanceof ObjectSchema || "object".equalsIgnoreCase(Objects.toString(s.getType(), ""))) {
+            Object props = s.getProperties();
+            if (props instanceof Map) {
+                ((Map<String, Schema<?>>) props).forEach((k, v) -> sanitizeSchemaTree(v));
+            }
+            return;
+        }
+
+        // „puste” nie-typowane – domknij jako object,
+        boolean noTypeLike = s.getType() == null
+                && !(s instanceof StringSchema)
+                && !(s instanceof IntegerSchema)
+                && !(s instanceof NumberSchema)
+                && !(s instanceof BooleanSchema);
+        if (noTypeLike) {
+            s.setType("object");
+        }
+    }
+
+    // ====== BEGIN: naming warnings (optional, non-breaking) ======
+    private static final java.util.Map<String, String> NAME_FIXES = new java.util.HashMap<>();
+    static {
+        NAME_FIXES.put("Anonimous", "Anonymous");
+        NAME_FIXES.put("anonimous", "anonymous");
+        NAME_FIXES.put("DEFAUL_",  "DEFAULT_");
+    }
+
+    private void collectNameWarnings(io.swagger.v3.oas.models.OpenAPI api) {
+        if (api == null) return;
+
+        java.util.List<String> warns = new java.util.ArrayList<>();
+
+        // Schematy i properties
+        if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
+            api.getComponents().getSchemas().forEach((schemaName, schema) -> {
+                NAME_FIXES.forEach((bad, good) -> {
+                    if (schemaName != null && schemaName.contains(bad)) {
+                        warns.add("Schema name contains '" + bad + "': " + schemaName +
+                                " → suggestion: " + schemaName.replace(bad, good));
+                    }
+                });
+                if (schema != null && schema.getProperties() instanceof java.util.Map) {
+                    @SuppressWarnings("unchecked")
+                    java.util.Map<String, io.swagger.v3.oas.models.media.Schema<?>> props =
+                            (java.util.Map<String, io.swagger.v3.oas.models.media.Schema<?>>) schema.getProperties();
+                    props.forEach((propName, propSchema) -> {
+                        NAME_FIXES.forEach((bad, good) -> {
+                            if (propName != null && propName.contains(bad)) {
+                                warns.add("Property contains '" + bad + "': " + schemaName + "." + propName +
+                                        " → suggestion: " + propName.replace(bad, good));
+                            }
+                        });
+                    });
+                }
+            });
+        }
+
+        // operationId + parametry
+        if (api.getPaths() != null) {
+            api.getPaths().forEach((path, item) -> {
+                java.util.stream.Stream
+                        .of(item.getGet(), item.getPost(), item.getPut(), item.getDelete(), item.getPatch())
+                        .filter(java.util.Objects::nonNull)
+                        .forEach(op -> {
+                            if (op.getOperationId() != null) {
+                                final String opId = op.getOperationId();
+                                NAME_FIXES.forEach((bad, good) -> {
+                                    if (opId.contains(bad)) {
+                                        warns.add("operationId contains '" + bad + "': " + opId +
+                                                " → suggestion: " + opId.replace(bad, good));
+                                    }
+                                });
+                            }
+                            if (op.getParameters() != null) {
+                                op.getParameters().forEach(param -> {
+                                    if (param.getName() != null) {
+                                        final String pn = param.getName();
+                                        NAME_FIXES.forEach((bad, good) -> {
+                                            if (pn.contains(bad)) {
+                                                warns.add("Parameter contains '" + bad + "': " + pn +
+                                                        " (path: " + path + ") → suggestion: " + pn.replace(bad, good));
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        });
+            });
+        }
+
+        if (!warns.isEmpty()) {
+            api.addExtension("x-warnings", warns);
+
+            io.swagger.v3.oas.models.info.Info info = api.getInfo();
+            if (info == null) info = new io.swagger.v3.oas.models.info.Info();
+            String desc = info.getDescription() == null ? "" : info.getDescription() + "\n\n";
+            info.setDescription(desc + "⚠ Naming warnings (non-blocking). Full list in `x-warnings`.");
+            api.setInfo(info);
+        }
+    }
+    // ====== END: naming warnings ======
+
+    // == [A] Wymuś $ref do istniejącego komponentu zamiast anonimowego object ==
+    private Schema<?> refIfComponentExists(String maybeDtoSimpleName, io.swagger.v3.oas.models.Components components) {
+        if (maybeDtoSimpleName == null || components == null || components.getSchemas() == null) {
+            return null;
+        }
+        Map<String, Schema> all = components.getSchemas();
+        if (all.containsKey(maybeDtoSimpleName)) {
+            Schema<?> ref = new Schema<>();
+            ref.$ref("#/components/schemas/" + maybeDtoSimpleName);
+            return ref;
+        }
+        return null;
+    }
+
+    /** Zwraca prostą nazwę typu (X z com.foo.X, X z List<X>, X[] -> X). */
+    private String simpleElementName(String typeString) {
+        if (typeString == null || typeString.isBlank()) return null;
+        String t = typeString.trim();
+        int lt = t.indexOf('<');
+        int gt = t.lastIndexOf('>');
+        if (lt >= 0 && gt > lt) t = t.substring(lt + 1, gt).trim();
+        if (t.endsWith("[]")) t = t.substring(0, t.length() - 2);
+        int dot = t.lastIndexOf('.');
+        return (dot >= 0) ? t.substring(dot + 1) : t;
+    }
+
+    /** Jeżeli schema jest ObjectSchema (anonimowy obiekt), a mamy pasujący component – podmień na $ref. */
+    private Schema<?> enforceRefIfPossible(Schema<?> current, String returnTypeString, io.swagger.v3.oas.models.Components comps) {
+        if (current == null) return null;
+        if (current.get$ref() != null && !current.get$ref().isBlank()) return current;
+
+        boolean isAnonObject = (current instanceof io.swagger.v3.oas.models.media.ObjectSchema)
+                || "object".equalsIgnoreCase(String.valueOf(current.getType()));
+
+        if (!isAnonObject) return current;
+
+        String candidate = simpleElementName(returnTypeString);
+        Schema<?> ref = refIfComponentExists(candidate, comps);
+        return (ref != null) ? ref : current;
+    }
 }

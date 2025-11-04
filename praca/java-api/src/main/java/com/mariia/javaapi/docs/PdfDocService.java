@@ -79,6 +79,30 @@ public class PdfDocService {
         return fallback;
     }
 
+    /** Nazwa projektu do nagłówka: x-project-name > info.title > "API". */
+    private static String getProjectName(OpenAPI api) {
+        if (api != null && api.getInfo() != null) {
+            Map<String, Object> ext = api.getInfo().getExtensions();
+            if (ext != null && ext.get("x-project-name") != null) {
+                String n = String.valueOf(ext.get("x-project-name")).trim();
+                if (!n.isBlank()) return n;
+            }
+            String t = nz(api.getInfo().getTitle()).trim();
+            if (!t.isBlank()) return t;
+        }
+        return "API";
+    }
+
+    /** Opcjonalny pakiet nagłówka: title/subtitle/generatedAt z info.extensions["x-doc-header"]. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> getDocHeader(OpenAPI api) {
+        if (api != null && api.getInfo() != null && api.getInfo().getExtensions() != null) {
+            Object v = api.getInfo().getExtensions().get("x-doc-header");
+            if (v instanceof Map) return (Map<String, Object>) v;
+        }
+        return Collections.emptyMap();
+    }
+
     private static String levelLabelPl(String lvl) {
         switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
             case "beginner":    return "Poziom: początkujący";
@@ -127,18 +151,30 @@ public class PdfDocService {
           .append("<style>").append(CSS).append("</style>")
           .append("</head><body>");
 
-        String title = api.getInfo() != null ? nz(api.getInfo().getTitle()) : "API";
-        String ver   = api.getInfo() != null ? nz(api.getInfo().getVersion()) : "";
+        // === Nagłówek z nazwą projektu ===
+        String projectName = getProjectName(api);                 // << klucz: nazwa projektu
         String spec  = api.getOpenapi() != null ? api.getOpenapi() : "3.x";
+        String ver   = (api.getInfo() != null ? nz(api.getInfo().getVersion()) : "");
 
         // poziom z Info.x-user-level
         String infoLevel = getInfoLevel(api);
 
+        // opcjonalny pakiet z x-doc-header
+        Map<String, Object> hdr = getDocHeader(api);
+        String subtitle   = Objects.toString(hdr.getOrDefault("subtitle", ""), "");
+        String generated  = Objects.toString(hdr.getOrDefault("generatedAt", ""), "");
+
         sb.append("<header>");
-        sb.append("<h1>").append(esc(title)).append("</h1>");
+        sb.append("<h1>").append(esc(projectName)).append("</h1>");  // NAZWA PROJEKTU u góry
+        if (!subtitle.isBlank()) {
+            sb.append("<div class='muted'>").append(esc(subtitle)).append("</div>");
+        }
         sb.append("<div class='muted'>OpenAPI ").append(esc(spec)).append("</div>");
         if (!ver.isBlank()) {
             sb.append("<div class='muted'>Wersja: ").append(esc(ver)).append("</div>");
+        }
+        if (!generated.isBlank()) {
+            sb.append("<div class='muted'>Wygenerowano: ").append(esc(generated)).append("</div>");
         }
         // badge poziomu
         sb.append("<div class='lvl-badge ").append(levelClass(infoLevel)).append("'>")
