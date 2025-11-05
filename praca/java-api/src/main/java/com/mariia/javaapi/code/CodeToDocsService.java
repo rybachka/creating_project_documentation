@@ -29,6 +29,8 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import io.swagger.v3.oas.models.headers.Header;
+
 @Service
 public class CodeToDocsService {
 
@@ -43,12 +45,12 @@ public class CodeToDocsService {
 
     /** Główne wejście – generuje YAML z IR + NLP (zależnie od trybu). */
     public Path generateYamlFromCode(
-            List<EndpointIR> eps,
-            String projectName,
-            String level,
-            Path outFile,
-            Path projectRoot,
-            DescribeMode mode
+        List<EndpointIR> eps,
+        String projectName,
+        String level,
+        Path outFile,
+        Path projectRoot,
+        DescribeMode mode
     ) throws Exception {
 
         System.out.println("[from-code] level=" + level + " mode=" + mode);
@@ -81,6 +83,9 @@ public class CodeToDocsService {
             System.out.println("[DTO] nie znaleziono żadnych DTO – components/schemas będzie puste.");
         }
 
+        // >>> P1: globalny model błędu
+        ensureApiErrorComponent(api);
+
         // Wymagane pola dla CreateUserRequest (jeśli istnieje)
         if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
             Schema<?> cur = api.getComponents().getSchemas().get("CreateUserRequest");
@@ -101,7 +106,7 @@ public class CodeToDocsService {
             PathItem pi = api.getPaths().get(ep.path);
             if (pi == null) { pi = new PathItem(); api.getPaths().addPathItem(ep.path, pi); }
 
-            var op = new io.swagger.v3.oas.models.Operation();
+            io.swagger.v3.oas.models.Operation op = new io.swagger.v3.oas.models.Operation();
             op.setOperationId(ep.operationId);
 
             // --- wejście do NLP ---
@@ -137,7 +142,6 @@ public class CodeToDocsService {
                 ));
 
                 nlpRes = callNlp(body, mode, level);
-                // --- kontrakt NLP: czy mamy response example?
                 boolean hasRespExample = false;
                 Object exObj = nlpRes.get("examples");
                 if (exObj instanceof Map<?,?> exMap) {
@@ -325,6 +329,9 @@ public class CodeToDocsService {
             // --- FINAL SANITY PASS (parametry + odpowiedzi) ---
             finalSanity(op, ep);
 
+            // >>> P1: standardowe błędy + semantyka 201/Location
+            attachStandardErrors(api, op, isWriteMethod(ep.http));
+
             // --- wstaw operację ---
             switch (ep.http) {
                 case "GET":    pi.setGet(op); break;
@@ -504,9 +511,7 @@ public class CodeToDocsService {
 
     // ============= FINAL SANITY PASS =============
     private void finalSanity(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        // 0) Ułatwienia
-        final String path = nz(ep.path);
-        final String pathLc = path.toLowerCase(Locale.ROOT);
+        if (op == null || ep == null) return;
 
         // 1) Dedup parametrów po (in,name) – preferuj bogatsze
         if (op.getParameters() != null && !op.getParameters().isEmpty()) {
@@ -525,13 +530,14 @@ public class CodeToDocsService {
         Set<String> pathVars = findPathVars(ep.path);
         if (!pathVars.isEmpty()) {
             List<Parameter> params = (op.getParameters() == null)
-                    ? new ArrayList<Parameter>()
-                    : new ArrayList<Parameter>(op.getParameters());
+                    ? new ArrayList<>()
+                    : new ArrayList<>(op.getParameters());
 
             Set<String> have = params.stream()
                     .filter(p -> "path".equalsIgnoreCase(nz(p.getIn())))
                     .map(p -> nz(p.getName()).toLowerCase(Locale.ROOT))
                     .collect(Collectors.toSet());
+
             for (String v : pathVars) {
                 if (!have.contains(v.toLowerCase(Locale.ROOT))) {
                     Parameter pp = new Parameter().in("path").name(v).required(true);
@@ -539,51 +545,37 @@ public class CodeToDocsService {
                     params.add(pp);
                 }
             }
-            // path params muszą być required=true
             for (Parameter p : params) {
                 if ("path".equalsIgnoreCase(nz(p.getIn()))) p.setRequired(true);
             }
             op.setParameters(params.isEmpty() ? null : params);
         }
 
-        // 3) Semantyka metod / body
         boolean isGet    = "GET".equalsIgnoreCase(ep.http);
         boolean isDelete = "DELETE".equalsIgnoreCase(ep.http);
         boolean isPost   = "POST".equalsIgnoreCase(ep.http);
         boolean isPut    = "PUT".equalsIgnoreCase(ep.http);
         boolean isPatch  = "PATCH".equalsIgnoreCase(ep.http);
 
-        // GET/DELETE nie powinny mieć body
+        // 3) GET/DELETE nie powinny mieć body
         if (isGet || isDelete) {
             if (op.getRequestBody() != null) {
                 op.setRequestBody(null);
-                // ostrzeżenie — w rozszerzeniu operacji
                 Map<String, Object> ext = op.getExtensions();
                 if (ext == null) { ext = new LinkedHashMap<>(); op.setExtensions(ext); }
-                @SuppressWarnings("unchecked")
-                List<String> warns = (List<String>) ext.getOrDefault("x-warnings", new ArrayList<String>());
-                if (warns == null) warns = new ArrayList<>();
+                List<String> warns = getStringListExt(ext, "x-warnings");
                 warns.add(isGet ? "GET body removed: filtry powinny być w query."
                                 : "DELETE nie przyjmuje body — usunięto.");
                 ext.put("x-warnings", warns);
             }
         }
 
-        // POST/PUT/PATCH – zapewnij body; POST/PUT zwykle wymagają body
-        if (isPost || isPut || isPatch) {
-            RequestBody rb = op.getRequestBody();
-            if (rb == null) {
-                rb = new RequestBody();
-                Content c0 = new Content().addMediaType(
-                        org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
-                        new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
-                );
-                rb.setContent(c0);
-                op.setRequestBody(rb);
-            }
-            if (isPost || isPut) op.getRequestBody().setRequired(true);
+        // 4) POST/PUT zwykle wymagają body
+        if (isPost || isPut) {
+            if (op.getRequestBody() == null) op.setRequestBody(new RequestBody());
+            op.getRequestBody().setRequired(true);
 
-            // jeżeli w schemacie body są pola binarne → multipart/form-data
+            // zapewnij content + schema
             Content c = op.getRequestBody().getContent();
             if (c == null || c.isEmpty()) {
                 c = new Content().addMediaType(
@@ -592,137 +584,22 @@ public class CodeToDocsService {
                 );
                 op.getRequestBody().setContent(c);
             } else {
+                // jeśli JSON schema zawiera binaria → multipart/form-data
                 io.swagger.v3.oas.models.media.MediaType json = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-                if (json != null && containsBinary(json.getSchema())) {
-                    // przenieś do multipart
+                if (json != null && isBinaryLikeSchema(json.getSchema())) {
                     io.swagger.v3.oas.models.media.MediaType mp =
-                            new io.swagger.v3.oas.models.media.MediaType().schema(toMultipart(json.getSchema()));
-                    Content nc = new Content();
+                        new io.swagger.v3.oas.models.media.MediaType().schema(toMultipartSchema(json.getSchema()));
+                    io.swagger.v3.oas.models.media.Content nc = new io.swagger.v3.oas.models.media.Content();
                     nc.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mp);
                     op.getRequestBody().setContent(nc);
                 }
+
             }
         }
 
-        // 4) Przygotuj odpowiedzi
-        ApiResponses responses = op.getResponses();
-        if (responses == null) {
-            responses = new ApiResponses();
-            op.setResponses(responses);
-        }
-
-        // Usuń treść z 204 i ustaw opis
-        ApiResponse r204 = responses.get("204");
-        if (r204 != null) {
-            if (r204.getContent() != null && !r204.getContent().isEmpty()) r204.setContent(null);
-            if (safe(r204.getDescription()).isBlank()) r204.setDescription("No Content");
-        }
-
-        // 5) Heurystyki zgodne z DoD
-
-        // 5a) LOGIN / SEARCH -> 200 OK
-        boolean isLogin  = pathLc.contains("/login") || pathLc.contains("/auth");
-        boolean isSearch = pathLc.contains("/search") || pathLc.contains("/find") || pathLc.endsWith("/list");
-        if (isLogin || isSearch) {
-            // usuń 201/204; wymuś 200 OK
-            responses.keySet().removeIf(k -> "201".equals(k) || "204".equals(k));
-            ApiResponse ok = responses.get("200");
-            if (ok == null) {
-                ok = new ApiResponse().description("OK");
-                Content cnt = new Content().addMediaType(
-                        "application/json",
-                        new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
-                );
-                ok.setContent(cnt);
-                responses.addApiResponse("200", ok);
-            }
-        }
-
-        // 5b) POST add/remove – bez nowego bytu -> 200 lub 204
-        boolean looksLikeAddRemove =
-                (pathLc.endsWith("/add") || pathLc.contains("/add/") || pathLc.endsWith("/remove") || pathLc.contains("/remove/"));
-        if (isPost && looksLikeAddRemove) {
-            boolean hasBodyContent = responses.values().stream().anyMatch(r ->
-                    r != null && r.getContent() != null && !r.getContent().isEmpty());
-            // wyczyść wszystkie 2xx i ustaw właściwą
-            final List<String> toDel = new ArrayList<>();
-            for (String k : responses.keySet()) if (k.startsWith("2")) toDel.add(k);
-            toDel.forEach(responses::remove);
-            if (hasBodyContent) {
-                ApiResponse ok = new ApiResponse().description("OK");
-                if (ok.getContent() == null) {
-                    ok.setContent(new Content().addMediaType(
-                            "application/json",
-                            new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
-                    ));
-                }
-                responses.addApiResponse("200", ok);
-            } else {
-                responses.addApiResponse("204", new ApiResponse().description("No Content"));
-            }
-        }
-
-        // 5c) POST tworzenie zasobu – promuj „puste 200” do 201 i dołóż Location
-        if (isPost) {
-            ApiResponse r200 = responses.get("200");
-            if (r200 != null && isEffectivelyEmpty(r200)) {
-                ApiResponse created = copyResponse(r200);
-                if (safe(created.getDescription()).isBlank()) created.setDescription("Created");
-                responses.remove("200");
-                responses.addApiResponse("201", created);
-            }
-            ApiResponse r201 = responses.get("201");
-            if (r201 != null) {
-                // nagłówek Location (jeśli nie ma)
-                Map<String, io.swagger.v3.oas.models.headers.Header> hs =
-                        (r201.getHeaders() == null) ? new LinkedHashMap<>() : new LinkedHashMap<>(r201.getHeaders());
-                if (!hs.containsKey("Location")) {
-                    io.swagger.v3.oas.models.headers.Header loc = new io.swagger.v3.oas.models.headers.Header()
-                            .description("URI nowo utworzonego zasobu.")
-                            .schema(new StringSchema().format("uri"));
-                    hs.put("Location", loc);
-                    r201.setHeaders(hs);
-                }
-                // jeżeli 200 i 201 są identycznie „puste” – preferuj 201
-                if (responses.get("200") != null && isEffectivelyEmpty(responses.get("200"))) {
-                    responses.remove("200");
-                }
-            }
-        }
-
-        // 5d) DELETE → preferuj 204 i usuń inne 2xx
-        if (isDelete) {
-            if (responses.get("204") == null) {
-                responses.addApiResponse("204", new ApiResponse().description("No Content"));
-            }
-            final List<String> toDel = new ArrayList<>();
-            for (String k : responses.keySet()) {
-                if (k.startsWith("2") && !"204".equals(k)) toDel.add(k);
-            }
-            toDel.forEach(responses::remove);
-        }
-
-        // 6) Napraw brak application/json w 2xx z treścią + brak schematu
-        for (String code : new ArrayList<>(responses.keySet())) {
-            if (!code.startsWith("2")) continue;
-            ApiResponse r = responses.get(code);
-            if (r == null) continue;
-            Content c = r.getContent();
-            if (c == null || c.isEmpty()) continue;
-            io.swagger.v3.oas.models.media.MediaType mt = c.get("application/json");
-            if (mt == null) {
-                mt = new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema());
-                c.addMediaType("application/json", mt);
-                r.setContent(c);
-            }
-            if (mt.getSchema() == null) {
-                mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
-            }
-        }
-
-        // 7) Specjalny kontrakt: POST /api/orders/{orderId}/items
-        if (isPost && path != null && path.matches(".*/api/orders/\\{[^}/]+}/items$")) {
-            // 1) Usuń sku/qty z query
+        // 5) Specjalny kontrakt: POST /api/orders/{orderId}/items
+        if (isPost && ep.path != null && ep.path.matches(".*/api/orders/\\{[^}/]+}/items$")) {
+            // Usuń sku/qty z query
             if (op.getParameters() != null && !op.getParameters().isEmpty()) {
                 List<Parameter> kept = new ArrayList<>();
                 for (Parameter p : op.getParameters()) {
@@ -734,7 +611,7 @@ public class CodeToDocsService {
                 }
                 op.setParameters(kept.isEmpty() ? null : kept);
             }
-            // 2) Body JSON: { sku, qty } (required)
+            // Ustal jednoznaczne JSON body
             ObjectSchema obj = new ObjectSchema();
             obj.addProperties("sku", new StringSchema().description("Kod SKU dodawanej pozycji."));
             obj.addProperties("qty", new IntegerSchema().description("Ilość sztuk."));
@@ -744,9 +621,9 @@ public class CodeToDocsService {
             RequestBody rb = new RequestBody().required(true).content(cnt);
             op.setRequestBody(rb);
 
-            // 3) 201 Created + example
-            ApiResponses rsX = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
-            ApiResponse r201x = new ApiResponse().description("Created");
+            // Odpowiedź 201 Created + prosty example
+            ApiResponses rsEnsure = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
+            ApiResponse r201 = new ApiResponse().description("Created");
             io.swagger.v3.oas.models.media.MediaType rmt = new io.swagger.v3.oas.models.media.MediaType();
             ObjectSchema item = new ObjectSchema();
             item.addProperties("id", new StringSchema().format("uuid"));
@@ -758,18 +635,32 @@ public class CodeToDocsService {
             ex.put("sku", "ABC-123");
             ex.put("qty", 2);
             rmt.setExample(ex);
-            r201x.setContent(new Content().addMediaType("application/json", rmt));
-            // usuń inne 2xx i wstaw 201
-            final List<String> toDel2 = new ArrayList<>();
-            for (String k : rsX.keySet()) if (k.startsWith("2")) toDel2.add(k);
-            toDel2.forEach(rsX::remove);
-            rsX.addApiResponse("201", r201x);
-            op.setResponses(rsX);
+            r201.setContent(new Content().addMediaType("application/json", rmt));
+            rsEnsure.keySet().removeIf(k -> k.startsWith("2"));
+            rsEnsure.addApiResponse("201", r201);
+            op.setResponses(rsEnsure);
+        }
+
+        // 6) Odpowiedzi 2xx — porządki
+        ApiResponses rs = op.getResponses();
+        if (rs == null) {
+            rs = new ApiResponses();
+            op.setResponses(rs);
+        }
+
+        // Usuń treść z 204 i dodaj opis
+        ApiResponse r204x = rs.get("204");
+        if (r204x != null) {
+            if (r204x.getContent() != null && !r204x.getContent().isEmpty()) r204x.setContent(null);
+            if (safe(r204x.getDescription()).isBlank()) r204x.setDescription("No Content");
+        }
+
+        // Jeśli DELETE → preferuj 204 i usuń inne 2xx
+        if (isDelete) {
+            if (rs.get("204") == null) rs.addApiResponse("204", new ApiResponse().description("No Content"));
+            rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
         }
     }
-
-
-
 
     // ============= Pomocnicze do FINAL SANITY ============
     private boolean isBetterParam(Parameter a, Parameter b) {
@@ -784,46 +675,6 @@ public class CodeToDocsService {
         Matcher m = Pattern.compile("\\{([^}/]+)}").matcher(path);
         while (m.find()) s.add(m.group(1));
         return s;
-    }
-
-    private boolean containsBinary(Schema<?> schema) {
-        if (schema == null) return false;
-        if (schema instanceof StringSchema) {
-            StringSchema ss = (StringSchema) schema;
-            return "binary".equalsIgnoreCase(ss.getFormat()) || "base64".equalsIgnoreCase(ss.getFormat());
-        }
-        if (schema instanceof ArraySchema) {
-            return containsBinary(((ArraySchema) schema).getItems());
-        }
-        if (schema instanceof ObjectSchema && schema.getProperties() != null) {
-            for (Object v : schema.getProperties().values()) {
-                if (containsBinary((Schema<?>) v)) return true;
-            }
-        }
-        return false;
-    }
-
-    private Schema<?> toMultipart(Schema<?> json) {
-        ObjectSchema mp = new ObjectSchema();
-        if (json instanceof ObjectSchema && json.getProperties() != null) {
-            for (Map.Entry<String, Schema> e : (Set<Map.Entry<String, Schema>>) json.getProperties().entrySet()) {
-                Schema<?> v = e.getValue();
-                if (v instanceof StringSchema) {
-                    mp.addProperties(e.getKey(), v);
-                } else if (v instanceof ArraySchema && containsBinary(((ArraySchema) v).getItems())) {
-                    ArraySchema arr = new ArraySchema();
-                    arr.setItems(new StringSchema().format("binary"));
-                    mp.addProperties(e.getKey(), arr);
-                } else if (containsBinary(v)) {
-                    mp.addProperties(e.getKey(), new StringSchema().format("binary"));
-                } else {
-                    mp.addProperties(e.getKey(), new StringSchema());
-                }
-            }
-        } else {
-            mp.addProperties("file", new StringSchema().format("binary"));
-        }
-        return mp;
     }
 
     private boolean returnsVoid(EndpointIR ep) {
@@ -1457,7 +1308,6 @@ public class CodeToDocsService {
         }
     }
 
-
     /** Upewnij się, że MediaType ma schema; jeśli brak – wstaw ObjectSchema. */
     private void ensureMediaTypeHasSchema(io.swagger.v3.oas.models.media.MediaType mt) {
         if (mt == null) return;
@@ -1646,4 +1496,242 @@ public class CodeToDocsService {
         Schema<?> ref = refIfComponentExists(candidate, comps);
         return (ref != null) ? ref : current;
     }
+
+    /** Upewnia się, że w components.schemas istnieje ApiError. */
+    private void ensureApiErrorComponent(OpenAPI api) {
+        if (api == null) return;
+        if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
+        Map<String, Schema> schemas = api.getComponents().getSchemas();
+        if (schemas == null) {
+            schemas = new LinkedHashMap<>();
+            api.getComponents().setSchemas(schemas);
+        }
+        if (!schemas.containsKey("ApiError")) {
+            // --- FIX: bez chainingu, bo addProperties zwraca Schema (nie ObjectSchema) ---
+            ObjectSchema err = new ObjectSchema();
+            err.addProperties("code", new StringSchema().description("Krótki kod błędu, np. USER_NOT_FOUND"));
+            err.addProperties("message", new StringSchema().description("Ludzki opis błędu"));
+            err.addProperties("details", new Schema<>().type("object").description("Szczegóły/konkretne pola (opcjonalnie)"));
+            err.addProperties("traceId", new StringSchema().description("Identyfikator żądania"));
+            err.addProperties("timestamp", new StringSchema().format("date-time").description("Znacznik czasu"));
+            err.setRequired(Arrays.asList("code","message"));
+            schemas.put("ApiError", err);
+        }
+    }
+
+    /** Buduje ref do ApiError. */
+    private Schema<?> apiErrorRef() {
+        return new Schema<>().$ref("#/components/schemas/ApiError");
+    }
+
+/** Zapewnia, że dana operacja ma odpowiedź błędu o wskazanym kodzie; nie nadpisuje istniejącej. */
+    private void ensureErrorResponse(
+            io.swagger.v3.oas.models.Operation op,
+            String status,
+            String description,
+            Map<String, Object> example,
+            Map<String, Header> headersIfAny
+    ) {
+        if (op.getResponses() == null) {
+            op.setResponses(new ApiResponses());
+        }
+        ApiResponses rs = op.getResponses();
+        if (rs.get(status) != null) {
+            // Nic nie robimy – już jest
+            return;
+        }
+
+        ApiResponse resp = new ApiResponse().description(description);
+
+        Content c = new Content();
+        io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType();
+        mt.setSchema(apiErrorRef());
+        if (example != null && !example.isEmpty()) {
+            mt.setExample(example);
+        }
+        c.addMediaType("application/json", mt);
+        resp.setContent(c);
+
+        if (headersIfAny != null && !headersIfAny.isEmpty()) {
+            resp.setHeaders(headersIfAny);
+        }
+
+        rs.addApiResponse(status, resp);
+    }
+
+    /** Przykłady dla błędów – proste i czytelne w PDF/SDK. */
+    private Map<String,Object> exErr(String code, String message) {
+        Map<String,Object> m = new LinkedHashMap<>();
+        m.put("code", code);
+        m.put("message", message);
+        m.put("traceId", "0000000000000000");
+        m.put("timestamp", "2025-01-01T12:00:00Z");
+        return m;
+    }
+
+    /** Nagłówek String. */
+    private Header hdrString(String desc) {
+        Header h = new Header();
+        h.setSchema(new StringSchema());
+        h.setDescription(desc);
+        return h;
+    }
+
+    /** Nagłówek Integer. */
+    private Header hdrInteger(String desc) {
+        Header h = new Header();
+        h.setSchema(new IntegerSchema());
+        h.setDescription(desc);
+        return h;
+    }
+
+    /**
+     * Dokleja standardowy zestaw błędów do operacji:
+     * - Zawsze: 400, 401, 403, 404, 429, 500
+     * - Dla operacji mutujących (POST/PUT/PATCH): 409 i 422
+     * Nie nadpisuje istniejących odpowiedzi.
+     */
+    private void attachStandardErrors(OpenAPI api, io.swagger.v3.oas.models.Operation op, boolean isWrite) {
+        if (op == null) return;
+
+        // 400
+        ensureErrorResponse(op, "400", "Bad Request",
+                exErr("INVALID_REQUEST", "Parametry niepoprawne lub niekompletne."),
+                null);
+
+        // 401 (z WWW-Authenticate)
+        Map<String,Header> h401 = new LinkedHashMap<>();
+        h401.put("WWW-Authenticate", hdrString("Schemat autoryzacji, np. Bearer"));
+        ensureErrorResponse(op, "401", "Unauthorized",
+                exErr("UNAUTHORIZED", "Wymagany token dostępu."),
+                h401);
+
+        // 403
+        ensureErrorResponse(op, "403", "Forbidden",
+                exErr("FORBIDDEN", "Brak uprawnień do tej operacji."),
+                null);
+
+        // 404
+        ensureErrorResponse(op, "404", "Not Found",
+                exErr("NOT_FOUND", "Zasób nie istnieje lub został usunięty."),
+                null);
+
+        // 409/422 dla write
+        if (isWrite) {
+            ensureErrorResponse(op, "409", "Conflict",
+                    exErr("CONFLICT", "Konflikt stanu, np. duplikat lub wersjonowanie."), null);
+            ensureErrorResponse(op, "422", "Unprocessable Entity",
+                    exErr("VALIDATION_ERROR", "Dane poprawne syntaktycznie, lecz nie przechodzą walidacji domenowej."), null);
+        }
+
+        // 429 (z Retry-After)
+        Map<String,Header> h429 = new LinkedHashMap<>();
+        h429.put("Retry-After", hdrInteger("Sekundy do kolejnej próby"));
+        ensureErrorResponse(op, "429", "Too Many Requests",
+                exErr("RATE_LIMITED", "Przekroczono limit zapytań."), h429);
+
+        // 500
+        ensureErrorResponse(op, "500", "Internal Server Error",
+                exErr("INTERNAL_ERROR", "Nieoczekiwany błąd serwera."), null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> getStringListExt(Map<String, Object> ext, String key) {
+        List<String> out = new ArrayList<>();
+        if (ext == null) return out;
+        Object v = ext.get(key);
+        if (v == null) return out;
+
+        if (v instanceof List<?>) {
+            for (Object o : (List<?>) v) {
+                if (o != null) out.add(o.toString());
+            }
+            return out;
+        }
+        if (v instanceof String) {
+            out.add((String) v);
+            return out;
+        }
+        return out;
+    }
+
+    // ===== Canonical Schema utils (single source of truth) =====
+
+    private boolean isBinaryLikeSchema(io.swagger.v3.oas.models.media.Schema<?> s) {
+        if (s == null) return false;
+
+        // $ref – nie wnioskujemy o formacie; traktuj jako nie-binarny (chyba że w innym miejscu rozwiniesz ref)
+        if (s.get$ref() != null) return false;
+
+        String type = s.getType();
+        String fmt  = s.getFormat();
+
+        // klasyczny upload pliku w OpenAPI: string + format: binary / base64
+        if ("string".equalsIgnoreCase(type)) {
+            if ("binary".equalsIgnoreCase(fmt) || "base64".equalsIgnoreCase(fmt)) return true;
+        }
+
+        // tablice i obiekty – przejrzyj rekurencyjnie
+        if (s instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
+            return isBinaryLikeSchema(arr.getItems());
+        }
+        if (s instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
+            if (obj.getProperties() != null) {
+                for (io.swagger.v3.oas.models.media.Schema<?> p : obj.getProperties().values()) {
+                    if (isBinaryLikeSchema(p)) return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private io.swagger.v3.oas.models.media.Schema<?> toMultipartSchema(io.swagger.v3.oas.models.media.Schema<?> original) {
+        if (original == null) {
+            return new io.swagger.v3.oas.models.media.ObjectSchema();
+        }
+
+        // Jeśli mamy obiekt – zamieniamy pola binarne na string/binary, resztę zostawiamy jak jest.
+        if (original instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
+            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
+
+            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> src = obj.getProperties();
+            if (src != null && !src.isEmpty()) {
+                java.util.Map<String, io.swagger.v3.oas.models.media.Schema> dst = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, io.swagger.v3.oas.models.media.Schema> e : src.entrySet()) {
+                    io.swagger.v3.oas.models.media.Schema<?> p = e.getValue();
+                    if (isBinaryLikeSchema(p)) {
+                        dst.put(e.getKey(), new io.swagger.v3.oas.models.media.StringSchema().format("binary"));
+                    } else {
+                        dst.put(e.getKey(), p);
+                    }
+                }
+                mp.setProperties(dst);
+            }
+            // przenieś „required”
+            if (obj.getRequired() != null && !obj.getRequired().isEmpty()) {
+                mp.setRequired(new java.util.ArrayList<>(obj.getRequired()));
+            }
+            if (mp.getDescription() == null) mp.setDescription(original.getDescription());
+            return mp;
+        }
+
+        // Jeśli tablica – owiń w obiekt z polem "files"
+        if (original instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
+            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
+            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> props = new java.util.LinkedHashMap<>();
+            props.put("files", arr);
+            mp.setProperties(props);
+            return mp;
+        }
+
+        // Jeśli to $ref – nie rozwijamy agresywnie; zostaw oryginał (często multipart nie ma sensu wymuszać)
+        if (original.get$ref() != null) {
+            return original;
+        }
+
+        // Inne typy – zwróć pusty obiekt jako najbezpieczniejszy fallback
+        return new io.swagger.v3.oas.models.media.ObjectSchema();
+    }
+
 }
