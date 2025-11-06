@@ -7,6 +7,8 @@ import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.media.*;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.responses.ApiResponse;
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.parser.OpenAPIV3Parser;
 import org.springframework.stereotype.Service;
 
@@ -131,9 +133,9 @@ public class PdfDocService {
       .op{border:1px solid #e6e6e6;border-radius:8px;padding:10px;margin:8px 0}
       .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10pt;background:#eef}
       .lvl-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10pt;margin-left:8px;border:1px solid #ddd}
-      .lvl-beginner{background:#e9f8ec}        /* delikatna zieleń */
-      .lvl-intermediate{background:#eef4ff}    /* delikatny niebieski */
-      .lvl-advanced{background:#fff2e6}        /* delikatny pomarańcz */
+      .lvl-beginner{background:#e9f8ec}
+      .lvl-intermediate{background:#eef4ff}
+      .lvl-advanced{background:#fff2e6}
       .method{font-weight:700}
       .path{font-family: monospace}
       .notes,.examples{background:#fafafa;border:1px solid #eee;border-radius:6px;padding:8px;margin-top:8px}
@@ -142,6 +144,7 @@ public class PdfDocService {
       table{border-collapse:collapse;width:100%;margin-top:8px;font-size:10pt;}
       th,td{border:1px solid #eee;padding:6px;text-align:left;vertical-align:top;}
       .schemas h3{margin-top:16px}
+      .security{background:#fbfcff;border:1px solid #e6ecff;border-radius:6px;padding:8px;margin:10px 0}
     """;
 
     private String buildHtml(OpenAPI api) {
@@ -152,20 +155,16 @@ public class PdfDocService {
           .append("</head><body>");
 
         // === Nagłówek z nazwą projektu ===
-        String projectName = getProjectName(api);                 // << klucz: nazwa projektu
+        String projectName = getProjectName(api);
         String spec  = api.getOpenapi() != null ? api.getOpenapi() : "3.x";
         String ver   = (api.getInfo() != null ? nz(api.getInfo().getVersion()) : "");
-
-        // poziom z Info.x-user-level
         String infoLevel = getInfoLevel(api);
-
-        // opcjonalny pakiet z x-doc-header
         Map<String, Object> hdr = getDocHeader(api);
         String subtitle   = Objects.toString(hdr.getOrDefault("subtitle", ""), "");
         String generated  = Objects.toString(hdr.getOrDefault("generatedAt", ""), "");
 
         sb.append("<header>");
-        sb.append("<h1>").append(esc(projectName)).append("</h1>");  // NAZWA PROJEKTU u góry
+        sb.append("<h1>").append(esc(projectName)).append("</h1>");
         if (!subtitle.isBlank()) {
             sb.append("<div class='muted'>").append(esc(subtitle)).append("</div>");
         }
@@ -176,20 +175,23 @@ public class PdfDocService {
         if (!generated.isBlank()) {
             sb.append("<div class='muted'>Wygenerowano: ").append(esc(generated)).append("</div>");
         }
-        // badge poziomu
         sb.append("<div class='lvl-badge ").append(levelClass(infoLevel)).append("'>")
           .append(esc(levelLabelPl(infoLevel)))
           .append("</div>");
         sb.append("</header>");
 
+        // === Sekcja SECURITY (global + schemes) tuż po nagłówku ===
+        renderSecuritySummary(sb, api);
+        renderSecuritySchemes(sb, api.getComponents());
+
         if (api.getPaths() != null) {
             api.getPaths().forEach((path, pathItem) -> {
                 sb.append("<h2><span class='path'>").append(esc(path)).append("</span></h2>");
-                renderOp(sb, "GET",   pathItem.getGet(),    path, infoLevel);
-                renderOp(sb, "POST",  pathItem.getPost(),   path, infoLevel);
-                renderOp(sb, "PUT",   pathItem.getPut(),    path, infoLevel);
-                renderOp(sb, "PATCH", pathItem.getPatch(),  path, infoLevel);
-                renderOp(sb, "DELETE",pathItem.getDelete(), path, infoLevel);
+                renderOp(sb, api, "GET",   pathItem.getGet(),    path, infoLevel);
+                renderOp(sb, api, "POST",  pathItem.getPost(),   path, infoLevel);
+                renderOp(sb, api, "PUT",   pathItem.getPut(),    path, infoLevel);
+                renderOp(sb, api, "PATCH", pathItem.getPatch(),  path, infoLevel);
+                renderOp(sb, api, "DELETE",pathItem.getDelete(), path, infoLevel);
             });
         }
 
@@ -200,10 +202,49 @@ public class PdfDocService {
         return sb.toString();
     }
 
-    private void renderOp(StringBuilder sb, String method, Operation op, String path, String infoLevel) {
+    /** Render: zwięzłe podsumowanie globalnego security (dziedziczenie). */
+    private void renderSecuritySummary(StringBuilder sb, OpenAPI api) {
+        List<SecurityRequirement> sec = api.getSecurity();
+        if (sec == null || sec.isEmpty()) return;
+
+        // Zbierz nazwy schematów z wszystkich wymagań
+        Set<String> names = new LinkedHashSet<>();
+        for (SecurityRequirement r : sec) {
+            if (r != null) names.addAll(r.keySet());
+        }
+        if (names.isEmpty()) return;
+
+        sb.append("<div class='security'><strong>Security (global):</strong> ");
+        sb.append(esc(String.join(", ", names)));
+        sb.append("<div class='muted'>Ścieżki dziedziczą te wymagania, chyba że operacja jawnie ustawi własne security lub „public”.</div>");
+        sb.append("</div>");
+    }
+
+    /** Render: lista components.securitySchemes (np. bearerAuth). */
+    private void renderSecuritySchemes(StringBuilder sb, Components components) {
+        if (components == null || components.getSecuritySchemes() == null || components.getSecuritySchemes().isEmpty()) return;
+
+        sb.append("<div class='security'><strong>Security Schemes</strong>");
+        sb.append("<table><thead><tr><th>Nazwa</th><th>Typ</th><th>Schemat</th><th>Format</th><th>Opis</th></tr></thead><tbody>");
+        components.getSecuritySchemes().forEach((name, scheme) -> {
+            String type   = scheme.getType() != null ? scheme.getType().toString().toLowerCase(Locale.ROOT) : "";
+            String schemeStr = nz(scheme.getScheme());
+            String fmt    = nz(scheme.getBearerFormat());
+            String desc   = nz(scheme.getDescription());
+            sb.append("<tr>")
+              .append("<td>").append(esc(name)).append("</td>")
+              .append("<td>").append(esc(type)).append("</td>")
+              .append("<td>").append(esc(schemeStr)).append("</td>")
+              .append("<td>").append(esc(fmt)).append("</td>")
+              .append("<td>").append(esc(desc)).append("</td>")
+              .append("</tr>");
+        });
+        sb.append("</tbody></table></div>");
+    }
+
+    private void renderOp(StringBuilder sb, OpenAPI api, String method, Operation op, String path, String infoLevel) {
         if (op == null) return;
 
-        // poziom dla tej operacji (nadpisuje nagłówny, jeśli ustawiony)
         String opLevel = getOpLevel(op, infoLevel);
 
         sb.append("<div class='op'>");
@@ -217,6 +258,14 @@ public class PdfDocService {
         sb.append("<span class='lvl-badge ").append(levelClass(opLevel)).append("'>")
           .append(esc(levelLabelPl(opLevel)))
           .append("</span>");
+
+        // ——— SECURITY per operacja ———
+        String opSecurityLabel = computeOperationSecurityLabel(api, op);
+        if (!opSecurityLabel.isBlank()) {
+            sb.append("<div class='muted' style='margin-top:6px'><strong>Security:</strong> ")
+              .append(esc(opSecurityLabel))
+              .append("</div>");
+        }
 
         if (op.getSummary() != null && !op.getSummary().isBlank()) {
             sb.append("<div style='margin-top:6px'><strong>")
@@ -341,15 +390,50 @@ public class PdfDocService {
         sb.append("</div>");
     }
 
+    /** Wylicza etykietę security dla operacji: lokalne -> globalne -> public. */
+    private String computeOperationSecurityLabel(OpenAPI api, Operation op) {
+        // 1) Jeśli operacja jawnie ustawiła pustą listę: public
+        if (op.getSecurity() != null) {
+            if (op.getSecurity().isEmpty()) return "Public (no auth)";
+            // lokalne wymagania
+            Set<String> names = new LinkedHashSet<>();
+            for (SecurityRequirement r : op.getSecurity()) {
+                if (r != null) names.addAll(r.keySet());
+            }
+            if (!names.isEmpty()) return String.join(", ", names);
+            // brak nazw, ale lista niepusta — pokaż jako „Custom”
+            return "Custom";
+        }
+
+        // 2) Dziedziczenie z globalnego (api.security)
+        List<SecurityRequirement> global = api.getSecurity();
+        if (global != null && !global.isEmpty()) {
+            Set<String> names = new LinkedHashSet<>();
+            for (SecurityRequirement r : global) {
+                if (r != null) names.addAll(r.keySet());
+            }
+            if (!names.isEmpty()) return String.join(", ", names);
+            return "Custom";
+        }
+
+        // 3) Brak local i global → traktuj jako public
+        return "Public (no auth)";
+    }
+
     private void renderComponents(StringBuilder sb, Components components) {
-        if (components == null || components.getSchemas() == null || components.getSchemas().isEmpty()) return;
+        if (components == null) return;
+
+        // Najpierw (jeśli jeszcze nie) — securitySchemes są renderowane u góry dokumentu sekcją renderSecuritySchemes().
+
+        // Schematy (DTO, ApiError, itp.)
+        if (components.getSchemas() == null || components.getSchemas().isEmpty()) return;
 
         sb.append("<h2>Components / Schemas</h2>");
         sb.append("<div class='schemas'>");
 
         components.getSchemas().forEach((name, schema) -> {
             sb.append("<h3>").append(esc(name)).append("</h3>");
-            // pokaż ogólny typ/ref
+            // ogólny typ/ref
             if (schema.get$ref() != null) {
                 sb.append("<div>Ref: <code>").append(esc(schema.get$ref())).append("</code></div>");
             } else if (schema.getType() != null) {

@@ -29,6 +29,10 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
+
+
 import io.swagger.v3.oas.models.headers.Header;
 
 @Service
@@ -56,6 +60,23 @@ public class CodeToDocsService {
         System.out.println("[from-code] level=" + level + " mode=" + mode);
         OpenAPI api = new OpenAPI().info(new Info().title(projectName + "-API").version("1.0.0"));
         api.setPaths(new Paths());
+
+        // === Security Schemes (JWT) + globalne wymaganie autoryzacji ===
+        if (api.getComponents() == null) {
+            api.setComponents(new io.swagger.v3.oas.models.Components());
+        }
+        api.getComponents().addSecuritySchemes(
+                "bearerAuth",
+                new io.swagger.v3.oas.models.security.SecurityScheme()
+                        .type(io.swagger.v3.oas.models.security.SecurityScheme.Type.HTTP)
+                        .scheme("bearer")
+                        .bearerFormat("JWT")
+                        .description("JWT w nagłówku Authorization: Bearer <token>")
+        );
+
+        // Globalnie: wszystkie ścieżki wymagają JWT (publiczne odpinamy per-endpoint)
+        api.addSecurityItem(new io.swagger.v3.oas.models.security.SecurityRequirement().addList("bearerAuth"));
+
 
         // === znacznik poziomu odbiorcy do INFO (badge w PDF) ===
         if (api.getInfo() != null) {
@@ -108,6 +129,23 @@ public class CodeToDocsService {
 
             io.swagger.v3.oas.models.Operation op = new io.swagger.v3.oas.models.Operation();
             op.setOperationId(ep.operationId);
+
+            // [SECURITY] publiczne endpointy odpinamy od globalnego security
+            if (isPublicEndpoint(ep)) {
+                op.setSecurity(Collections.emptyList()); // brak wymagań → public
+                // Opcjonalny znacznik do PDF/SDK:
+                Map<String, Object> ext = op.getExtensions();
+                if (ext == null) ext = new LinkedHashMap<>();
+                ext.put("x-security", "public");
+                op.setExtensions(ext);
+            } else {
+                // Opcjonalny znacznik do PDF/SDK:
+                Map<String, Object> ext = op.getExtensions();
+                if (ext == null) ext = new LinkedHashMap<>();
+                ext.put("x-security", "bearerAuth");
+                op.setExtensions(ext);
+            }
+
 
             // --- wejście do NLP ---
             Map<String, Object> nlpRes = Collections.emptyMap();
@@ -1733,5 +1771,65 @@ public class CodeToDocsService {
         // Inne typy – zwróć pusty obiekt jako najbezpieczniejszy fallback
         return new io.swagger.v3.oas.models.media.ObjectSchema();
     }
+
+    /** [SECURITY] Dodaje components.securitySchemes.bearerAuth (HTTP bearer, JWT). */
+private void ensureBearerAuth(OpenAPI api) {
+    if (api == null) return;
+    if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
+    io.swagger.v3.oas.models.Components comps = api.getComponents();
+    if (comps.getSecuritySchemes() == null) comps.setSecuritySchemes(new LinkedHashMap<>());
+
+    if (!comps.getSecuritySchemes().containsKey("bearerAuth")) {
+        SecurityScheme bearer = new SecurityScheme()
+                .type(SecurityScheme.Type.HTTP)
+                .scheme("bearer")
+                .bearerFormat("JWT")
+                .description("JWT bearer token. Używaj nagłówka: Authorization: Bearer <token>");
+        comps.addSecuritySchemes("bearerAuth", bearer);
+    }
+}
+
+/** [SECURITY] Ustaw globalne security: [{ bearerAuth: [] }]. */
+private void applyGlobalSecurity(OpenAPI api) {
+    if (api == null) return;
+    // Nie duplikuj, jeśli już jest ustawione
+    List<SecurityRequirement> sec = api.getSecurity();
+    if (sec == null) sec = new ArrayList<>();
+    boolean hasBearer = sec.stream().anyMatch(sr -> sr != null && sr.containsKey("bearerAuth"));
+    if (!hasBearer) {
+        SecurityRequirement req = new SecurityRequirement().addList("bearerAuth", Collections.emptyList());
+        sec.add(req);
+        api.setSecurity(sec);
+    }
+}
+
+    /**
+     * [SECURITY] Heurystyka: czy endpoint jest publiczny (bez JWT).
+     * - Ścieżki zaczynające się od /auth lub /public
+     * - operationId/description/javadoc wskazują login/register/token/refresh
+     * - GET /docs /health /actuator (typowe public/info)
+     */
+    private boolean isPublicEndpoint(EndpointIR ep) {
+        if (ep == null) return false;
+        String p = nz(ep.path).toLowerCase(Locale.ROOT);
+        String h = nz(ep.http).toUpperCase(Locale.ROOT);
+        String opId = nz(ep.operationId).toLowerCase(Locale.ROOT);
+        String desc = nz(ep.description).toLowerCase(Locale.ROOT);
+        String jdoc = nz(ep.javadoc).toLowerCase(Locale.ROOT);
+
+        // jawne prefiksy publiczne
+        if (p.startsWith("/auth") || p.startsWith("/public")) return true;
+
+        // typowe publiczne zasoby informacyjne
+        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator"))) return true;
+
+        // słowa-klucze (login/register/token/refresh)
+        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh")) return true;
+        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh")) return true;
+        if (jdoc.contains("@public") || jdoc.contains("[public]")) return true;
+
+        return false;
+    }
+
 
 }
