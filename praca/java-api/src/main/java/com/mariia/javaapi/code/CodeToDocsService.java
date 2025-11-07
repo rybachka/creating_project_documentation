@@ -31,7 +31,8 @@ import java.util.stream.Stream;
 
 import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.oas.models.security.SecurityScheme;
-
+import java.math.BigDecimal;
+import io.swagger.v3.oas.models.examples.Example;
 
 import io.swagger.v3.oas.models.headers.Header;
 
@@ -61,6 +62,8 @@ public class CodeToDocsService {
         OpenAPI api = new OpenAPI().info(new Info().title(projectName + "-API").version("1.0.0"));
         api.setPaths(new Paths());
 
+        ensurePaginationComponents(api);
+
         // === Security Schemes (JWT) + globalne wymaganie autoryzacji ===
         if (api.getComponents() == null) {
             api.setComponents(new io.swagger.v3.oas.models.Components());
@@ -73,10 +76,7 @@ public class CodeToDocsService {
                         .bearerFormat("JWT")
                         .description("JWT w nagłówku Authorization: Bearer <token>")
         );
-
-        // Globalnie: wszystkie ścieżki wymagają JWT (publiczne odpinamy per-endpoint)
         api.addSecurityItem(new io.swagger.v3.oas.models.security.SecurityRequirement().addList("bearerAuth"));
-
 
         // === znacznik poziomu odbiorcy do INFO (badge w PDF) ===
         if (api.getInfo() != null) {
@@ -132,20 +132,17 @@ public class CodeToDocsService {
 
             // [SECURITY] publiczne endpointy odpinamy od globalnego security
             if (isPublicEndpoint(ep)) {
-                op.setSecurity(Collections.emptyList()); // brak wymagań → public
-                // Opcjonalny znacznik do PDF/SDK:
+                op.setSecurity(Collections.emptyList());
                 Map<String, Object> ext = op.getExtensions();
                 if (ext == null) ext = new LinkedHashMap<>();
                 ext.put("x-security", "public");
                 op.setExtensions(ext);
             } else {
-                // Opcjonalny znacznik do PDF/SDK:
                 Map<String, Object> ext = op.getExtensions();
                 if (ext == null) ext = new LinkedHashMap<>();
                 ext.put("x-security", "bearerAuth");
                 op.setExtensions(ext);
             }
-
 
             // --- wejście do NLP ---
             Map<String, Object> nlpRes = Collections.emptyMap();
@@ -361,14 +358,27 @@ public class CodeToDocsService {
                 op.setResponses(rs);
             }
 
+            // [PAGINATION] Jeśli to „lista” – dołącz wspólne parametry i PageResponse<T>
+            if (isListEndpoint(ep)) {
+                attachPageableToOperation(api, op, ep);
+            }
+
             // --- twardy post-processing (po NLP) ---
             aiPostProcess(op, ep, mode);
 
             // --- FINAL SANITY PASS (parametry + odpowiedzi) ---
             finalSanity(op, ep);
 
+            ensureResponseExample(op, ep);
+
+            // --- DODANE: minimalne przykłady (request/response/cURL) ---
+            ensureRequestExample(op);
+            ensureHappyResponseExample(api, op, ep);
+            ensureCurlExample(api, op, ep);
+
             // >>> P1: standardowe błędy + semantyka 201/Location
             attachStandardErrors(api, op, isWriteMethod(ep.http));
+            addHappyPathExamples(api, op, ep);
 
             // --- wstaw operację ---
             switch (ep.http) {
@@ -631,7 +641,6 @@ public class CodeToDocsService {
                     nc.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mp);
                     op.getRequestBody().setContent(nc);
                 }
-
             }
         }
 
@@ -694,7 +703,7 @@ public class CodeToDocsService {
         }
 
         // Jeśli DELETE → preferuj 204 i usuń inne 2xx
-        if (isDelete) {
+        if ("DELETE".equalsIgnoreCase(ep.http)) {
             if (rs.get("204") == null) rs.addApiResponse("204", new ApiResponse().description("No Content"));
             rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
         }
@@ -713,47 +722,6 @@ public class CodeToDocsService {
         Matcher m = Pattern.compile("\\{([^}/]+)}").matcher(path);
         while (m.find()) s.add(m.group(1));
         return s;
-    }
-
-    private boolean returnsVoid(EndpointIR ep) {
-        if (ep == null || ep.returns == null || ep.returns.type == null) return true;
-        String t = ep.returns.type.trim();
-        return t.equals("void") || t.equals("Void") || t.startsWith("ResponseEntity<Void");
-    }
-
-    private boolean isEffectivelyEmpty(ApiResponse r) {
-        if (r == null) return true;
-        Content c = r.getContent();
-        if (c == null || c.isEmpty()) return true;
-        io.swagger.v3.oas.models.media.MediaType mt = c.get("application/json");
-        if (mt == null) return true;
-        Schema<?> s = mt.getSchema();
-        return (s == null) || ("object".equalsIgnoreCase(String.valueOf(s.getType())) && mt.getExample() == null);
-    }
-
-    private ApiResponse copyResponse(ApiResponse src) {
-        if (src == null) return new ApiResponse();
-        ApiResponse dst = new ApiResponse();
-        dst.set$ref(src.get$ref());
-        dst.setDescription(src.getDescription());
-        if (src.getContent() != null) {
-            Content dstC = new Content();
-            for (Map.Entry<String, io.swagger.v3.oas.models.media.MediaType> e : src.getContent().entrySet()) {
-                io.swagger.v3.oas.models.media.MediaType nv = new io.swagger.v3.oas.models.media.MediaType();
-                io.swagger.v3.oas.models.media.MediaType v = e.getValue();
-                nv.setSchema(v.getSchema());
-                nv.setExample(v.getExample());
-                nv.setExamples(v.getExamples());
-                nv.setEncoding(v.getEncoding());
-                nv.setExtensions(v.getExtensions());
-                dstC.addMediaType(e.getKey(), nv);
-            }
-            dst.setContent(dstC);
-        }
-        dst.setHeaders(src.getHeaders());
-        dst.setLinks(src.getLinks());
-        dst.setExtensions(src.getExtensions());
-        return dst;
     }
 
     // ============= Ścieżki projektu =============
@@ -1143,6 +1111,7 @@ public class CodeToDocsService {
         }
 
         if (s.get$ref() != null) {
+            // bez deref – zwracamy „pusty” obiekt; w PageResponse i tak dokładamy 1 element
             return Map.of();
         }
 
@@ -1158,7 +1127,6 @@ public class CodeToDocsService {
     }
 
     // ================== DODATKI: helper do rozpoznania metody w sanitizeOpenApi ==================
-    // Rozpoznaj metodę HTTP dla Operation, patrząc na referencję w PathItem
     private static String methodOf(PathItem pi, io.swagger.v3.oas.models.Operation op) {
         if (op == null || pi == null) return null;
         if (op == pi.getGet())     return "GET";
@@ -1222,25 +1190,21 @@ public class CodeToDocsService {
                                 op.getResponses().forEach((code, resp) -> {
                                     if (resp == null) return;
 
-                                    // 204: bezwzględnie bez treści i z opisem "No Content"
                                     if ("204".equals(code)) {
                                         resp.setContent(null);
                                         resp.setDescription("No Content");
                                         return;
                                     }
 
-                                    // Pozostałe kody – domknięcie contentu/schematów
                                     if (resp.getContent() != null) {
                                         resp.getContent().forEach((ct, mt) -> {
                                             ensureMediaTypeHasSchema(mt);
                                             Schema<?> s = mt.getSchema();
                                             sanitizeSchemaTree(s);
 
-                                            // „gołe” array → dodaj items
                                             if (s instanceof ArraySchema arr && arr.getItems() == null) {
                                                 arr.setItems(new ObjectSchema());
                                             }
-                                            // błędny $ref → object
                                             if (s != null && s.get$ref() != null && s.get$ref().endsWith("/?")) {
                                                 mt.setSchema(new ObjectSchema());
                                             }
@@ -1248,7 +1212,6 @@ public class CodeToDocsService {
                                     }
                                 });
 
-                                // Po pętli: kosmetyka opisów 201/OK → Created
                                 ApiResponse r201 = op.getResponses().get("201");
                                 if (r201 != null) {
                                     String desc = r201.getDescription();
@@ -1264,7 +1227,6 @@ public class CodeToDocsService {
                                     && p != null
                                     && p.matches(".*/api/orders/\\{[^}/]+}/items$")) {
 
-                                // 1) Body musi być JSON: { sku: string, qty: integer } i oba required
                                 RequestBody rb2 = op.getRequestBody();
                                 boolean needsFix = true;
                                 ObjectSchema desired = new ObjectSchema();
@@ -1290,7 +1252,6 @@ public class CodeToDocsService {
                                     op.setRequestBody(new RequestBody().content(cnt).required(true));
                                 }
 
-                                // 2) Odpowiedź: preferuj 201 Created z prostym schematem i przykładem
                                 ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
 
                                 ApiResponse r200 = rs.get("200");
@@ -1359,20 +1320,17 @@ public class CodeToDocsService {
     private void sanitizeSchemaTree(Schema<?> s) {
         if (s == null) return;
 
-        // $ref – nie dłubiemy w środku
         if (s.get$ref() != null && !s.get$ref().isBlank()) return;
 
-        // Array → MUSI mieć items
         if (s instanceof ArraySchema arr) {
             if (arr.getItems() == null) {
-                arr.setItems(new ObjectSchema());              // << koniec „gołych” array
+                arr.setItems(new ObjectSchema());
             } else {
                 sanitizeSchemaTree(arr.getItems());
             }
             return;
         }
 
-        // Map → additionalProperties = schema (nie Boolean.TRUE)
         if (s instanceof MapSchema ms) {
             Object ap = ms.getAdditionalProperties();
             if (ap == null || ap instanceof Boolean) {
@@ -1383,7 +1341,6 @@ public class CodeToDocsService {
             return;
         }
 
-        // Composed (oneOf/anyOf/allOf)
         if (s instanceof ComposedSchema cs) {
             if (cs.getAllOf() != null) cs.getAllOf().forEach(this::sanitizeSchemaTree);
             if (cs.getAnyOf() != null) cs.getAnyOf().forEach(this::sanitizeSchemaTree);
@@ -1391,7 +1348,6 @@ public class CodeToDocsService {
             return;
         }
 
-        // Object → przejdź po properties
         if (s instanceof ObjectSchema || "object".equalsIgnoreCase(Objects.toString(s.getType(), ""))) {
             Object props = s.getProperties();
             if (props instanceof Map) {
@@ -1400,7 +1356,6 @@ public class CodeToDocsService {
             return;
         }
 
-        // „puste” nie-typowane – domknij jako object,
         boolean noTypeLike = s.getType() == null
                 && !(s instanceof StringSchema)
                 && !(s instanceof IntegerSchema)
@@ -1424,7 +1379,6 @@ public class CodeToDocsService {
 
         java.util.List<String> warns = new java.util.ArrayList<>();
 
-        // Schematy i properties
         if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
             api.getComponents().getSchemas().forEach((schemaName, schema) -> {
                 NAME_FIXES.forEach((bad, good) -> {
@@ -1449,7 +1403,6 @@ public class CodeToDocsService {
             });
         }
 
-        // operationId + parametry
         if (api.getPaths() != null) {
             api.getPaths().forEach((path, item) -> {
                 java.util.stream.Stream
@@ -1494,48 +1447,424 @@ public class CodeToDocsService {
     }
     // ====== END: naming warnings ======
 
-    // == [A] Wymuś $ref do istniejącego komponentu zamiast anonimowego object ==
-    private Schema<?> refIfComponentExists(String maybeDtoSimpleName, io.swagger.v3.oas.models.Components components) {
-        if (maybeDtoSimpleName == null || components == null || components.getSchemas() == null) {
-            return null;
+    /** [SECURITY] Dodaje components.securitySchemes.bearerAuth (HTTP bearer, JWT). */
+    private void ensureBearerAuth(OpenAPI api) {
+        if (api == null) return;
+        if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
+        io.swagger.v3.oas.models.Components comps = api.getComponents();
+        if (comps.getSecuritySchemes() == null) comps.setSecuritySchemes(new LinkedHashMap<>());
+
+        if (!comps.getSecuritySchemes().containsKey("bearerAuth")) {
+            SecurityScheme bearer = new SecurityScheme()
+                    .type(SecurityScheme.Type.HTTP)
+                    .scheme("bearer")
+                    .bearerFormat("JWT")
+                    .description("JWT bearer token. Używaj nagłówka: Authorization: Bearer <token>");
+            comps.addSecuritySchemes("bearerAuth", bearer);
         }
-        Map<String, Schema> all = components.getSchemas();
-        if (all.containsKey(maybeDtoSimpleName)) {
-            Schema<?> ref = new Schema<>();
-            ref.$ref("#/components/schemas/" + maybeDtoSimpleName);
-            return ref;
+    }
+
+    /** [SECURITY] Ustaw globalne security: [{ bearerAuth: [] }]. */
+    private void applyGlobalSecurity(OpenAPI api) {
+        if (api == null) return;
+        List<SecurityRequirement> sec = api.getSecurity();
+        if (sec == null) sec = new ArrayList<>();
+        boolean hasBearer = sec.stream().anyMatch(sr -> sr != null && sr.containsKey("bearerAuth"));
+        if (!hasBearer) {
+            SecurityRequirement req = new SecurityRequirement().addList("bearerAuth", Collections.emptyList());
+            sec.add(req);
+            api.setSecurity(sec);
         }
+    }
+
+    /**
+     * [SECURITY] Heurystyka: czy endpoint jest publiczny (bez JWT).
+     */
+    private boolean isPublicEndpoint(EndpointIR ep) {
+        if (ep == null) return false;
+        String p = nz(ep.path).toLowerCase(Locale.ROOT);
+        String h = nz(ep.http).toUpperCase(Locale.ROOT);
+        String opId = nz(ep.operationId).toLowerCase(Locale.ROOT);
+        String desc = nz(ep.description).toLowerCase(Locale.ROOT);
+        String jdoc = nz(ep.javadoc).toLowerCase(Locale.ROOT);
+
+        if (p.startsWith("/auth") || p.startsWith("/public")) return true;
+        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator"))) return true;
+
+        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh")) return true;
+        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh")) return true;
+        if (jdoc.contains("@public") || jdoc.contains("[public]")) return true;
+
+        return false;
+    }
+
+    /** [PAGINATION] Dodaje reużywalne parametry i schemat odpowiedzi PageResponse<T>. */
+    private void ensurePaginationComponents(OpenAPI api) {
+        if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
+        var comps = api.getComponents();
+
+        if (comps.getParameters() == null) comps.setParameters(new LinkedHashMap<>());
+
+        Parameter page = new Parameter()
+                .name("page").in("query").required(false).description("Numer strony (0..N).")
+                .schema(new IntegerSchema()._default(0).minimum(BigDecimal.ZERO));
+        comps.getParameters().put("PageablePage", page);
+
+        IntegerSchema sizeSchema = new IntegerSchema();
+        sizeSchema.setMinimum(new BigDecimal(1));
+        sizeSchema.setMaximum(new BigDecimal(100));
+        sizeSchema.setDefault(20);
+        Parameter size = new Parameter()
+                .name("size").in("query").required(false)
+                .description("Rozmiar strony (1..100).")
+                .schema(sizeSchema);
+        comps.getParameters().put("PageableSize", size);
+
+        StringSchema sortSchema = new StringSchema();
+        sortSchema.setExample("createdAt,desc");
+        Parameter sort = new Parameter()
+                .name("sort").in("query").required(false)
+                .description("Sortowanie: pole,(asc|desc). Można powtórzyć parametr wielokrotnie.")
+                .schema(sortSchema);
+        comps.getParameters().put("PageableSort", sort);
+
+        if (comps.getSchemas() == null) comps.setSchemas(new LinkedHashMap<>());
+        if (!comps.getSchemas().containsKey("PageResponse")) {
+            ObjectSchema pageResp = new ObjectSchema();
+            ArraySchema content = new ArraySchema().items(new ObjectSchema());
+            pageResp.addProperties("content", content);
+            pageResp.addProperties("page", new IntegerSchema().description("Numer strony (0..N)."));
+            pageResp.addProperties("size", new IntegerSchema().description("Rozmiar strony."));
+            pageResp.addProperties("totalElements", new IntegerSchema().description("Łączna liczba rekordów."));
+            pageResp.addProperties("totalPages", new IntegerSchema().description("Łączna liczba stron."));
+            comps.getSchemas().put("PageResponse", pageResp);
+        }
+    }
+
+    /** Heurystyka: czy endpoint zwraca listę/stronicowaną kolekcję. */
+    private boolean isListEndpoint(EndpointIR ep) {
+        if (ep == null) return false;
+        String h = (ep.http == null ? "" : ep.http).toUpperCase(Locale.ROOT);
+        if (!"GET".equals(h)) return false;
+
+        String t = ep.returns == null ? "" : (ep.returns.type == null ? "" : ep.returns.type);
+        String path = ep.path == null ? "" : ep.path;
+
+        if (t.startsWith("List<") || t.endsWith("[]")) return true;
+        if (t.startsWith("Page<")) return true;
+        if (path.matches(".*/(users|orders|items|products|entries|posts|comments|[a-zA-Z]+s)(/)?$")) return true;
+
+        return false;
+    }
+
+    /** Przypina reużywalne parametry i ustawia PageResponse<T> dla 200. */
+    private void attachPageableToOperation(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op == null) return;
+
+        List<Parameter> ps = (op.getParameters() == null) ? new ArrayList<>(): new ArrayList<>(op.getParameters());
+        ps.removeIf(p -> {
+            String place = (p.getIn() == null ? "" : p.getIn()).toLowerCase(Locale.ROOT);
+            String name  = (p.getName() == null ? "" : p.getName()).toLowerCase(Locale.ROOT);
+            return "query".equals(place) && (name.equals("page") || name.equals("size") || name.equals("sort"));
+        });
+
+        Parameter pPage = new Parameter().$ref("#/components/parameters/PageablePage");
+        Parameter pSize = new Parameter().$ref("#/components/parameters/PageableSize");
+        Parameter pSort = new Parameter().$ref("#/components/parameters/PageableSort");
+
+        var keys = ps.stream()
+                .map(p -> (String.valueOf(p.getIn()) + ":" + String.valueOf(p.getName())).toLowerCase(Locale.ROOT))
+                .collect(java.util.stream.Collectors.toSet());
+        if (!keys.contains("query:page")) ps.add(pPage);
+        if (!keys.contains("query:size")) ps.add(pSize);
+        if (!keys.contains("query:sort")) ps.add(pSort);
+        op.setParameters(ps);
+
+        ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
+        ApiResponse ok = rs.get("200");
+        if (ok == null) {
+            ok = new ApiResponse().description("OK");
+            rs.addApiResponse("200", ok);
+        }
+        Content c = (ok.getContent() == null) ? new Content() : ok.getContent();
+        io.swagger.v3.oas.models.media.MediaType mt = (c.get("application/json") == null)
+                ? new io.swagger.v3.oas.models.media.MediaType()
+                : c.get("application/json");
+
+        String returns = (ep.returns == null) ? null : ep.returns.type;
+        Schema<?> itemSchema = schemaForType(extractElementType(returns));
+        if (itemSchema == null) itemSchema = new ObjectSchema();
+
+        Schema<?> pageBaseRef = new Schema<>().$ref("#/components/schemas/PageResponse");
+        ObjectSchema pageOverride = new ObjectSchema();
+        ArraySchema content = new ArraySchema().items(itemSchema);
+        pageOverride.addProperties("content", content);
+
+        ComposedSchema pageComposed = new ComposedSchema();
+        pageComposed.addAllOfItem(pageBaseRef);
+        pageComposed.addAllOfItem(pageOverride);
+
+        Map<String,Object> ex = new LinkedHashMap<>();
+        ex.put("page", 0);
+        ex.put("size", 20);
+        ex.put("totalElements", 128);
+        ex.put("totalPages", 7);
+        Object itemEx = synthExampleNeutral(itemSchema);
+        ex.put("content", java.util.List.of(itemEx));
+
+        mt.setSchema(pageComposed);
+        mt.setExample(ex);
+
+        c.addMediaType("application/json", mt);
+        ok.setContent(c);
+        rs.addApiResponse("200", ok);
+        op.setResponses(rs);
+    }
+
+    /** Wyciąga typ elementu: List<X> / Page<X> / X[] → X; w przeciwnym razie null. */
+    private String extractElementType(String t) {
+        if (t == null || t.isBlank()) return null;
+        String s = t.trim();
+        if (s.startsWith("List<") || s.startsWith("Page<")) {
+            int lt = s.indexOf('<'); int gt = s.lastIndexOf('>');
+            if (lt >= 0 && gt > lt) return s.substring(lt + 1, gt).trim();
+        }
+        if (s.endsWith("[]")) return s.substring(0, s.length() - 2);
         return null;
     }
 
-    /** Zwraca prostą nazwę typu (X z com.foo.X, X z List<X>, X[] -> X). */
-    private String simpleElementName(String typeString) {
-        if (typeString == null || typeString.isBlank()) return null;
-        String t = typeString.trim();
-        int lt = t.indexOf('<');
-        int gt = t.lastIndexOf('>');
-        if (lt >= 0 && gt > lt) t = t.substring(lt + 1, gt).trim();
-        if (t.endsWith("[]")) t = t.substring(0, t.length() - 2);
-        int dot = t.lastIndexOf('.');
-        return (dot >= 0) ? t.substring(dot + 1) : t;
+    // ===================== DODANE: Request/Response/Curl Examples =====================
+
+    /** Minimalny „happy path” example w 2xx (preferencja: 200 → 201 → inne 2xx). */
+    private void ensureHappyResponseExample(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op == null || op.getResponses() == null || op.getResponses().isEmpty()) return;
+
+        // wybór kodu 2xx
+        String[] prefs = {"200","201"};
+        String pick = null;
+        for (String p : prefs) if (op.getResponses().containsKey(p)) { pick = p; break; }
+        if (pick == null) {
+            for (String k : op.getResponses().keySet()) {
+                if (k != null && k.startsWith("2")) { pick = k; break; }
+            }
+        }
+        if (pick == null) return;
+
+        ApiResponse r = op.getResponses().get(pick);
+        if (r == null) return;
+        Content rc = (r.getContent() == null) ? new Content() : r.getContent();
+        io.swagger.v3.oas.models.media.MediaType mt = rc.get("application/json");
+        if (mt == null) {
+            mt = new io.swagger.v3.oas.models.media.MediaType();
+            rc.addMediaType("application/json", mt);
+        }
+
+        if (mt.getSchema() == null) {
+            mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
+        }
+
+        if (mt.getExample() == null) {
+            Object ex = exampleFromSchema(mt.getSchema());
+            // jeśli dalej pusto, wypełnij neutralnie
+            if (ex == null || (ex instanceof Map && ((Map<?,?>) ex).isEmpty())) {
+                ex = synthExampleNeutral(mt.getSchema());
+            }
+            mt.setExample(ex);
+        }
+
+        r.setContent(rc);
+        op.getResponses().put(pick, r);
     }
 
-    /** Jeżeli schema jest ObjectSchema (anonimowy obiekt), a mamy pasujący component – podmień na $ref. */
-    private Schema<?> enforceRefIfPossible(Schema<?> current, String returnTypeString, io.swagger.v3.oas.models.Components comps) {
-        if (current == null) return null;
-        if (current.get$ref() != null && !current.get$ref().isBlank()) return current;
+    /** cURL: jeśli nie ma żadnego, wygeneruj prosty przykład zgodny z metodą i ścieżką. */
+    private void ensureCurlExample(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op == null) return;
+        Map<String, Object> ext = op.getExtensions();
+        if (ext == null) { ext = new LinkedHashMap<>(); op.setExtensions(ext); }
 
-        boolean isAnonObject = (current instanceof io.swagger.v3.oas.models.media.ObjectSchema)
-                || "object".equalsIgnoreCase(String.valueOf(current.getType()));
+        Object xr = ext.get("x-request-examples");
+        boolean hasAny = (xr instanceof List) && !((List<?>) xr).isEmpty();
+        if (hasAny) return;
 
-        if (!isAnonObject) return current;
+        String base = "{{BASE_URL}}"; // zostawiamy placeholder do podmiany w PDF/SDK
+        String url = base + ep.path;
+        String method = nz(ep.http).isBlank() ? "GET" : ep.http.toUpperCase(Locale.ROOT);
 
-        String candidate = simpleElementName(returnTypeString);
-        Schema<?> ref = refIfComponentExists(candidate, comps);
-        return (ref != null) ? ref : current;
+        StringBuilder sb = new StringBuilder();
+        sb.append("curl -X ").append(method).append(" \"").append(url).append("\" \\\n")
+          .append("  -H \"Authorization: Bearer <token>\"");
+
+        // jeśli body → dołącz JSON z example
+        if (op.getRequestBody() != null) {
+            Content c = op.getRequestBody().getContent();
+            io.swagger.v3.oas.models.media.MediaType mt = (c == null) ? null : c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+            Object bodyEx = (mt != null) ? mt.getExample() : null;
+            if (bodyEx == null && mt != null && mt.getSchema() != null) {
+                bodyEx = synthExampleNeutral(mt.getSchema());
+            }
+            sb.append(" \\\n  -H \"Content-Type: application/json\"");
+            if (bodyEx != null) {
+                sb.append(" \\\n  --data-raw '").append(jsonMin(bodyEx)).append("'");
+            }
+        }
+
+        List<String> list = new ArrayList<>();
+        list.add(normalizeCurl(sb.toString()));
+        ext.put("x-request-examples", list);
+
+        // od razu walidacja/annotacja
+        validateAndAnnotateCurlExamples(op, ep);
     }
 
-    /** Upewnia się, że w components.schemas istnieje ApiError. */
+    // ========== Helpery do przykładów ==========
+    private Schema<?> resolveRef(Schema<?> s) {
+        // Minimalny resolver – zostawiamy s jak jest; dla $ref synthExampleNeutral zwróci {} (bezpieczny fallback)
+        return s;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object exampleFromSchema(Schema<?> schema) {
+        if (schema == null) return Map.of();
+
+        if (schema instanceof ArraySchema arr) {
+            return List.of(synthExampleNeutral(arr.getItems()));
+        }
+        if (schema instanceof ObjectSchema obj) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            Object props = obj.getProperties();
+            if (props instanceof Map<?,?> m) {
+                for (Map.Entry<?,?> e : m.entrySet()) {
+                    if (e.getKey() == null || !(e.getValue() instanceof Schema<?> ps)) continue;
+                    out.put(String.valueOf(e.getKey()), synthExampleNeutral(ps));
+                }
+            }
+            return out;
+        }
+        if (schema instanceof ComposedSchema cs) {
+            // najczęstszy przypadek: allOf[ $ref(PageResponse), { content: array<T> } ]
+            Map<String,Object> merged = new LinkedHashMap<>();
+            if (cs.getAllOf() != null) {
+                for (Schema<?> part : cs.getAllOf()) {
+                    Object ex = exampleFromSchema(part);
+                    if (ex instanceof Map<?,?> map) {
+                        map.forEach((k,v) -> merged.put(String.valueOf(k), v));
+                    }
+                }
+            }
+            return merged.isEmpty() ? Map.of() : merged;
+        }
+        if (schema instanceof StringSchema || schema instanceof IntegerSchema || schema instanceof NumberSchema || schema instanceof BooleanSchema) {
+            return synthExampleNeutral(schema);
+        }
+        if (schema.get$ref() != null) {
+            return Map.of();
+        }
+        return Map.of();
+    }
+
+    private String jsonMin(Object o) {
+        // najprostszy, bez zależności – na nasze proste przykłady wystarczy
+        if (o == null) return "null";
+        if (o instanceof String) return ((String) o).replace("\"","\\\"");
+        if (o instanceof Number || o instanceof Boolean) return String.valueOf(o);
+        if (o instanceof Map<?,?> m) {
+            StringBuilder sb = new StringBuilder("{");
+            boolean first = true;
+            for (Map.Entry<?,?> e : m.entrySet()) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('"').append(String.valueOf(e.getKey()).replace("\"","\\\"")).append("\":");
+                sb.append(jsonMin(e.getValue()));
+            }
+            sb.append('}');
+            return sb.toString();
+        }
+        if (o instanceof Collection<?> c) {
+            StringBuilder sb = new StringBuilder("[");
+            boolean first = true;
+            for (Object it : c) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append(jsonMin(it));
+            }
+            sb.append(']');
+            return sb.toString();
+        }
+        return "\"\"";
+    }
+
+    // ===== Canonical Schema utils (single source of truth) =====
+
+    private boolean isBinaryLikeSchema(io.swagger.v3.oas.models.media.Schema<?> s) {
+        if (s == null) return false;
+
+        if (s.get$ref() != null) return false;
+
+        String type = s.getType();
+        String fmt  = s.getFormat();
+
+        if ("string".equalsIgnoreCase(type)) {
+            if ("binary".equalsIgnoreCase(fmt) || "base64".equalsIgnoreCase(fmt)) return true;
+        }
+
+        if (s instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
+            return isBinaryLikeSchema(arr.getItems());
+        }
+        if (s instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
+            if (obj.getProperties() != null) {
+                for (io.swagger.v3.oas.models.media.Schema<?> p : obj.getProperties().values()) {
+                    if (isBinaryLikeSchema(p)) return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private io.swagger.v3.oas.models.media.Schema<?> toMultipartSchema(io.swagger.v3.oas.models.media.Schema<?> original) {
+        if (original == null) {
+            return new io.swagger.v3.oas.models.media.ObjectSchema();
+        }
+
+        if (original instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
+            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
+
+            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> src = obj.getProperties();
+            if (src != null && !src.isEmpty()) {
+                java.util.Map<String, io.swagger.v3.oas.models.media.Schema> dst = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, io.swagger.v3.oas.models.media.Schema> e : src.entrySet()) {
+                    io.swagger.v3.oas.models.media.Schema<?> p = e.getValue();
+                    if (isBinaryLikeSchema(p)) {
+                        dst.put(e.getKey(), new io.swagger.v3.oas.models.media.StringSchema().format("binary"));
+                    } else {
+                        dst.put(e.getKey(), p);
+                    }
+                }
+                mp.setProperties(dst);
+            }
+            if (obj.getRequired() != null && !obj.getRequired().isEmpty()) {
+                mp.setRequired(new java.util.ArrayList<>(obj.getRequired()));
+            }
+            if (mp.getDescription() == null) mp.setDescription(original.getDescription());
+            return mp;
+        }
+
+        if (original instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
+            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
+            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> props = new java.util.LinkedHashMap<>();
+            props.put("files", arr);
+            mp.setProperties(props);
+            return mp;
+        }
+
+        if (original.get$ref() != null) {
+            return original;
+        }
+
+        return new io.swagger.v3.oas.models.media.ObjectSchema();
+    }
+
+    /** [SECURITY] Dodaje ApiError do components.schemas jeśli brakuje. */
     private void ensureApiErrorComponent(OpenAPI api) {
         if (api == null) return;
         if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
@@ -1545,7 +1874,6 @@ public class CodeToDocsService {
             api.getComponents().setSchemas(schemas);
         }
         if (!schemas.containsKey("ApiError")) {
-            // --- FIX: bez chainingu, bo addProperties zwraca Schema (nie ObjectSchema) ---
             ObjectSchema err = new ObjectSchema();
             err.addProperties("code", new StringSchema().description("Krótki kod błędu, np. USER_NOT_FOUND"));
             err.addProperties("message", new StringSchema().description("Ludzki opis błędu"));
@@ -1562,7 +1890,7 @@ public class CodeToDocsService {
         return new Schema<>().$ref("#/components/schemas/ApiError");
     }
 
-/** Zapewnia, że dana operacja ma odpowiedź błędu o wskazanym kodzie; nie nadpisuje istniejącej. */
+    /** Zapewnia, że dana operacja ma odpowiedź błędu o wskazanym kodzie; nie nadpisuje istniejącej. */
     private void ensureErrorResponse(
             io.swagger.v3.oas.models.Operation op,
             String status,
@@ -1575,7 +1903,6 @@ public class CodeToDocsService {
         }
         ApiResponses rs = op.getResponses();
         if (rs.get(status) != null) {
-            // Nic nie robimy – już jest
             return;
         }
 
@@ -1624,37 +1951,25 @@ public class CodeToDocsService {
     }
 
     /**
-     * Dokleja standardowy zestaw błędów do operacji:
-     * - Zawsze: 400, 401, 403, 404, 429, 500
-     * - Dla operacji mutujących (POST/PUT/PATCH): 409 i 422
-     * Nie nadpisuje istniejących odpowiedzi.
+     * Dokleja standardowy zestaw błędów do operacji.
      */
     private void attachStandardErrors(OpenAPI api, io.swagger.v3.oas.models.Operation op, boolean isWrite) {
         if (op == null) return;
 
-        // 400
         ensureErrorResponse(op, "400", "Bad Request",
-                exErr("INVALID_REQUEST", "Parametry niepoprawne lub niekompletne."),
-                null);
+                exErr("INVALID_REQUEST", "Parametry niepoprawne lub niekompletne."), null);
 
-        // 401 (z WWW-Authenticate)
         Map<String,Header> h401 = new LinkedHashMap<>();
         h401.put("WWW-Authenticate", hdrString("Schemat autoryzacji, np. Bearer"));
         ensureErrorResponse(op, "401", "Unauthorized",
-                exErr("UNAUTHORIZED", "Wymagany token dostępu."),
-                h401);
+                exErr("UNAUTHORIZED", "Wymagany token dostępu."), h401);
 
-        // 403
         ensureErrorResponse(op, "403", "Forbidden",
-                exErr("FORBIDDEN", "Brak uprawnień do tej operacji."),
-                null);
+                exErr("FORBIDDEN", "Brak uprawnień do tej operacji."), null);
 
-        // 404
         ensureErrorResponse(op, "404", "Not Found",
-                exErr("NOT_FOUND", "Zasób nie istnieje lub został usunięty."),
-                null);
+                exErr("NOT_FOUND", "Zasób nie istnieje lub został usunięty."), null);
 
-        // 409/422 dla write
         if (isWrite) {
             ensureErrorResponse(op, "409", "Conflict",
                     exErr("CONFLICT", "Konflikt stanu, np. duplikat lub wersjonowanie."), null);
@@ -1662,13 +1977,11 @@ public class CodeToDocsService {
                     exErr("VALIDATION_ERROR", "Dane poprawne syntaktycznie, lecz nie przechodzą walidacji domenowej."), null);
         }
 
-        // 429 (z Retry-After)
         Map<String,Header> h429 = new LinkedHashMap<>();
         h429.put("Retry-After", hdrInteger("Sekundy do kolejnej próby"));
         ensureErrorResponse(op, "429", "Too Many Requests",
                 exErr("RATE_LIMITED", "Przekroczono limit zapytań."), h429);
 
-        // 500
         ensureErrorResponse(op, "500", "Internal Server Error",
                 exErr("INTERNAL_ERROR", "Nieoczekiwany błąd serwera."), null);
     }
@@ -1693,143 +2006,241 @@ public class CodeToDocsService {
         return out;
     }
 
-    // ===== Canonical Schema utils (single source of truth) =====
+    /** Jeśli brak przykładu w 2xx -> zbuduj neutralny example na bazie schematu. */
+    private void ensureResponseExample(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op.getResponses() == null) return;
+        op.getResponses().forEach((code, resp) -> {
+            if (resp == null) return;
+            // tylko 2xx
+            if (!code.startsWith("2")) return;
+            Content c = resp.getContent();
+            if (c == null) return;
+            io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+            if (mt == null) return;
 
-    private boolean isBinaryLikeSchema(io.swagger.v3.oas.models.media.Schema<?> s) {
-        if (s == null) return false;
+            // nie nadpisuj istniejących przykładów
+            if (mt.getExample() != null) return;
 
-        // $ref – nie wnioskujemy o formacie; traktuj jako nie-binarny (chyba że w innym miejscu rozwiniesz ref)
-        if (s.get$ref() != null) return false;
+            Schema<?> s = mt.getSchema();
+            if (s == null) return;
 
-        String type = s.getType();
-        String fmt  = s.getFormat();
+            // Bez enforceRefIfPossible – utrzymujemy istniejący schema i generujemy neutralny example
+            Object ex = synthExampleNeutral(s);
+            if (ex != null) mt.setExample(ex);
+        });
+    }
 
-        // klasyczny upload pliku w OpenAPI: string + format: binary / base64
-        if ("string".equalsIgnoreCase(type)) {
-            if ("binary".equalsIgnoreCase(fmt) || "base64".equalsIgnoreCase(fmt)) return true;
+    /** Dodaje automatyczne happy-path examples wg metody i typu endpointu. */
+    private void addHappyPathExamples(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op == null) return;
+
+        boolean isGet    = "GET".equalsIgnoreCase(nz(ep.http));
+        boolean isPost   = "POST".equalsIgnoreCase(nz(ep.http));
+        boolean isPut    = "PUT".equalsIgnoreCase(nz(ep.http));
+        boolean isPatch  = "PATCH".equalsIgnoreCase(nz(ep.http));
+        boolean isDelete = "DELETE".equalsIgnoreCase(nz(ep.http));
+
+        // GET /{id} — przykład 200 z konkretnym obiektem
+        if (isGet && isGetById(ep)) {
+            ensureResponseExample(op, "200", buildHappyResponseExampleFor(ep, api));
+            // kluczowe ścieżki mogą mieć dodatkowy wariant:
+            if (isKeyEndpoint(ep)) {
+                ensureResponseExamples(op, "200", Map.of(
+                    "basic", buildHappyResponseExampleFor(ep, api),
+                    "withExtra", buildHappyResponseExampleFor(ep, api)
+                ));
+            }
         }
 
-        // tablice i obiekty – przejrzyj rekurencyjnie
-        if (s instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
-            return isBinaryLikeSchema(arr.getItems());
+        // POST/PUT/PATCH — przykład request + response (201/200)
+        if (isPost || isPut || isPatch) {
+            ensureRequestExample(op); // ma już szkic
+            String success = isPost ? "201" : "200";
+            ensureResponseExample(op, success, buildHappyResponseExampleFor(ep, api));
+
+            if (isKeyEndpoint(ep)) {
+                // 2–3 warianty: minimalny / pełny
+                addMultipleRequestExamples(op, Map.of(
+                    "minimal", synthRequestExample(op, /*minimal*/ true),
+                    "full",    synthRequestExample(op, /*minimal*/ false)
+                ));
+                ensureResponseExamples(op, success, Map.of(
+                    "okBasic", buildHappyResponseExampleFor(ep, api),
+                    "okExtended", buildHappyResponseExampleFor(ep, api)
+                ));
+            }
         }
-        if (s instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
-            if (obj.getProperties() != null) {
-                for (io.swagger.v3.oas.models.media.Schema<?> p : obj.getProperties().values()) {
-                    if (isBinaryLikeSchema(p)) return true;
+
+        // DELETE — 204 (albo 200 z payloadem, jeśli tak macie)
+        if (isDelete) {
+            ApiResponses rs = op.getResponses();
+            boolean has200 = rs != null && rs.get("200") != null;
+            if (has200) {
+                ensureResponseExample(op, "200", Map.of("status", "deleted"));
+            } else {
+                if (rs == null) { rs = new ApiResponses(); op.setResponses(rs); }
+                if (rs.get("204") == null) rs.addApiResponse("204", new ApiResponse().description("No Content"));
+                // 204 nie ma body – nic nie dodajemy
+            }
+        }
+
+        // Listy (GET kolekcji) – PageResponse + 1–3 warianty (sort/filtry)
+        if (isGet && isListEndpoint(ep)) {
+            String code = "200";
+            Object pageEx = buildPageExampleFor(ep, api);
+            ensureResponseExample(op, code, pageEx);
+
+            if (isKeyEndpoint(ep)) {
+                ensureResponseExamples(op, code, Map.of(
+                    "sortCreatedDesc", pageEx,
+                    "sortCreatedAsc",  pageEx,
+                    "filtered",        pageEx
+                ));
+            }
+        }
+    }
+
+    /** Czy endpoint wygląda na GET /.../{id} (pojedynczy zasób). */
+    private boolean isGetById(EndpointIR ep) {
+        if (ep == null || ep.path == null) return false;
+        if (!"GET".equalsIgnoreCase(nz(ep.http))) return false;
+        Set<String> vars = findPathVars(ep.path);
+        return !vars.isEmpty() && !isListEndpoint(ep);
+    }
+
+    /** Dodaje jeden example do odpowiedzi (200/201/...) – jako 'example' (pojedynczy). */
+    private void ensureResponseExample(io.swagger.v3.oas.models.Operation op, String code, Object example) {
+        if (op.getResponses() == null) op.setResponses(new ApiResponses());
+        ApiResponse r = op.getResponses().get(code);
+        if (r == null) { r = new ApiResponse().description(code.equals("201") ? "Created" : "OK"); op.getResponses().addApiResponse(code, r); }
+        Content c = (r.getContent() == null) ? new Content() : r.getContent();
+        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+        if (mt == null) {
+            mt = new io.swagger.v3.oas.models.media.MediaType();
+            // jeśli brak schematu, ustaw prosty ObjectSchema
+            if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
+            c.addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
+        }
+        if (mt.getSchema() == null) {
+            mt.setSchema(new ObjectSchema());
+        }
+        mt.setExample(example);
+        r.setContent(c);
+    }
+
+    /** Dodaje wiele nazwanych examples do odpowiedzi. Nadpisuje/łączy mapę .examples. */
+    private void ensureResponseExamples(io.swagger.v3.oas.models.Operation op, String code, Map<String, Object> examples) {
+        if (examples == null || examples.isEmpty()) return;
+        if (op.getResponses() == null) op.setResponses(new ApiResponses());
+        ApiResponse r = op.getResponses().get(code);
+        if (r == null) { r = new ApiResponse().description(code.equals("201") ? "Created" : "OK"); op.getResponses().addApiResponse(code, r); }
+        Content c = (r.getContent() == null) ? new Content() : r.getContent();
+        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+        if (mt == null) {
+            mt = new io.swagger.v3.oas.models.media.MediaType();
+            c.addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
+        }
+        if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
+
+        Map<String, Example> exMap = (mt.getExamples() == null) ? new LinkedHashMap<>() : new LinkedHashMap<>(mt.getExamples());
+        for (Map.Entry<String, Object> e : examples.entrySet()) {
+            Example ex = new Example();
+            ex.setValue(e.getValue());
+            exMap.put(e.getKey(), ex);
+        }
+        mt.setExamples(exMap);
+        r.setContent(c);
+    }
+
+    /** Dodaje wiele request examples (minimal/full). */
+    private void addMultipleRequestExamples(io.swagger.v3.oas.models.Operation op, Map<String, Object> examples) {
+        if (op.getRequestBody() == null) return;
+        Content c = op.getRequestBody().getContent();
+        if (c == null) return;
+        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+        if (mt == null) return;
+        if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
+
+        Map<String, Example> exMap = (mt.getExamples() == null) ? new LinkedHashMap<>() : new LinkedHashMap<>(mt.getExamples());
+        for (Map.Entry<String, Object> e : examples.entrySet()) {
+            Example ex = new Example(); ex.setValue(e.getValue());
+            exMap.put(e.getKey(), ex);
+        }
+        mt.setExamples(exMap);
+    }
+
+    /** Buduje neutralny „happy path” example 200/201 dla pojedynczego zasobu. */
+    private Object buildHappyResponseExampleFor(EndpointIR ep, OpenAPI api) {
+        String success = "POST".equalsIgnoreCase(nz(ep.http)) ? "201" : "200";
+        Schema<?> s = null;
+        if (ep != null && ep.returns != null) s = schemaForType(ep.returns.type);
+        if (s instanceof ArraySchema) {
+            return List.of(synthExampleNeutral(((ArraySchema) s).getItems()));
+        }
+        return synthExampleNeutral(s == null ? new ObjectSchema() : s);
+    }
+
+    /** Buduje example dla stron (PageResponse<T>) – 1 strona z jednym elementem. */
+    private Object buildPageExampleFor(EndpointIR ep, OpenAPI api) {
+        String returns = (ep.returns == null) ? null : ep.returns.type;
+        Schema<?> item = schemaForType(extractElementType(returns));
+        Map<String,Object> ex = new LinkedHashMap<>();
+        ex.put("page", 0);
+        ex.put("size", 20);
+        ex.put("totalElements", 1);
+        ex.put("totalPages", 1);
+        ex.put("content", List.of(synthExampleNeutral(item == null ? new ObjectSchema() : item)));
+        return ex;
+    }
+
+    /** Minimalny/pełny przykład request body na bazie schematu. */
+    private Object synthRequestExample(io.swagger.v3.oas.models.Operation op, boolean minimal) {
+        if (op.getRequestBody() == null) return Map.of();
+        Content c = op.getRequestBody().getContent();
+        if (c == null) return Map.of();
+        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+        if (mt == null) return Map.of();
+        Schema<?> s = mt.getSchema();
+        if (s == null) return Map.of();
+
+        Object ex = synthExampleNeutral(s);
+        if (minimal && ex instanceof Map) {
+            Set<String> req = (s.getRequired() == null) ? Set.of() : new LinkedHashSet<>(s.getRequired());
+            if (!req.isEmpty()) {
+                Map<?,?> full = (Map<?,?>) ex;
+                Map<String,Object> min = new LinkedHashMap<>();
+                for (String r : req) {
+                    if (full.containsKey(r)) min.put(r, full.get(r));
                 }
+                return min.isEmpty() ? ex : min;
             }
         }
-
-        return false;
+        return ex;
     }
 
-    private io.swagger.v3.oas.models.media.Schema<?> toMultipartSchema(io.swagger.v3.oas.models.media.Schema<?> original) {
-        if (original == null) {
-            return new io.swagger.v3.oas.models.media.ObjectSchema();
+    /** Uzupełnia single 'example' dla request body, jeśli nie ustawiono. */
+    private void ensureRequestExample(io.swagger.v3.oas.models.Operation op) {
+        if (op.getRequestBody() == null) return;
+        Content c = op.getRequestBody().getContent();
+        if (c == null) return;
+        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
+        if (mt == null) return;
+        if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
+        if (mt.getExample() == null) {
+            mt.setExample(synthExampleNeutral(mt.getSchema()));
         }
-
-        // Jeśli mamy obiekt – zamieniamy pola binarne na string/binary, resztę zostawiamy jak jest.
-        if (original instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
-            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
-
-            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> src = obj.getProperties();
-            if (src != null && !src.isEmpty()) {
-                java.util.Map<String, io.swagger.v3.oas.models.media.Schema> dst = new java.util.LinkedHashMap<>();
-                for (java.util.Map.Entry<String, io.swagger.v3.oas.models.media.Schema> e : src.entrySet()) {
-                    io.swagger.v3.oas.models.media.Schema<?> p = e.getValue();
-                    if (isBinaryLikeSchema(p)) {
-                        dst.put(e.getKey(), new io.swagger.v3.oas.models.media.StringSchema().format("binary"));
-                    } else {
-                        dst.put(e.getKey(), p);
-                    }
-                }
-                mp.setProperties(dst);
-            }
-            // przenieś „required”
-            if (obj.getRequired() != null && !obj.getRequired().isEmpty()) {
-                mp.setRequired(new java.util.ArrayList<>(obj.getRequired()));
-            }
-            if (mp.getDescription() == null) mp.setDescription(original.getDescription());
-            return mp;
-        }
-
-        // Jeśli tablica – owiń w obiekt z polem "files"
-        if (original instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
-            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
-            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> props = new java.util.LinkedHashMap<>();
-            props.put("files", arr);
-            mp.setProperties(props);
-            return mp;
-        }
-
-        // Jeśli to $ref – nie rozwijamy agresywnie; zostaw oryginał (często multipart nie ma sensu wymuszać)
-        if (original.get$ref() != null) {
-            return original;
-        }
-
-        // Inne typy – zwróć pusty obiekt jako najbezpieczniejszy fallback
-        return new io.swagger.v3.oas.models.media.ObjectSchema();
     }
 
-    /** [SECURITY] Dodaje components.securitySchemes.bearerAuth (HTTP bearer, JWT). */
-private void ensureBearerAuth(OpenAPI api) {
-    if (api == null) return;
-    if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
-    io.swagger.v3.oas.models.Components comps = api.getComponents();
-    if (comps.getSecuritySchemes() == null) comps.setSecuritySchemes(new LinkedHashMap<>());
-
-    if (!comps.getSecuritySchemes().containsKey("bearerAuth")) {
-        SecurityScheme bearer = new SecurityScheme()
-                .type(SecurityScheme.Type.HTTP)
-                .scheme("bearer")
-                .bearerFormat("JWT")
-                .description("JWT bearer token. Używaj nagłówka: Authorization: Bearer <token>");
-        comps.addSecuritySchemes("bearerAuth", bearer);
-    }
-}
-
-/** [SECURITY] Ustaw globalne security: [{ bearerAuth: [] }]. */
-private void applyGlobalSecurity(OpenAPI api) {
-    if (api == null) return;
-    // Nie duplikuj, jeśli już jest ustawione
-    List<SecurityRequirement> sec = api.getSecurity();
-    if (sec == null) sec = new ArrayList<>();
-    boolean hasBearer = sec.stream().anyMatch(sr -> sr != null && sr.containsKey("bearerAuth"));
-    if (!hasBearer) {
-        SecurityRequirement req = new SecurityRequirement().addList("bearerAuth", Collections.emptyList());
-        sec.add(req);
-        api.setSecurity(sec);
-    }
-}
-
-    /**
-     * [SECURITY] Heurystyka: czy endpoint jest publiczny (bez JWT).
-     * - Ścieżki zaczynające się od /auth lub /public
-     * - operationId/description/javadoc wskazują login/register/token/refresh
-     * - GET /docs /health /actuator (typowe public/info)
-     */
-    private boolean isPublicEndpoint(EndpointIR ep) {
+    /** Heurystyka: które endpointy traktujemy jako „kluczowe” (dostaną 2–3 warianty). */
+    private boolean isKeyEndpoint(EndpointIR ep) {
         if (ep == null) return false;
         String p = nz(ep.path).toLowerCase(Locale.ROOT);
-        String h = nz(ep.http).toUpperCase(Locale.ROOT);
         String opId = nz(ep.operationId).toLowerCase(Locale.ROOT);
-        String desc = nz(ep.description).toLowerCase(Locale.ROOT);
-        String jdoc = nz(ep.javadoc).toLowerCase(Locale.ROOT);
-
-        // jawne prefiksy publiczne
-        if (p.startsWith("/auth") || p.startsWith("/public")) return true;
-
-        // typowe publiczne zasoby informacyjne
-        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator"))) return true;
-
-        // słowa-klucze (login/register/token/refresh)
-        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh")) return true;
-        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh")) return true;
-        if (jdoc.contains("@public") || jdoc.contains("[public]")) return true;
-
-        return false;
+        return
+            p.startsWith("/auth") ||
+            p.startsWith("/api/profile") ||
+            p.startsWith("/api/suggestions") ||
+            opId.contains("login") || opId.contains("register") ||
+            opId.contains("profile") || opId.contains("suggest");
     }
-
-
 }

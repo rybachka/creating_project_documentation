@@ -8,7 +8,6 @@ import io.swagger.v3.oas.models.media.*;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.responses.ApiResponse;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
-import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.parser.OpenAPIV3Parser;
 import org.springframework.stereotype.Service;
 
@@ -227,10 +226,10 @@ public class PdfDocService {
         sb.append("<div class='security'><strong>Security Schemes</strong>");
         sb.append("<table><thead><tr><th>Nazwa</th><th>Typ</th><th>Schemat</th><th>Format</th><th>Opis</th></tr></thead><tbody>");
         components.getSecuritySchemes().forEach((name, scheme) -> {
-            String type   = scheme.getType() != null ? scheme.getType().toString().toLowerCase(Locale.ROOT) : "";
-            String schemeStr = nz(scheme.getScheme());
-            String fmt    = nz(scheme.getBearerFormat());
-            String desc   = nz(scheme.getDescription());
+            String type     = scheme.getType() != null ? scheme.getType().toString().toLowerCase(Locale.ROOT) : "";
+            String schemeStr= nz(scheme.getScheme());
+            String fmt      = nz(scheme.getBearerFormat());
+            String desc     = nz(scheme.getDescription());
             sb.append("<tr>")
               .append("<td>").append(esc(name)).append("</td>")
               .append("<td>").append(esc(type)).append("</td>")
@@ -267,6 +266,11 @@ public class PdfDocService {
               .append("</div>");
         }
 
+        // ——— PAGINATION badge/linia ———
+        if (hasPaginationParams(op)) {
+            sb.append("<div class='muted' style='margin-top:4px'><strong>Pagination:</strong> page, size, sort</div>");
+        }
+
         if (op.getSummary() != null && !op.getSummary().isBlank()) {
             sb.append("<div style='margin-top:6px'><strong>")
               .append(esc(op.getSummary()))
@@ -281,16 +285,18 @@ public class PdfDocService {
         // Parametry
         if (op.getParameters() != null && !op.getParameters().isEmpty()) {
             sb.append("<div style='margin-top:8px'><strong>Parametry</strong>");
-            sb.append("<table><thead><tr><th>Nazwa</th><th>W</th><th>Typ</th><th>Wymagany</th><th>Opis</th></tr></thead><tbody>");
+            sb.append("<table><thead><tr><th>Nazwa</th><th>W</th><th>Typ</th><th>Wymagany</th><th>Ograniczenia</th><th>Opis</th></tr></thead><tbody>");
             for (Parameter p : op.getParameters()) {
                 String typ = (p.getSchema() != null)
                         ? (p.getSchema().getType() == null ? "" : p.getSchema().getType())
                         : "";
+                String constraints = paramConstraints(p);
                 sb.append("<tr>")
                   .append("<td>").append(esc(p.getName())).append("</td>")
                   .append("<td>").append(esc(p.getIn())).append("</td>")
                   .append("<td>").append(esc(typ)).append("</td>")
                   .append("<td>").append(Boolean.TRUE.equals(p.getRequired()) ? "tak" : "nie").append("</td>")
+                  .append("<td>").append(esc(constraints)).append("</td>")
                   .append("<td>").append(esc(p.getDescription())).append("</td>")
                   .append("</tr>");
             }
@@ -340,8 +346,7 @@ public class PdfDocService {
                     if (mt != null) {
                         Schema<?> s = mt.getSchema();
                         if (s != null) {
-                            if (s.get$ref() != null) schemaTxt = s.get$ref();
-                            else if (s.getType() != null) schemaTxt = s.getType();
+                            schemaTxt = schemaToLabel(s);
                         }
                         if (mt.getExample() != null) {
                             exTxt = toPrettyJson(mt.getExample());
@@ -395,13 +400,11 @@ public class PdfDocService {
         // 1) Jeśli operacja jawnie ustawiła pustą listę: public
         if (op.getSecurity() != null) {
             if (op.getSecurity().isEmpty()) return "Public (no auth)";
-            // lokalne wymagania
             Set<String> names = new LinkedHashSet<>();
             for (SecurityRequirement r : op.getSecurity()) {
                 if (r != null) names.addAll(r.keySet());
             }
             if (!names.isEmpty()) return String.join(", ", names);
-            // brak nazw, ale lista niepusta — pokaż jako „Custom”
             return "Custom";
         }
 
@@ -423,8 +426,6 @@ public class PdfDocService {
     private void renderComponents(StringBuilder sb, Components components) {
         if (components == null) return;
 
-        // Najpierw (jeśli jeszcze nie) — securitySchemes są renderowane u góry dokumentu sekcją renderSecuritySchemes().
-
         // Schematy (DTO, ApiError, itp.)
         if (components.getSchemas() == null || components.getSchemas().isEmpty()) return;
 
@@ -433,14 +434,12 @@ public class PdfDocService {
 
         components.getSchemas().forEach((name, schema) -> {
             sb.append("<h3>").append(esc(name)).append("</h3>");
-            // ogólny typ/ref
             if (schema.get$ref() != null) {
                 sb.append("<div>Ref: <code>").append(esc(schema.get$ref())).append("</code></div>");
             } else if (schema.getType() != null) {
                 sb.append("<div>Type: <code>").append(esc(schema.getType())).append("</code></div>");
             }
 
-            // jeśli obiekt – pokaż pola
             if (schema instanceof ObjectSchema obj) {
                 Map<String, Schema> props = obj.getProperties();
                 if (props != null && !props.isEmpty()) {
@@ -460,7 +459,6 @@ public class PdfDocService {
                 }
             }
 
-            // jeśli tablica – pokaż typ elementu
             if (schema instanceof ArraySchema arr) {
                 Schema<?> items = arr.getItems();
                 String it = (items != null && items.get$ref() != null) ? items.get$ref()
@@ -481,5 +479,121 @@ public class PdfDocService {
         } catch (Exception e) {
             return String.valueOf(obj);
         }
+    }
+
+    /** Zwraca zwięzłą etykietę dla schema: wspiera $ref, typy proste, tablice i allOf(PageResponse<T>). */
+    private static String schemaToLabel(Schema<?> s) {
+        if (s == null) return "";
+        if (s.get$ref() != null && !s.get$ref().isBlank()) {
+            return s.get$ref();
+        }
+        if (s instanceof ArraySchema arr) {
+            String it = schemaToLabel(arr.getItems());
+            return it.isBlank() ? "array" : "array<" + it + ">";
+        }
+        if (s instanceof ComposedSchema cs && cs.getAllOf() != null && !cs.getAllOf().isEmpty()) {
+            boolean isPage = cs.getAllOf().stream().anyMatch(x ->
+                    (x.get$ref() != null && x.get$ref().endsWith("/PageResponse")) ||
+                            "PageResponse".equalsIgnoreCase(Objects.toString(x.getName(), ""))
+            );
+            if (isPage) {
+                Schema<?> t = extractPageItemSchema(cs);
+                String tLabel = schemaToLabel(t);
+                if (tLabel.isBlank()) tLabel = "object";
+                return "PageResponse<" + tLabel + ">";
+            }
+            return cs.getAllOf().stream().map(PdfDocService::schemaToLabel)
+                    .filter(x -> x != null && !x.isBlank())
+                    .reduce((a, b) -> a + " + " + b).orElse("composed");
+        }
+        if (s.getType() != null && !s.getType().isBlank()) {
+            return s.getType();
+        }
+        return "";
+    }
+
+    /** Dla allOf(PageResponse, {...}) wyciąga schema elementu T z content.items. */
+    @SuppressWarnings("unchecked")
+    private static Schema<?> extractPageItemSchema(ComposedSchema cs) {
+        for (Schema<?> part : cs.getAllOf()) {
+            if (part instanceof ObjectSchema obj && obj.getProperties() != null) {
+                Object prop = obj.getProperties().get("content");
+                if (prop instanceof ArraySchema arr) {
+                    return arr.getItems();
+                }
+                if (prop instanceof Schema<?> ps && ps instanceof ArraySchema arr2) {
+                    return arr2.getItems();
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Czy operacja ma standardowe parametry paginacji (page/size/sort)? */
+    private static boolean hasPaginationParams(Operation op) {
+        if (op == null || op.getParameters() == null) return false;
+        boolean page = false, size = false, sort = false;
+        for (Parameter p : op.getParameters()) {
+            String in = nz(p.getIn()).toLowerCase(Locale.ROOT);
+            String name = nz(p.getName()).toLowerCase(Locale.ROOT);
+            if (!"query".equals(in)) continue;
+            if ("page".equals(name)) page = true;
+            else if ("size".equals(name)) size = true;
+            else if ("sort".equals(name)) sort = true;
+        }
+        return page || size || sort;
+    }
+
+    /** Buduje zwięzły opis ograniczeń parametru (min/max, długości, pattern, enum, default/example, itp.). */
+    private static String paramConstraints(Parameter p) {
+        if (p == null) return "";
+        Schema<?> s = p.getSchema();
+        String name = nz(p.getName()).toLowerCase(Locale.ROOT);
+        StringJoiner j = new StringJoiner(", ");
+
+        // Heurystyki dla standardowych pageable:
+        if ("page".equals(name)) j.add("≥ 0");
+        if ("size".equals(name)) j.add("1..100");
+        // (sort zwykle bez sztywnych limitów – zostawiamy puste)
+
+        if (s != null) {
+            // liczby
+            if (s.getMinimum() != null) {
+                String op = Boolean.TRUE.equals(s.getExclusiveMinimum()) ? ">" : "≥";
+                j.add(op + " " + s.getMinimum());
+            }
+            if (s.getMaximum() != null) {
+                String op = Boolean.TRUE.equals(s.getExclusiveMaximum()) ? "<" : "≤";
+                j.add(op + " " + s.getMaximum());
+            }
+            // długości (string)
+            if (s.getMinLength() != null) j.add("minLen " + s.getMinLength());
+            if (s.getMaxLength() != null) j.add("maxLen " + s.getMaxLength());
+            if (s.getPattern() != null && !s.getPattern().isBlank()) j.add("pattern /" + s.getPattern() + "/");
+
+            // tablice
+            if (s instanceof ArraySchema arr) {
+                if (arr.getMinItems() != null) j.add("minItems " + arr.getMinItems());
+                if (arr.getMaxItems() != null) j.add("maxItems " + arr.getMaxItems());
+            }
+
+            // enum
+            if (s.getEnum() != null && !s.getEnum().isEmpty()) {
+                String values = s.getEnum().stream().limit(6).map(String::valueOf).reduce((a,b)->a+", "+b).orElse("");
+                j.add("enum {" + values + (s.getEnum().size() > 6 ? ", …" : "") + "}");
+            }
+
+            // format (np. uuid, date-time)
+            if (s.getFormat() != null && !s.getFormat().isBlank()) j.add("format " + s.getFormat());
+
+            // default / example
+            if (s.getDefault() != null) j.add("default " + s.getDefault());
+            if (s.getExample() != null) j.add("example " + s.getExample());
+        }
+
+        // przykład ustawiony na parametrze (jeśli brak w schemacie)
+        if (p.getExample() != null) j.add("example " + p.getExample());
+
+        return j.toString();
     }
 }
