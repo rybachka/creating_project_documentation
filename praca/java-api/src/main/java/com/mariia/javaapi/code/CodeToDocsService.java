@@ -4,37 +4,29 @@ import com.mariia.javaapi.code.ir.EndpointIR;
 import com.mariia.javaapi.code.ir.ParamIR;
 import com.mariia.javaapi.docs.AiPostProcessor;
 import io.swagger.v3.core.util.Yaml;
+import io.swagger.v3.oas.models.Components;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.PathItem;
 import io.swagger.v3.oas.models.Paths;
+import io.swagger.v3.oas.models.headers.Header;
 import io.swagger.v3.oas.models.info.Info;
 import io.swagger.v3.oas.models.media.*;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.parameters.RequestBody;
 import io.swagger.v3.oas.models.responses.ApiResponse;
 import io.swagger.v3.oas.models.responses.ApiResponses;
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.URISyntaxException;
+import java.math.BigDecimal;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
-import io.swagger.v3.oas.models.security.SecurityRequirement;
-import io.swagger.v3.oas.models.security.SecurityScheme;
-import java.math.BigDecimal;
-import io.swagger.v3.oas.models.examples.Example;
-
-import io.swagger.v3.oas.models.headers.Header;
 
 @Service
 public class CodeToDocsService {
@@ -48,376 +40,182 @@ public class CodeToDocsService {
         this.nlp = nlp;
     }
 
-    /** Główne wejście – generuje YAML z IR + NLP (zależnie od trybu). */
+    // ========================================================================
+    // PUBLIC API
+    // ========================================================================
+
     public Path generateYamlFromCode(
-        List<EndpointIR> eps,
-        String projectName,
-        String level,
-        Path outFile,
-        Path projectRoot,
-        DescribeMode mode
+            List<EndpointIR> eps,
+            String projectName,
+            String level,
+            Path outFile,
+            Path projectRoot,
+            DescribeMode mode
     ) throws Exception {
 
         System.out.println("[from-code] level=" + level + " mode=" + mode);
-        OpenAPI api = new OpenAPI().info(new Info().title(projectName + "-API").version("1.0.0"));
+
+        OpenAPI api = new OpenAPI();
+        Info info = new Info()
+                .title(projectName + "-API")
+                .version("1.0.0");
+
+        Map<String, Object> infoExt = new LinkedHashMap<>();
+        String audience = normalizeAudience(level);
+        infoExt.put("x-user-level", audience);
+        // Nazwa zipa jako nazwa projektu do PDF (zamiast technicznego ID)
+        infoExt.put("x-project-name", projectName);
+        info.setExtensions(infoExt);
+
+        api.setInfo(info);
         api.setPaths(new Paths());
+        api.setComponents(new Components());
 
         ensurePaginationComponents(api);
+        ensureApiErrorComponent(api);
+        ensureBearerAuth(api);
+        applyGlobalSecurity(api);
 
-        // === Security Schemes (JWT) + globalne wymaganie autoryzacji ===
-        if (api.getComponents() == null) {
-            api.setComponents(new io.swagger.v3.oas.models.Components());
-        }
-        api.getComponents().addSecuritySchemes(
-                "bearerAuth",
-                new io.swagger.v3.oas.models.security.SecurityScheme()
-                        .type(io.swagger.v3.oas.models.security.SecurityScheme.Type.HTTP)
-                        .scheme("bearer")
-                        .bearerFormat("JWT")
-                        .description("JWT w nagłówku Authorization: Bearer <token>")
-        );
-        api.addSecurityItem(new io.swagger.v3.oas.models.security.SecurityRequirement().addList("bearerAuth"));
-
-        // === znacznik poziomu odbiorcy do INFO (badge w PDF) ===
-        if (api.getInfo() != null) {
-            Map<String, Object> ext = api.getInfo().getExtensions();
-            if (ext == null) ext = new LinkedHashMap<>();
-            ext.put("x-user-level", normalizeAudience(level));
-            api.getInfo().setExtensions(ext);
-        }
-
-        // ==== DTO (components/schemas) ====
+        // DTOs
         Path projectPath = resolveProjectPath(projectRoot);
         System.out.println("[DTO] użyty katalog do skanowania: " + projectPath);
-        JavaDtoParser dtoParser = new JavaDtoParser();
-        Map<String, Schema> dtoSchemas = Collections.emptyMap();
         try {
-            dtoSchemas = dtoParser.parseDtos(projectPath);
+            JavaDtoParser dtoParser = new JavaDtoParser();
+            Map<String, Schema> dtoSchemas = dtoParser.parseDtos(projectPath);
+            if (!dtoSchemas.isEmpty()) {
+                api.getComponents().getSchemas().putAll(dtoSchemas);
+                System.out.println("[DTO] dodano do components/schemas: " + dtoSchemas.keySet());
+            } else {
+                System.out.println("[DTO] nie znaleziono żadnych DTO – components/schemas będzie puste.");
+            }
         } catch (Exception e) {
             System.err.println("[WARN] Pomijam parsowanie DTO: " + e.getMessage());
         }
-        if (!dtoSchemas.isEmpty()) {
-            if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
-            api.getComponents().setSchemas(dtoSchemas);
-            System.out.println("[DTO] dodano do components/schemas: " + dtoSchemas.keySet());
-        } else {
-            System.out.println("[DTO] nie znaleziono żadnych DTO – components/schemas będzie puste.");
+
+        // Przykładowy hack pod CreateUserRequest: dopilnuj wymaganych pól
+        Schema<?> cur = api.getComponents().getSchemas().get("CreateUserRequest");
+        if (cur instanceof ObjectSchema os) {
+            Set<String> req = new LinkedHashSet<>();
+            if (os.getRequired() != null) req.addAll(os.getRequired());
+            req.add("name");
+            req.add("email");
+            os.setRequired(new ArrayList<>(req));
         }
 
-        // >>> P1: globalny model błędu
-        ensureApiErrorComponent(api);
-
-        // Wymagane pola dla CreateUserRequest (jeśli istnieje)
-        if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
-            Schema<?> cur = api.getComponents().getSchemas().get("CreateUserRequest");
-            if (cur instanceof ObjectSchema) {
-                ObjectSchema os = (ObjectSchema) cur;
-                if (os.getRequired() == null || os.getRequired().isEmpty()) {
-                    os.setRequired(Arrays.asList("name","email"));
-                } else {
-                    Set<String> req = new LinkedHashSet<>(os.getRequired());
-                    req.add("name"); req.add("email");
-                    os.setRequired(new ArrayList<>(req));
-                }
-            }
-        }
-
-        // ==== Operacje ====
+        // Endpointy
         for (EndpointIR ep : eps) {
+
             PathItem pi = api.getPaths().get(ep.path);
-            if (pi == null) { pi = new PathItem(); api.getPaths().addPathItem(ep.path, pi); }
+            if (pi == null) {
+                pi = new PathItem();
+                api.getPaths().addPathItem(ep.path, pi);
+            }
 
             io.swagger.v3.oas.models.Operation op = new io.swagger.v3.oas.models.Operation();
             op.setOperationId(ep.operationId);
 
-            // [SECURITY] publiczne endpointy odpinamy od globalnego security
+            // SECURITY per operacja
+            Map<String, Object> opExt = new LinkedHashMap<>();
             if (isPublicEndpoint(ep)) {
                 op.setSecurity(Collections.emptyList());
-                Map<String, Object> ext = op.getExtensions();
-                if (ext == null) ext = new LinkedHashMap<>();
-                ext.put("x-security", "public");
-                op.setExtensions(ext);
+                opExt.put("x-security", "public");
             } else {
-                Map<String, Object> ext = op.getExtensions();
-                if (ext == null) ext = new LinkedHashMap<>();
-                ext.put("x-security", "bearerAuth");
-                op.setExtensions(ext);
+                opExt.put("x-security", "bearerAuth");
             }
-
-            // --- wejście do NLP ---
-            Map<String, Object> nlpRes = Collections.emptyMap();
-            if (mode != DescribeMode.PLAIN) {
-                Map<String, Object> body = new LinkedHashMap<>();
-                body.put("symbol", ep.operationId);
-                body.put("kind", "endpoint");
-                body.put("signature", ep.http + " " + ep.path);
-                body.put("comment", ep.description == null ? "" : ep.description);
-
-                body.put("http", ep.http);
-                body.put("pathTemplate", ep.path);
-                body.put("javadoc", ep.javadoc == null ? "" : ep.javadoc);
-                body.put("notes", ep.notes == null ? List.of() : ep.notes);
-                body.put("todos", ep.todos == null ? List.of() : ep.todos);
-                body.put("language", "pl");
-
-                List<Map<String, Object>> nlpParams = new ArrayList<>();
-                for (ParamIR p : ep.params) {
-                    nlpParams.add(Map.of(
-                            "name", p.name,
-                            "in", p.in,
-                            "type", p.type,
-                            "required", p.required,
-                            "description", p.description == null ? "" : p.description
-                    ));
-                }
-                body.put("params", nlpParams);
-                body.put("returns", Map.of(
-                        "type", ep.returns != null ? ep.returns.type : "void",
-                        "description", ep.returns != null ? (ep.returns.description == null ? "" : ep.returns.description) : ""
-                ));
-
-                nlpRes = callNlp(body, mode, level);
-                boolean hasRespExample = false;
-                Object exObj = nlpRes.get("examples");
-                if (exObj instanceof Map<?,?> exMap) {
-                    Object r = exMap.get("response");
-                    if (r instanceof Map<?,?> rMap) {
-                        hasRespExample = rMap.get("body") != null;
-                    }
-                }
-                if (!hasRespExample) {
-                    System.out.println("[NLP] Brak examples.response.body dla " + ep.http + " " + ep.path);
-                }
-
-            } else {
-                Map<String, Object> body = new LinkedHashMap<>();
-                body.put("symbol", ep.operationId);
-                body.put("kind", "endpoint");
-                body.put("signature", ep.http + " " + ep.path);
-                body.put("comment", "");
-                List<Map<String, Object>> nlpParams = new ArrayList<>();
-                for (ParamIR p : ep.params) {
-                    nlpParams.add(Map.of(
-                            "name", p.name,
-                            "type", p.type,
-                            "description", p.description == null ? "" : p.description
-                    ));
-                }
-                body.put("params", nlpParams);
-                body.put("returns", Map.of("type", ep.returns != null ? ep.returns.type : "void"));
-                nlpRes = callNlp(body, DescribeMode.PLAIN, level);
-            }
-
-            // === znacznik poziomu odbiorcy do operacji ===
-            Map<String, Object> opExt = op.getExtensions();
-            if (opExt == null) opExt = new LinkedHashMap<>();
-            opExt.put("x-user-level", normalizeAudience(level));
+            opExt.put("x-user-level", audience);
             op.setExtensions(opExt);
 
-            // —— summary/description zależnie od trybu ——
-            if (mode == DescribeMode.PLAIN) {
-                // brak opisów
-            } else if (mode == DescribeMode.RULES) {
-                String shortD = sanitizeNlpStrict(asStr(nlpRes.get("shortDescription")));
-                String medD   = sanitizeNlpStrict(asStr(nlpRes.get("mediumDescription")));
-                String longD  = sanitizeNlpStrict(asStr(nlpRes.get("longDescription")));
-
-                String summary = firstNonBlank(shortD, medD, longD, ep.description, ep.operationId);
-                if (summary != null && !summary.isBlank()) op.setSummary(trim100(summary));
-                String descr = pickByLevel(shortD, medD, longD, level);
-                if (descr == null) descr = firstNonBlank(longD, medD, shortD, ep.description);
-                if (descr != null && !descr.isBlank()) op.setDescription(descr);
-
-                if (ep.notes != null && !ep.notes.isEmpty()) op.addExtension("x-impl-notes", ep.notes);
-                if (ep.todos != null && !ep.todos.isEmpty()) op.addExtension("x-todos", ep.todos);
-
-                if (ep.notes != null && !ep.notes.isEmpty()) {
-                    String base = (op.getDescription() == null || op.getDescription().isBlank())
-                            ? (ep.description == null ? "" : ep.description.trim())
-                            : op.getDescription().trim();
-                    String joined = String.join("; ", ep.notes);
-                    if (joined.length() > 220) joined = joined.substring(0, 220).trim() + "…";
-                    String finalDesc = base.isBlank() ? ("Notes: " + joined) : (base + "\n\nNotes: " + joined);
-                    op.setDescription(finalDesc);
-                }
-
-            } else { // AI (Ollama)
-                String medD = asStr(nlpRes.get("mediumDescription"));
-                if (medD != null && !medD.isBlank()) {
-                    op.setDescription(medD.trim());
-                    String firstSentence = firstSentenceOf(medD);
-                    if (!firstSentence.isBlank()) op.setSummary(trim100(firstSentence + "."));
-                }
-
-                // notes
-                Object notesObj = nlpRes.get("notes");
-                if (notesObj instanceof List) {
-                    List<String> implNotes = ((List<?>) notesObj).stream()
-                            .map(x -> Objects.toString(x, ""))
-                            .filter(s -> !s.isBlank())
-                            .map(String::trim)
-                            .limit(5)
-                            .toList();
-                    if (!implNotes.isEmpty()) op.addExtension("x-impl-notes", implNotes);
-                }
-
-                // examples
-                Object examplesObj = nlpRes.get("examples");
-                if (examplesObj instanceof Map) {
-                    Map<String, Object> examples = (Map<String, Object>) examplesObj;
-
-                    Object reqsObj = examples.get("requests");
-                    if (reqsObj instanceof List && !((List<?>) reqsObj).isEmpty()) {
-                        List<String> curlList = new ArrayList<>();
-                        for (Object r : (List<?>) reqsObj) {
-                            if (r instanceof Map) {
-                                Object curl = ((Map<?, ?>) r).get("curl");
-                                if (curl != null && !curl.toString().isBlank()) {
-                                    curlList.add(curl.toString());
-                                }
-                            } else if (r instanceof String) {
-                                String curl = ((String) r).trim();
-                                if (!curl.isBlank()) curlList.add(curl);
-                            }
-                        }
-                        if (!curlList.isEmpty()) op.addExtension("x-request-examples", curlList);
-                    }
-
-                    Object respObj = examples.get("response");
-                    if (respObj instanceof Map) {
-                        Map<String, Object> resp = (Map<String, Object>) respObj;
-                        int status = 200;
-                        try { status = Integer.parseInt(Objects.toString(resp.get("status"), "200")); } catch (Exception ignore) {}
-                        Object bodyEx = resp.get("body");
-
-                        ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
-                        ApiResponse r = (rs.get(String.valueOf(status)) != null)
-                                ? rs.get(String.valueOf(status))
-                                : new ApiResponse().description("OK");
-
-                        Content rc = (r.getContent() == null) ? new Content() : r.getContent();
-                        io.swagger.v3.oas.models.media.MediaType mt = (rc.get("application/json") == null)
-                                ? new io.swagger.v3.oas.models.media.MediaType()
-                                : rc.get("application/json");
-
-                        if (bodyEx != null) mt.setExample(bodyEx);
-                        if (mt.getSchema() == null) mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
-
-                        rc.addMediaType("application/json", mt);
-                        r.setContent(rc);
-                        rs.addApiResponse(String.valueOf(status), r);
-                        op.setResponses(rs);
-                    }
-                }
+            // NLP /describe
+            Map<String, Object> nlpRes;
+            if (mode != DescribeMode.PLAIN) {
+                nlpRes = callNlp(buildNlpBody(ep), mode, level);
+            } else {
+                nlpRes = callNlp(buildPlainNlpBody(ep), DescribeMode.PLAIN, level);
             }
 
-            // --- parametry -> (wstępnie) ---
-            if (ep.params != null && !ep.params.isEmpty()) {
-                List<Parameter> ps = new ArrayList<>();
-                for (ParamIR p : ep.params) {
-                    if ("body".equalsIgnoreCase(p.in)) {
-                        RequestBody rb = buildJsonRequestBody(p);
-                        op.setRequestBody(rb);
-                    } else {
-                        Parameter par = new Parameter()
-                                .name(p.name)
-                                .in(p.in)
-                                .required(p.required)
-                                .description(p.description);
-                        par.setSchema(schemaForType(p.type));
-                        ps.add(par);
-                    }
-                }
-                if (!ps.isEmpty()) op.setParameters(ps);
+            if (mode == DescribeMode.RULES) {
+                applyRuleDescriptions(op, ep, nlpRes, level);
+            } else if (mode == DescribeMode.AI) {
+                applyAiDescriptionsAndExamples(op, ep, nlpRes);
             }
 
-            // --- domyślna odpowiedź gdy brak ---
-            if (op.getResponses() == null || op.getResponses().isEmpty()) {
-                ApiResponses rs = new ApiResponses();
+            applyParamsAndRequestBody(op, ep);
+            ensureDefaultResponses(op, ep, nlpRes);
 
-                boolean isDelete = "DELETE".equalsIgnoreCase(ep.http);
-                boolean isVoid = ep.returns == null
-                        || ep.returns.type == null
-                        || ep.returns.type.trim().equals("void")
-                        || ep.returns.type.trim().equals("Void")
-                        || ep.returns.type.trim().startsWith("ResponseEntity<Void");
-
-                if (isDelete || isVoid) {
-                    rs.addApiResponse("204", new ApiResponse().description("No Content"));
-                } else {
-                    ApiResponse ok = new ApiResponse();
-                    String retDoc = asStr(nlpRes.get("returnDoc"));
-                    ok.setDescription((retDoc != null && !retDoc.isBlank()) ? retDoc : "OK");
-                    ok.setContent(new Content().addMediaType(
-                            "application/json",
-                            new io.swagger.v3.oas.models.media.MediaType()
-                                    .schema(schemaForType(ep.returns != null ? ep.returns.type : null))
-                    ));
-                    rs.addApiResponse("200", ok);
-                }
-                op.setResponses(rs);
-            }
-
-            // [PAGINATION] Jeśli to „lista” – dołącz wspólne parametry i PageResponse<T>
             if (isListEndpoint(ep)) {
                 attachPageableToOperation(api, op, ep);
             }
 
-            // --- twardy post-processing (po NLP) ---
-            aiPostProcess(op, ep, mode);
+            // pełna macierz błędów (PDF przefiltruje dla beginner)
+            attachStandardErrors(op, isWriteMethod(ep.http));
 
-            // --- FINAL SANITY PASS (parametry + odpowiedzi) ---
-            finalSanity(op, ep);
-
-            ensureResponseExample(op, ep);
-
-            // --- DODANE: minimalne przykłady (request/response/cURL) ---
-            ensureRequestExample(op);
+            // request/response/examples fallback
+            ensureRequestExample(api, op);
             ensureHappyResponseExample(api, op, ep);
-            ensureCurlExample(api, op, ep);
+            ensureCurlExample(op, ep);
 
-            // >>> P1: standardowe błędy + semantyka 201/Location
-            attachStandardErrors(api, op, isWriteMethod(ep.http));
-            addHappyPathExamples(api, op, ep);
-
-            // --- wstaw operację ---
-            switch (ep.http) {
-                case "GET":    pi.setGet(op); break;
-                case "POST":   pi.setPost(op); break;
-                case "PUT":    pi.setPut(op); break;
-                case "DELETE": pi.setDelete(op); break;
-                case "PATCH":  pi.setPatch(op); break;
-                default:       pi.setGet(op); break;
+            // podpięcie pod PathItem wg metody
+            switch (String.valueOf(ep.http).toUpperCase(Locale.ROOT)) {
+                case "GET"    -> pi.setGet(op);
+                case "POST"   -> pi.setPost(op);
+                case "PUT"    -> pi.setPut(op);
+                case "PATCH"  -> pi.setPatch(op);
+                case "DELETE" -> pi.setDelete(op);
+                default       -> pi.setGet(op);
             }
         }
 
-        // Globalnie po całym drzewie
+        // Post-process
         AiPostProcessor post = new AiPostProcessor();
         post.apply(api);
+        sanitizeOpenApi(api);
 
-        sanitizeOpenApi(api);       // << końcowa „miotła”
-        collectNameWarnings(api);   // << opcjonalny linter nazw
+        // Podsumowanie projektu do PDF dla BEGINNER:
+        // zapisujemy w info.extensions["x-project-summary"]
+        if ("beginner".equals(audience)) {
+            String projectSummary = generateBeginnerSummary(api, projectName, audience);
+            if (projectSummary != null && !projectSummary.isBlank()) {
+                Map<String, Object> ext = api.getInfo().getExtensions();
+                if (ext == null) {
+                    ext = new LinkedHashMap<>();
+                    api.getInfo().setExtensions(ext);
+                }
+                ext.put("x-project-summary", projectSummary);
+            }
+        }
 
+        // zapis YAML
         Files.createDirectories(outFile.getParent());
         String yaml = Yaml.mapper().writeValueAsString(api);
         Files.writeString(outFile, yaml);
+
         return outFile;
     }
 
-    /** Zachowujemy starą sygnaturę dla kompatybilności. */
-    public Path generateYamlFromCode(List<EndpointIR> eps, String projectName, String level, Path outFile, Path projectRoot) throws Exception {
-        return generateYamlFromCode(eps, projectName, level, outFile, projectRoot, DescribeMode.RULES);
+    public Path generateYamlFromCode(
+            List<EndpointIR> eps,
+            String projectName,
+            String level,
+            Path outFile,
+            Path projectRoot
+    ) throws Exception {
+        return generateYamlFromCode(eps, projectName, level, outFile, projectRoot, DescribeMode.AI);
     }
 
-    // ============= NLP I/O =============
+    // ========================================================================
+    // NLP CALLS
+    // ========================================================================
+
     @SuppressWarnings("unchecked")
     private Map<String, Object> callNlp(Map<String, Object> body, DescribeMode mode, String level) {
         try {
-            String modeParam = (mode == DescribeMode.PLAIN) ? "plain"
-                    : (mode == DescribeMode.RULES) ? "rule"
-                    : "ollama";
+            String modeParam = switch (mode) {
+                case PLAIN -> "plain";
+                case RULES -> "rule";
+                case AI    -> "ollama";
+            };
             String audience = normalizeAudience(level);
-            String uri = "/describe?mode=" + modeParam + "&audience=" + audience + ((mode == DescribeMode.AI) ? "&strict=true" : "");
+            String uri = "/describe?mode=" + modeParam + "&audience=" + audience + "&strict=true";
             return nlp.post()
                     .uri(uri)
                     .contentType(MediaType.APPLICATION_JSON)
@@ -426,13 +224,142 @@ public class CodeToDocsService {
                     .bodyToMono(Map.class)
                     .block(timeout);
         } catch (Exception e) {
-            System.err.println("Błąd połączenia z NLP: " + e.getMessage());
+            System.err.println("[NLP] Błąd połączenia z NLP: " + e.getMessage());
             return Collections.emptyMap();
         }
     }
 
+    /**
+     * Generuje krótkie, spójne podsumowanie całego API dla początkujących za pomocą serwisu NLP.
+     * Wynik trafia do x-project-summary i jest renderowany w PDF.
+     */
+    @SuppressWarnings("unchecked")
+    private String generateBeginnerSummary(OpenAPI api, String projectName, String level) {
+        try {
+            if (api == null || api.getPaths() == null) {
+                return "";
+            }
+
+            List<Map<String, String>> endpoints = new ArrayList<>();
+
+            api.getPaths().forEach((path, pi) -> {
+                if (pi == null) return;
+                collectEndpointSummary(endpoints, "GET",    path, pi.getGet());
+                collectEndpointSummary(endpoints, "POST",   path, pi.getPost());
+                collectEndpointSummary(endpoints, "PUT",    path, pi.getPut());
+                collectEndpointSummary(endpoints, "PATCH",  path, pi.getPatch());
+                collectEndpointSummary(endpoints, "DELETE", path, pi.getDelete());
+            });
+
+            if (endpoints.isEmpty()) {
+                return "";
+            }
+
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("projectName", projectName);
+            body.put("language", "pl");
+            body.put("audience", normalizeAudience(level));
+            body.put("endpoints", endpoints);
+
+            Map<String, Object> res = nlp.post()
+                    .uri("/project-summary")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block(timeout);
+
+            if (res != null && res.get("summary") != null) {
+                String s = String.valueOf(res.get("summary")).trim();
+                if (!s.isBlank()) {
+                    return s;
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("[NLP] Błąd project-summary: " + e.getMessage());
+        }
+
+        // Fallback – prosty, ale sensowny opis
+        return "To API udostępnia zestaw endpointów do pobierania, tworzenia, aktualizacji i usuwania " +
+               "kluczowych danych domenowych aplikacji \"" + projectName + "\" w spójny i przewidywalny sposób.";
+    }
+
+    private void collectEndpointSummary(List<Map<String, String>> target,
+                                        String method,
+                                        String path,
+                                        io.swagger.v3.oas.models.Operation op) {
+        if (op == null) return;
+        String sum = firstNonBlank(
+                nz(op.getSummary()),
+                nz(op.getDescription())
+        );
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put("method", method);
+        m.put("path", path);
+        m.put("summary", sum == null ? "" : sum);
+        m.put("description", sum == null ? "" : sum);
+        target.add(m);
+    }
+
+    private Map<String, Object> buildNlpBody(EndpointIR ep) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("symbol", ep.operationId);
+        body.put("kind", "endpoint");
+        body.put("signature", ep.http + " " + ep.path);
+        body.put("comment", ep.description == null ? "" : ep.description);
+        body.put("http", ep.http);
+        body.put("pathTemplate", ep.path);
+        body.put("javadoc", ep.javadoc == null ? "" : ep.javadoc);
+        body.put("notes", ep.notes == null ? List.of() : ep.notes);
+        body.put("todos", ep.todos == null ? List.of() : ep.todos);
+        body.put("language", "pl");
+
+        List<Map<String, Object>> nlpParams = new ArrayList<>();
+        for (ParamIR p : ep.params) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", p.name);
+            m.put("in", p.in);
+            m.put("type", p.type);
+            m.put("required", p.required);
+            m.put("description", p.description == null ? "" : p.description);
+            nlpParams.add(m);
+        }
+        body.put("params", nlpParams);
+
+        Map<String, Object> ret = new LinkedHashMap<>();
+        ret.put("type", ep.returns != null ? ep.returns.type : "void");
+        ret.put("description", ep.returns != null
+                ? (ep.returns.description == null ? "" : ep.returns.description)
+                : "");
+        body.put("returns", ret);
+
+        return body;
+    }
+
+    private Map<String, Object> buildPlainNlpBody(EndpointIR ep) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("symbol", ep.operationId);
+        body.put("kind", "endpoint");
+        body.put("signature", ep.http + " " + ep.path);
+        body.put("comment", "");
+        List<Map<String, Object>> nlpParams = new ArrayList<>();
+        for (ParamIR p : ep.params) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", p.name);
+            m.put("type", p.type);
+            m.put("description", p.description == null ? "" : p.description);
+            nlpParams.add(m);
+        }
+        body.put("params", nlpParams);
+        Map<String, Object> ret = new LinkedHashMap<>();
+        ret.put("type", ep.returns != null ? ep.returns.type : "void");
+        body.put("returns", ret);
+        return body;
+    }
+
     private static String normalizeAudience(String level) {
-        String lv = safe(level);
+        String lv = level == null ? "" : level.trim().toLowerCase(Locale.ROOT);
         return switch (lv) {
             case "beginner", "short", "junior" -> "beginner";
             case "advanced", "long", "senior"  -> "advanced";
@@ -440,367 +367,607 @@ public class CodeToDocsService {
         };
     }
 
-    // ============= TWARDY POST-PROCESSING (jak wcześniej) =============
-    private static final Pattern PLACEHOLDER_RX = Pattern.compile(
-            "(string\\s*\\(\\s*1\\s*[–-]\\s*3\\s*zdani|1\\s*[–-]\\s*3\\s*zdani|<extra_id_|wstaw\\s+opis|uzupełnij\\s+opis)",
-            Pattern.CASE_INSENSITIVE
-    );
+    // ========================================================================
+    // OPISY ENDPOINTÓW
+    // ========================================================================
 
-    private void aiPostProcess(io.swagger.v3.oas.models.Operation op, EndpointIR ep, DescribeMode mode) {
-        if (op.getSummary() != null && PLACEHOLDER_RX.matcher(op.getSummary()).find()) op.setSummary(null);
-        if (op.getDescription() != null && PLACEHOLDER_RX.matcher(op.getDescription()).find()) op.setDescription(null);
+    private void applyRuleDescriptions(io.swagger.v3.oas.models.Operation op,
+                                       EndpointIR ep,
+                                       Map<String, Object> nlpRes,
+                                       String level) {
+        String shortD = sanitizeNlp(asStr(nlpRes.get("shortDescription")));
+        String medD   = sanitizeNlp(asStr(nlpRes.get("mediumDescription")));
+        String longD  = sanitizeNlp(asStr(nlpRes.get("longDescription")));
 
-        if (nz(op.getSummary()).equals(nz(op.getDescription())) && op.getDescription() != null) {
-            String fs = firstSentenceOf(op.getDescription());
-            if (!fs.isBlank()) op.setSummary(trim100(fs + "."));
+        String summary = firstNonBlank(shortD, medD, longD, ep.description, ep.operationId);
+        if (summary != null && !summary.isBlank()) {
+            op.setSummary(trim(summary, 100));
         }
 
-        if (op.getRequestBody() != null && op.getParameters() != null && !op.getParameters().isEmpty()) {
-            Set<String> dupNames = Set.of("request","payload","body","dto","file","avatar","avatarfile");
-            List<Parameter> filtered = op.getParameters().stream()
-                    .filter(p -> !("query".equalsIgnoreCase(p.getIn())
-                            && dupNames.contains(nz(p.getName()).toLowerCase(Locale.ROOT))))
-                    .collect(Collectors.toList());
-            op.setParameters(filtered.isEmpty() ? null : filtered);
+        String descr = pickByLevel(shortD, medD, longD, level);
+        if (descr == null) {
+            descr = firstNonBlank(longD, medD, shortD, ep.description);
+        }
+        if (descr != null && !descr.isBlank()) {
+            op.setDescription(descr);
         }
 
-        if (isWriteMethod(ep.http)) {
-            if (op.getRequestBody() == null && op.getParameters() != null) {
-                List<Parameter> params = new ArrayList<>(op.getParameters());
-                List<Parameter> toMove = params.stream()
-                        .filter(p -> "query".equalsIgnoreCase(p.getIn()))
-                        .filter(p -> {
-                            String n = nz(p.getName()).toLowerCase(Locale.ROOT);
-                            return n.equals("request") || n.equals("payload") || n.equals("body") || n.equals("dto")
-                                    || n.equals("file") || n.equals("avatar") || n.equals("avatarfile");
-                        })
-                        .collect(Collectors.toList());
+        if (ep.notes != null && !ep.notes.isEmpty()) {
+            op.addExtension("x-impl-notes", ep.notes);
+        }
+    }
 
-                if (!toMove.isEmpty()) {
-                    boolean fileLike = toMove.stream().anyMatch(p ->
-                            schemaName(p.getSchema()).toLowerCase(Locale.ROOT).contains("multipart")
-                                    || schemaName(p.getSchema()).toLowerCase(Locale.ROOT).contains("file"));
-
-                    RequestBody rb = new RequestBody().required(true);
-                    Content content = new Content();
-                    io.swagger.v3.oas.models.media.MediaType mt;
-                    if (fileLike) {
-                        mt = new io.swagger.v3.oas.models.media.MediaType();
-                        Schema<?> sch = new ObjectSchema();
-                        for (Parameter qp : toMove) {
-                            String n = nz(qp.getName());
-                            if (n.equalsIgnoreCase("file") || n.equalsIgnoreCase("avatar") || n.equalsIgnoreCase("avatarfile")) {
-                                sch.addProperties(n, new StringSchema().format("binary"));
-                            } else {
-                                sch.addProperties(n, schemaOrString(qp.getSchema()));
-                            }
-                        }
-                        mt.setSchema(sch);
-                        content.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mt);
-                    } else {
-                        mt = new io.swagger.v3.oas.models.media.MediaType();
-                        Schema<?> sch = new ObjectSchema();
-                        for (Parameter qp : toMove) {
-                            String n = nz(qp.getName());
-                            sch.addProperties(n, schemaOrString(qp.getSchema()));
-                        }
-                        mt.setSchema(sch);
-                        content.addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
-                    }
-                    rb.setContent(content);
-                    op.setRequestBody(rb);
-
-                    params.removeAll(toMove);
-                    op.setParameters(params.isEmpty() ? null : params);
-                }
+    @SuppressWarnings("unchecked")
+    private void applyAiDescriptionsAndExamples(io.swagger.v3.oas.models.Operation op,
+                                                EndpointIR ep,
+                                                Map<String, Object> nlpRes) {
+        // mediumDescription -> description + summary
+        String medD = asStr(nlpRes.get("mediumDescription"));
+        if (medD != null && !medD.isBlank()) {
+            String trimmed = medD.trim();
+            op.setDescription(trimmed);
+            String fs = firstSentenceOf(trimmed);
+            if (!fs.isBlank()) {
+                op.setSummary(trim(fs, 100));
             }
         }
 
-        Object xr = op.getExtensions() != null ? op.getExtensions().get("x-request-examples") : null;
-        if (xr instanceof List) {
-            @SuppressWarnings("unchecked")
-            List<Object> raw = (List<Object>) xr;
-            List<String> norm = raw.stream()
+        // notes -> x-impl-notes
+        Object notesObj = nlpRes.get("notes");
+        if (notesObj instanceof List<?>) {
+            List<String> implNotes = ((List<?>) notesObj).stream()
                     .map(x -> Objects.toString(x, ""))
+                    .map(String::trim)
                     .filter(s -> !s.isBlank())
-                    .map(CodeToDocsService::normalizeCurl)
-                    .collect(Collectors.toList());
-            if (!norm.isEmpty()) op.addExtension("x-request-examples", norm);
-        }
-
-        // >>> NOWOŚĆ: lekki validator cURL po normalizeCurl
-        validateAndAnnotateCurlExamples(op, ep);
-
-        if ("POST".equalsIgnoreCase(ep.http) && op.getResponses() != null && op.getResponses().containsKey("200")) {
-            boolean hasBody = op.getRequestBody() != null;
-            if (hasBody && op.getResponses().size() == 1) {
-                ApiResponse r200 = op.getResponses().get("200");
-                op.getResponses().remove("200");
-                op.getResponses().addApiResponse("201", r200.description(r200.getDescription() == null ? "Created" : r200.getDescription()));
+                    .limit(8)
+                    .toList();
+            if (!implNotes.isEmpty()) {
+                op.addExtension("x-impl-notes", implNotes);
             }
         }
 
-        if ((op.getSummary() == null || op.getSummary().isBlank()) && op.getDescription() != null) {
-            String fs = firstSentenceOf(op.getDescription());
-            if (!fs.isBlank()) op.setSummary(trim100(fs + "."));
-        }
-    }
-
-    private static boolean isWriteMethod(String http) {
-        String h = nz(http).toUpperCase(Locale.ROOT);
-        return h.equals("POST") || h.equals("PUT") || h.equals("PATCH");
-    }
-
-    private static String schemaName(Schema<?> s) {
-        if (s == null) return "";
-        if (s.get$ref() != null) return s.get$ref();
-        return s.getType() == null ? s.getClass().getSimpleName() : s.getType();
-    }
-
-    // ============= FINAL SANITY PASS =============
-    private void finalSanity(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        if (op == null || ep == null) return;
-
-        // 1) Dedup parametrów po (in,name) – preferuj bogatsze
-        if (op.getParameters() != null && !op.getParameters().isEmpty()) {
-            Map<String, Parameter> best = new LinkedHashMap<>();
-            for (Parameter p : op.getParameters()) {
-                if (p == null) continue;
-                String key = (nz(p.getIn()) + ":" + nz(p.getName())).toLowerCase(Locale.ROOT);
-                Parameter cur = best.get(key);
-                if (cur == null || isBetterParam(p, cur)) best.put(key, p);
-            }
-            List<Parameter> dedup = new ArrayList<>(best.values());
-            op.setParameters(dedup.isEmpty() ? null : dedup);
+        // examples
+        Object examplesObj = nlpRes.get("examples");
+        if (!(examplesObj instanceof Map<?, ?> exMap)) {
+            return;
         }
 
-        // 2) Zapewnij obecność parametrów {path}
-        Set<String> pathVars = findPathVars(ep.path);
-        if (!pathVars.isEmpty()) {
-            List<Parameter> params = (op.getParameters() == null)
-                    ? new ArrayList<>()
-                    : new ArrayList<>(op.getParameters());
-
-            Set<String> have = params.stream()
-                    .filter(p -> "path".equalsIgnoreCase(nz(p.getIn())))
-                    .map(p -> nz(p.getName()).toLowerCase(Locale.ROOT))
-                    .collect(Collectors.toSet());
-
-            for (String v : pathVars) {
-                if (!have.contains(v.toLowerCase(Locale.ROOT))) {
-                    Parameter pp = new Parameter().in("path").name(v).required(true);
-                    pp.setSchema(new StringSchema());
-                    params.add(pp);
-                }
-            }
-            for (Parameter p : params) {
-                if ("path".equalsIgnoreCase(nz(p.getIn()))) p.setRequired(true);
-            }
-            op.setParameters(params.isEmpty() ? null : params);
-        }
-
-        boolean isGet    = "GET".equalsIgnoreCase(ep.http);
-        boolean isDelete = "DELETE".equalsIgnoreCase(ep.http);
-        boolean isPost   = "POST".equalsIgnoreCase(ep.http);
-        boolean isPut    = "PUT".equalsIgnoreCase(ep.http);
-        boolean isPatch  = "PATCH".equalsIgnoreCase(ep.http);
-
-        // 3) GET/DELETE nie powinny mieć body
-        if (isGet || isDelete) {
-            if (op.getRequestBody() != null) {
-                op.setRequestBody(null);
-                Map<String, Object> ext = op.getExtensions();
-                if (ext == null) { ext = new LinkedHashMap<>(); op.setExtensions(ext); }
-                List<String> warns = getStringListExt(ext, "x-warnings");
-                warns.add(isGet ? "GET body removed: filtry powinny być w query."
-                                : "DELETE nie przyjmuje body — usunięto.");
-                ext.put("x-warnings", warns);
-            }
-        }
-
-        // 4) POST/PUT zwykle wymagają body
-        if (isPost || isPut) {
-            if (op.getRequestBody() == null) op.setRequestBody(new RequestBody());
-            op.getRequestBody().setRequired(true);
-
-            // zapewnij content + schema
-            Content c = op.getRequestBody().getContent();
-            if (c == null || c.isEmpty()) {
-                c = new Content().addMediaType(
-                        org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
-                        new io.swagger.v3.oas.models.media.MediaType().schema(new ObjectSchema())
-                );
-                op.getRequestBody().setContent(c);
-            } else {
-                // jeśli JSON schema zawiera binaria → multipart/form-data
-                io.swagger.v3.oas.models.media.MediaType json = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-                if (json != null && isBinaryLikeSchema(json.getSchema())) {
-                    io.swagger.v3.oas.models.media.MediaType mp =
-                        new io.swagger.v3.oas.models.media.MediaType().schema(toMultipartSchema(json.getSchema()));
-                    io.swagger.v3.oas.models.media.Content nc = new io.swagger.v3.oas.models.media.Content();
-                    nc.addMediaType(org.springframework.http.MediaType.MULTIPART_FORM_DATA_VALUE, mp);
-                    op.getRequestBody().setContent(nc);
-                }
-            }
-        }
-
-        // 5) Specjalny kontrakt: POST /api/orders/{orderId}/items
-        if (isPost && ep.path != null && ep.path.matches(".*/api/orders/\\{[^}/]+}/items$")) {
-            // Usuń sku/qty z query
-            if (op.getParameters() != null && !op.getParameters().isEmpty()) {
-                List<Parameter> kept = new ArrayList<>();
-                for (Parameter p : op.getParameters()) {
-                    if ("query".equalsIgnoreCase(nz(p.getIn()))) {
-                        String n = nz(p.getName()).toLowerCase(Locale.ROOT);
-                        if (n.equals("sku") || n.equals("qty")) continue;
+        // requests -> x-request-examples
+        Object reqsObj = exMap.get("requests");
+        if (reqsObj instanceof List<?>) {
+            List<String> curls = new ArrayList<>();
+            for (Object r : (List<?>) reqsObj) {
+                if (r instanceof Map<?, ?>) {
+                    Object curl = ((Map<?, ?>) r).get("curl");
+                    if (curl != null && !curl.toString().isBlank()) {
+                        curls.add(normalizeCurl(curl.toString()));
                     }
-                    kept.add(p);
+                } else if (r instanceof String) {
+                    String curl = ((String) r).trim();
+                    if (!curl.isBlank()) {
+                        curls.add(normalizeCurl(curl));
+                    }
                 }
-                op.setParameters(kept.isEmpty() ? null : kept);
             }
-            // Ustal jednoznaczne JSON body
-            ObjectSchema obj = new ObjectSchema();
-            obj.addProperties("sku", new StringSchema().description("Kod SKU dodawanej pozycji."));
-            obj.addProperties("qty", new IntegerSchema().description("Ilość sztuk."));
-            obj.setRequired(Arrays.asList("sku","qty"));
-            io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType().schema(obj);
-            Content cnt = new Content().addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
-            RequestBody rb = new RequestBody().required(true).content(cnt);
-            op.setRequestBody(rb);
-
-            // Odpowiedź 201 Created + prosty example
-            ApiResponses rsEnsure = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
-            ApiResponse r201 = new ApiResponse().description("Created");
-            io.swagger.v3.oas.models.media.MediaType rmt = new io.swagger.v3.oas.models.media.MediaType();
-            ObjectSchema item = new ObjectSchema();
-            item.addProperties("id", new StringSchema().format("uuid"));
-            item.addProperties("sku", new StringSchema());
-            item.addProperties("qty", new IntegerSchema());
-            rmt.setSchema(item);
-            Map<String,Object> ex = new LinkedHashMap<>();
-            ex.put("id", "7b2f3c4e-2a1b-4c5d-9e8f-001122334455");
-            ex.put("sku", "ABC-123");
-            ex.put("qty", 2);
-            rmt.setExample(ex);
-            r201.setContent(new Content().addMediaType("application/json", rmt));
-            rsEnsure.keySet().removeIf(k -> k.startsWith("2"));
-            rsEnsure.addApiResponse("201", r201);
-            op.setResponses(rsEnsure);
+            if (!curls.isEmpty()) {
+                op.addExtension("x-request-examples", curls);
+            }
         }
 
-        // 6) Odpowiedzi 2xx — porządki
+        // response example
+        Object respObj = exMap.get("response");
+        if (respObj instanceof Map<?, ?> rm) {
+            int status = 200;
+            Object st = rm.get("status");
+            if (st != null) {
+                try { status = Integer.parseInt(st.toString()); } catch (NumberFormatException ignore) {}
+            }
+            Object bodyEx = rm.get("body");
+
+            if (bodyEx != null || status == 204) {
+                ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
+                String code = String.valueOf(status);
+
+                ApiResponse ar = rs.get(code);
+                if (ar == null) {
+                    ar = new ApiResponse().description(status == 204 ? "No Content" : "OK");
+                }
+
+                Content c = (ar.getContent() == null) ? new Content() : ar.getContent();
+                io.swagger.v3.oas.models.media.MediaType mt =
+                        (c.get(MediaType.APPLICATION_JSON_VALUE) == null)
+                                ? new io.swagger.v3.oas.models.media.MediaType()
+                                : c.get(MediaType.APPLICATION_JSON_VALUE);
+
+                if (status != 204 && bodyEx != null) {
+                    mt.setExample(bodyEx);
+                }
+                if (mt.getSchema() == null && status != 204) {
+                    mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
+                }
+
+                if (status != 204) {
+                    c.addMediaType(MediaType.APPLICATION_JSON_VALUE, mt);
+                    ar.setContent(c);
+                } else {
+                    ar.setContent(null);
+                }
+
+                rs.addApiResponse(code, ar);
+                op.setResponses(rs);
+            }
+        }
+    }
+
+    // ========================================================================
+    // PARAMS / BODY / RESPONSES
+    // ========================================================================
+
+    private void applyParamsAndRequestBody(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (ep.params == null || ep.params.isEmpty()) return;
+
+        List<Parameter> params = new ArrayList<>();
+        for (ParamIR p : ep.params) {
+            if ("body".equalsIgnoreCase(p.in)) {
+                RequestBody rb = new RequestBody()
+                        .description(p.description)
+                        .required(p.required)
+                        .content(new Content().addMediaType(
+                                MediaType.APPLICATION_JSON_VALUE,
+                                new io.swagger.v3.oas.models.media.MediaType()
+                                        .schema(schemaForType(p.type))
+                        ));
+                op.setRequestBody(rb);
+            } else {
+                Parameter par = new Parameter()
+                        .name(p.name)
+                        .in(p.in)
+                        .required(p.required)
+                        .description(p.description);
+                par.setSchema(schemaForType(p.type));
+                params.add(par);
+            }
+        }
+        if (!params.isEmpty()) {
+            op.setParameters(params);
+        }
+    }
+
+    private void ensureDefaultResponses(io.swagger.v3.oas.models.Operation op,
+                                        EndpointIR ep,
+                                        Map<String, Object> nlpRes) {
+        if (op.getResponses() != null && !op.getResponses().isEmpty()) return;
+
+        ApiResponses rs = new ApiResponses();
+
+        boolean isDelete = "DELETE".equalsIgnoreCase(String.valueOf(ep.http));
+        boolean isVoid = ep.returns == null
+                || ep.returns.type == null
+                || ep.returns.type.trim().equals("void")
+                || ep.returns.type.trim().equals("Void")
+                || ep.returns.type.trim().startsWith("ResponseEntity<Void");
+
+        if (isDelete || isVoid) {
+            rs.addApiResponse("204", new ApiResponse().description("No Content"));
+        } else {
+            ApiResponse ok = new ApiResponse();
+            String retDoc = asStr(nlpRes.get("returnDoc"));
+            ok.setDescription((retDoc != null && !retDoc.isBlank()) ? retDoc : "OK");
+            ok.setContent(new Content().addMediaType(
+                    MediaType.APPLICATION_JSON_VALUE,
+                    new io.swagger.v3.oas.models.media.MediaType()
+                            .schema(schemaForType(ep.returns != null ? ep.returns.type : null))
+            ));
+            rs.addApiResponse("200", ok);
+        }
+        op.setResponses(rs);
+    }
+
+    // ========================================================================
+    // PRZYKŁADY
+    // ========================================================================
+
+    private void ensureRequestExample(OpenAPI api,
+                                      io.swagger.v3.oas.models.Operation op) {
+        if (op.getRequestBody() == null) return;
+        Content c = op.getRequestBody().getContent();
+        if (c == null) return;
+        io.swagger.v3.oas.models.media.MediaType mt = c.get(MediaType.APPLICATION_JSON_VALUE);
+        if (mt == null) return;
+
+        if (mt.getSchema() == null) {
+            mt.setSchema(new ObjectSchema());
+        }
+
+        if (mt.getExample() == null) {
+            Schema<?> schema = resolveRefSchema(api, mt.getSchema());
+            mt.setExample(synthExampleNeutral(schema));
+        }
+    }
+
+    private void ensureHappyResponseExample(OpenAPI api,
+                                            io.swagger.v3.oas.models.Operation op,
+                                            EndpointIR ep) {
+        if (op.getResponses() == null || op.getResponses().isEmpty()) return;
+
+        String pick = null;
+        if (op.getResponses().get("200") != null) pick = "200";
+        else if (op.getResponses().get("201") != null) pick = "201";
+        else {
+            for (String k : op.getResponses().keySet()) {
+                if (k != null && k.startsWith("2")) { pick = k; break; }
+            }
+        }
+        if (pick == null) return;
+
+        ApiResponse r = op.getResponses().get(pick);
+        if (r == null) return;
+        Content rc = (r.getContent() == null) ? new Content() : r.getContent();
+
+        if ("204".equals(pick)) {
+            r.setContent(null);
+            r.setDescription(firstNonBlank(r.getDescription(), "No Content"));
+            op.getResponses().put("204", r);
+            return;
+        }
+
+        io.swagger.v3.oas.models.media.MediaType mt =
+                (rc.get(MediaType.APPLICATION_JSON_VALUE) == null)
+                        ? new io.swagger.v3.oas.models.media.MediaType()
+                        : rc.get(MediaType.APPLICATION_JSON_VALUE);
+
+        if (mt.getSchema() == null) {
+            mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
+        }
+
+        if (mt.getExample() == null) {
+            Schema<?> schema = resolveRefSchema(api, mt.getSchema());
+            mt.setExample(synthExampleNeutral(schema));
+        }
+
+        rc.addMediaType(MediaType.APPLICATION_JSON_VALUE, mt);
+        r.setContent(rc);
+        op.getResponses().put(pick, r);
+    }
+
+    private void ensureCurlExample(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op.getExtensions() != null) {
+            Object ex = op.getExtensions().get("x-request-examples");
+            if (ex instanceof List<?> list && !list.isEmpty()) {
+                return; // AI już coś dał
+            }
+        }
+
+        String method = String.valueOf(ep.http).toUpperCase(Locale.ROOT);
+        if (method.isBlank()) method = "GET";
+        String url = "{{BASE_URL}}" + ep.path;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("curl -X ").append(method).append(" \"").append(url).append("\"");
+
+        boolean hasBody = op.getRequestBody() != null;
+        if (!isPublicEndpoint(ep)) {
+            sb.append(" \\\n  -H \"Authorization: Bearer <token>\"");
+        }
+        if (hasBody) {
+            sb.append(" \\\n  -H \"Content-Type: application/json\"");
+            Object bodyEx = null;
+            Content c = op.getRequestBody().getContent();
+            if (c != null) {
+                io.swagger.v3.oas.models.media.MediaType mt = c.get(MediaType.APPLICATION_JSON_VALUE);
+                if (mt != null) {
+                    bodyEx = mt.getExample();
+                    if (bodyEx == null && mt.getSchema() != null) {
+                        bodyEx = synthExampleNeutral(mt.getSchema());
+                    }
+                }
+            }
+            if (bodyEx != null) {
+                sb.append(" \\\n  --data-raw '").append(jsonMin(bodyEx)).append("'");
+            }
+        }
+
+        List<String> curls = new ArrayList<>();
+        curls.add(normalizeCurl(sb.toString()));
+
+        Map<String, Object> ext = (op.getExtensions() == null)
+                ? new LinkedHashMap<>()
+                : new LinkedHashMap<>(op.getExtensions());
+        ext.put("x-request-examples", curls);
+        op.setExtensions(ext);
+    }
+
+    // ========================================================================
+    // SECURITY / PAGINATION / API ERROR
+    // ========================================================================
+
+    private void ensureBearerAuth(OpenAPI api) {
+        Components comps = api.getComponents();
+        if (comps.getSecuritySchemes() == null) {
+            comps.setSecuritySchemes(new LinkedHashMap<>());
+        }
+        if (!comps.getSecuritySchemes().containsKey("bearerAuth")) {
+            SecurityScheme bearer = new SecurityScheme()
+                    .type(SecurityScheme.Type.HTTP)
+                    .scheme("bearer")
+                    .bearerFormat("JWT")
+                    .description("JWT bearer token. Nagłówek: Authorization: Bearer <token>.");
+            comps.addSecuritySchemes("bearerAuth", bearer);
+        }
+    }
+
+    private void applyGlobalSecurity(OpenAPI api) {
+        List<SecurityRequirement> sec = api.getSecurity();
+        if (sec == null) sec = new ArrayList<>();
+        boolean hasBearer = sec.stream().anyMatch(sr -> sr != null && sr.containsKey("bearerAuth"));
+        if (!hasBearer) {
+            sec.add(new SecurityRequirement().addList("bearerAuth", Collections.emptyList()));
+        }
+        api.setSecurity(sec);
+    }
+
+    private boolean isPublicEndpoint(EndpointIR ep) {
+        if (ep == null) return false;
+        String p = nz(ep.path).toLowerCase(Locale.ROOT);
+        String h = nz(ep.http).toUpperCase(Locale.ROOT);
+        String opId = nz(ep.operationId).toLowerCase(Locale.ROOT);
+        String desc = nz(ep.description).toLowerCase(Locale.ROOT);
+        String jdoc = nz(ep.javadoc).toLowerCase(Locale.ROOT);
+
+        if (p.startsWith("/auth") || p.startsWith("/public")) return true;
+        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator"))) return true;
+        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh")) return true;
+        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh")) return true;
+        if (jdoc.contains("@public") || jdoc.contains("[public]")) return true;
+
+        return false;
+    }
+
+    private void ensurePaginationComponents(OpenAPI api) {
+        Components comps = api.getComponents();
+        if (comps.getParameters() == null) comps.setParameters(new LinkedHashMap<>());
+
+        Parameter page = new Parameter()
+                .name("page").in("query").required(false).description("Numer strony (0..N).")
+                .schema(new IntegerSchema()._default(0).minimum(BigDecimal.ZERO));
+        comps.getParameters().put("PageablePage", page);
+
+        IntegerSchema sizeSchema = new IntegerSchema();
+        sizeSchema.setMinimum(BigDecimal.ONE);
+        sizeSchema.setMaximum(new BigDecimal(100));
+        sizeSchema.setDefault(20);
+        Parameter size = new Parameter()
+                .name("size").in("query").required(false)
+                .description("Rozmiar strony (1..100).")
+                .schema(sizeSchema);
+        comps.getParameters().put("PageableSize", size);
+
+        StringSchema sortSchema = new StringSchema();
+        sortSchema.setExample("createdAt,desc");
+        Parameter sort = new Parameter()
+                .name("sort").in("query").required(false)
+                .description("Sortowanie: pole,(asc|desc). Można powtórzyć parametr.")
+                .schema(sortSchema);
+        comps.getParameters().put("PageableSort", sort);
+
+        if (comps.getSchemas() == null) comps.setSchemas(new LinkedHashMap<>());
+        if (!comps.getSchemas().containsKey("PageResponse")) {
+            ObjectSchema pageResp = new ObjectSchema();
+            ArraySchema content = new ArraySchema().items(new ObjectSchema());
+            pageResp.addProperties("content", content);
+            pageResp.addProperties("page", new IntegerSchema());
+            pageResp.addProperties("size", new IntegerSchema());
+            pageResp.addProperties("totalElements", new IntegerSchema());
+            pageResp.addProperties("totalPages", new IntegerSchema());
+            comps.getSchemas().put("PageResponse", pageResp);
+        }
+    }
+
+    private void ensureApiErrorComponent(OpenAPI api) {
+        Components comps = api.getComponents();
+        if (comps.getSchemas() == null) comps.setSchemas(new LinkedHashMap<>());
+        Map<String, Schema> schemas = comps.getSchemas();
+        if (!schemas.containsKey("ApiError")) {
+            ObjectSchema err = new ObjectSchema();
+            err.addProperties("code", new StringSchema().description("Krótki kod błędu, np. USER_NOT_FOUND."));
+            err.addProperties("message", new StringSchema().description("Opis błędu w czytelnym języku."));
+            err.addProperties("details", new Schema<>().type("object").description("Dodatkowe szczegóły."));
+            err.addProperties("traceId", new StringSchema().description("Identyfikator żądania."));
+            err.addProperties("timestamp", new StringSchema().format("date-time").description("Znacznik czasu."));
+            err.setRequired(Arrays.asList("code", "message"));
+            schemas.put("ApiError", err);
+        }
+    }
+
+    private Schema<?> apiErrorRef() {
+        return new Schema<>().$ref("#/components/schemas/ApiError");
+    }
+
+    // ========================================================================
+    // STANDARD ERRORS
+    // ========================================================================
+
+    private void attachStandardErrors(io.swagger.v3.oas.models.Operation op, boolean isWrite) {
+        if (op == null) return;
+
+        ensureErrorResponse(op, "400", "Nieprawidłowe lub niekompletne dane żądania.",
+                exErr("INVALID_REQUEST", "Parametry są niepoprawne lub brakuje wymaganych pól."), null);
+
+        Map<String, Header> h401 = new LinkedHashMap<>();
+        h401.put("WWW-Authenticate", hdrString("Schemat autoryzacji, np. Bearer."));
+        ensureErrorResponse(op, "401", "Brak poprawnego tokenu uwierzytelniającego.",
+                exErr("UNAUTHORIZED", "Użyj nagłówka Authorization: Bearer <token>."), h401);
+
+        ensureErrorResponse(op, "403", "Zalogowany użytkownik nie ma uprawnień do tej operacji.",
+                exErr("FORBIDDEN", "Token jest poprawny, ale brak wymaganych uprawnień."), null);
+
+        ensureErrorResponse(op, "404", "Szukany zasób nie istnieje lub nie jest dostępny.",
+                exErr("NOT_FOUND", "Podany zasób nie został znaleziony."), null);
+
+        if (isWrite) {
+            ensureErrorResponse(op, "409", "Konflikt danych (np. duplikat lub niezgodny stan).",
+                    exErr("CONFLICT", "Operacja koliduje z istniejącymi danymi."), null);
+            ensureErrorResponse(op, "422", "Dane są poprawne syntaktycznie, ale nie przechodzą walidacji biznesowej.",
+                    exErr("VALIDATION_ERROR", "Sprawdź reguły walidacji domenowej."), null);
+        }
+
+        Map<String, Header> h429 = new LinkedHashMap<>();
+        h429.put("Retry-After", hdrInteger("Liczba sekund do kolejnej próby."));
+        ensureErrorResponse(op, "429", "Przekroczono limit zapytań (rate limit).",
+                exErr("RATE_LIMITED", "Zwolnij tempo wywołań, spróbuj ponownie później."), h429);
+
+        ensureErrorResponse(op, "500", "Nieoczekiwany błąd po stronie serwera.",
+                exErr("INTERNAL_ERROR", "Spróbuj ponownie lub skontaktuj się z zespołem utrzymania."), null);
+    }
+
+    private void ensureErrorResponse(io.swagger.v3.oas.models.Operation op,
+                                     String status,
+                                     String description,
+                                     Map<String, Object> example,
+                                     Map<String, Header> headersIfAny) {
+        if (op.getResponses() == null) {
+            op.setResponses(new ApiResponses());
+        }
         ApiResponses rs = op.getResponses();
-        if (rs == null) {
-            rs = new ApiResponses();
-            op.setResponses(rs);
+        if (rs.get(status) != null) {
+            return;
         }
 
-        // Usuń treść z 204 i dodaj opis
-        ApiResponse r204x = rs.get("204");
-        if (r204x != null) {
-            if (r204x.getContent() != null && !r204x.getContent().isEmpty()) r204x.setContent(null);
-            if (safe(r204x.getDescription()).isBlank()) r204x.setDescription("No Content");
+        ApiResponse resp = new ApiResponse().description(description);
+
+        Content c = new Content();
+        io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType();
+        mt.setSchema(apiErrorRef());
+        if (example != null && !example.isEmpty()) {
+            mt.setExample(example);
+        }
+        c.addMediaType(MediaType.APPLICATION_JSON_VALUE, mt);
+        resp.setContent(c);
+
+        if (headersIfAny != null && !headersIfAny.isEmpty()) {
+            resp.setHeaders(headersIfAny);
         }
 
-        // Jeśli DELETE → preferuj 204 i usuń inne 2xx
-        if ("DELETE".equalsIgnoreCase(ep.http)) {
-            if (rs.get("204") == null) rs.addApiResponse("204", new ApiResponse().description("No Content"));
-            rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
+        rs.addApiResponse(status, resp);
+    }
+
+    private Map<String, Object> exErr(String code, String message) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("code", code);
+        m.put("message", message);
+        m.put("traceId", "0000000000000000");
+        m.put("timestamp", "2025-01-01T12:00:00Z");
+        return m;
+    }
+
+    private Header hdrString(String desc) {
+        Header h = new Header();
+        h.setSchema(new StringSchema());
+        h.setDescription(desc);
+        return h;
+    }
+
+    private Header hdrInteger(String desc) {
+        Header h = new Header();
+        h.setSchema(new IntegerSchema());
+        h.setDescription(desc);
+        return h;
+    }
+
+    // ========================================================================
+    // LIST / PAGE
+    // ========================================================================
+
+    private boolean isListEndpoint(EndpointIR ep) {
+        if (ep == null) return false;
+        String h = nz(ep.http).toUpperCase(Locale.ROOT);
+        if (!"GET".equals(h)) return false;
+
+        String t = ep.returns == null ? "" : nz(ep.returns.type);
+        String path = nz(ep.path);
+
+        if (t.startsWith("List<") || t.endsWith("[]")) return true;
+        if (t.startsWith("Page<")) return true;
+        if (path.matches(".*/(users|orders|items|products|entries|posts|comments|[a-zA-Z]+s)(/)?$")) return true;
+
+        return false;
+    }
+
+    private void attachPageableToOperation(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+        if (op == null) return;
+
+        List<Parameter> ps = (op.getParameters() == null)
+                ? new ArrayList<>()
+                : new ArrayList<>(op.getParameters());
+
+        ps.removeIf(p -> {
+            String place = nz(p.getIn()).toLowerCase(Locale.ROOT);
+            String name = nz(p.getName()).toLowerCase(Locale.ROOT);
+            return "query".equals(place) && (name.equals("page") || name.equals("size") || name.equals("sort"));
+        });
+
+        ps.add(new Parameter().$ref("#/components/parameters/PageablePage"));
+        ps.add(new Parameter().$ref("#/components/parameters/PageableSize"));
+        ps.add(new Parameter().$ref("#/components/parameters/PageableSort"));
+        op.setParameters(ps);
+
+        ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
+        ApiResponse ok = rs.get("200");
+        if (ok == null) {
+            ok = new ApiResponse().description("OK");
+            rs.addApiResponse("200", ok);
         }
+        Content c = (ok.getContent() == null) ? new Content() : ok.getContent();
+        io.swagger.v3.oas.models.media.MediaType mt =
+                (c.get(MediaType.APPLICATION_JSON_VALUE) == null)
+                        ? new io.swagger.v3.oas.models.media.MediaType()
+                        : c.get(MediaType.APPLICATION_JSON_VALUE);
+
+        String returns = (ep.returns == null) ? null : ep.returns.type;
+        Schema<?> itemSchema = schemaForType(extractElementType(returns));
+        if (itemSchema == null) itemSchema = new ObjectSchema();
+
+        Schema<?> pageBaseRef = new Schema<>().$ref("#/components/schemas/PageResponse");
+        ObjectSchema pageOverride = new ObjectSchema();
+        ArraySchema contentArr = new ArraySchema().items(itemSchema);
+        pageOverride.addProperties("content", contentArr);
+
+        ComposedSchema pageComposed = new ComposedSchema();
+        pageComposed.addAllOfItem(pageBaseRef);
+        pageComposed.addAllOfItem(pageOverride);
+
+        Map<String, Object> ex = new LinkedHashMap<>();
+        ex.put("page", 0);
+        ex.put("size", 20);
+        ex.put("totalElements", 1);
+        ex.put("totalPages", 1);
+        ex.put("content", List.of(synthExampleNeutral(itemSchema)));
+
+        mt.setSchema(pageComposed);
+        mt.setExample(ex);
+
+        c.addMediaType(MediaType.APPLICATION_JSON_VALUE, mt);
+        ok.setContent(c);
+        rs.addApiResponse("200", ok);
+        op.setResponses(rs);
     }
 
-    // ============= Pomocnicze do FINAL SANITY ============
-    private boolean isBetterParam(Parameter a, Parameter b) {
-        int as = (a.getSchema() != null ? 1 : 0) + (safe(a.getDescription()).length() > safe(b.getDescription()).length() ? 1 : 0);
-        int bs = (b.getSchema() != null ? 1 : 0);
-        return as >= bs;
-    }
-
-    private Set<String> findPathVars(String path) {
-        Set<String> s = new LinkedHashSet<>();
-        if (path == null) return s;
-        Matcher m = Pattern.compile("\\{([^}/]+)}").matcher(path);
-        while (m.find()) s.add(m.group(1));
-        return s;
-    }
-
-    // ============= Ścieżki projektu =============
-    private Path resolveProjectPath(Path projectRoot) {
-        try {
-            Path base = (projectRoot != null) ? projectRoot : Path.of(System.getProperty("user.dir"));
-            Path src = base.resolve("src/main/java");
-            if (Files.exists(src)) return src;
-            Path classes = base.resolve("target/classes");
-            if (Files.exists(classes)) return classes;
-
-            try (Stream<Path> s = Files.find(base, 4, (p, a) -> a.isDirectory() && p.endsWith("src/main/java"))) {
-                Optional<Path> hit = s.findFirst();
-                if (hit.isPresent()) return hit.get();
-            }
-            try (Stream<Path> s2 = Files.find(base, 4, (p, a) -> a.isRegularFile() && p.toString().endsWith(".java"))) {
-                Optional<Path> anyJava = s2.findFirst();
-                if (anyJava.isPresent()) return anyJava.get().getParent();
-            }
-            return base;
-        } catch (IOException e) {
-            System.err.println("[WARN] resolveProjectPath error: " + e.getMessage());
-            return (projectRoot != null) ? projectRoot : Path.of(System.getProperty("user.dir"));
+    private String extractElementType(String t) {
+        if (t == null || t.isBlank()) return null;
+        String s = t.trim();
+        if (s.startsWith("List<") || s.startsWith("Page<")) {
+            int lt = s.indexOf('<');
+            int gt = s.lastIndexOf('>');
+            if (lt >= 0 && gt > lt) return s.substring(lt + 1, gt).trim();
         }
-    }
-
-    // ============= Teksty i wybór długości =============
-    private static String pickByLevel(String s, String m, String l, String level) {
-        String lvl = (level == null || level.isBlank()) ? "medium" : level;
-        return switch (lvl) {
-            case "short" -> firstNonBlank(s, m, l);
-            case "long"  -> firstNonBlank(l, m, s);
-            default      -> firstNonBlank(m, s, l);
-        };
-    }
-
-    private static String sanitizeNlpStrict(String s) {
-        if (s == null) return null;
-        String t = s.trim();
-        String lower = t.toLowerCase(Locale.ROOT);
-        if (t.startsWith("規") || lower.startsWith("zadanie")
-                || lower.contains("instrukcja") || lower.contains("<extra_id_")) {
-            return null;
-        }
-        if (t.equals(".") || t.length() < 8) return null;
-        if (!t.endsWith(".")) t = t + ".";
-        return t;
-    }
-
-    private static String firstNonBlank(String... xs) {
-        if (xs == null) return null;
-        for (String x : xs) {
-            if (x != null && !x.isBlank()) return x;
-        }
+        if (s.endsWith("[]")) return s.substring(0, s.length() - 2);
         return null;
     }
 
-    private static String asStr(Object o) {
-        return (o == null) ? null : Objects.toString(o, null);
-    }
+    // ========================================================================
+    // SCHEMAS + EXAMPLE SYNTH
+    // ========================================================================
 
-    private static String trim100(String s) {
-        if (s == null) return null;
-        return (s.length() > 100) ? (s.substring(0, 100) + "…") : s;
-    }
-
-    private static String nz(String s) { return (s == null) ? "" : s; }
-
-    private static String safe(String s) { return (s == null) ? "" : s.trim().toLowerCase(Locale.ROOT); }
-
-    private static String firstSentenceOf(String text) {
-        if (text == null) return "";
-        String t = text.trim();
-        int idx = t.indexOf('.');
-        if (idx < 0) return t;
-        return t.substring(0, idx).trim();
-    }
-
-    // ============= Mapowanie typów =============
     private static final Set<String> PRIMITIVES = Set.of(
             "byte","short","int","long","float","double","boolean","char"
     );
@@ -813,26 +980,24 @@ public class CodeToDocsService {
         if (typeName == null || typeName.isBlank()) return new ObjectSchema();
         String t = typeName.trim();
 
-        if (t.startsWith("ResponseEntity<") ||
-                t.startsWith("Optional<") ||
-                t.startsWith("CompletableFuture<") ||
-                t.startsWith("Mono<") ||
-                t.startsWith("Flux<")) {
+        if (t.startsWith("ResponseEntity<")
+                || t.startsWith("Optional<")
+                || t.startsWith("CompletableFuture<")
+                || t.startsWith("Mono<")
+                || t.startsWith("Flux<")) {
             return schemaForType(stripGenerics(t));
         }
 
         if (t.startsWith("Page<")) {
             Schema<?> inner = schemaForType(stripGenerics(t));
-            ArraySchema content = new ArraySchema(); content.setItems(inner);
+            ArraySchema content = new ArraySchema();
+            content.setItems(inner);
             ObjectSchema page = new ObjectSchema();
-            Map<String, Schema> props = new LinkedHashMap<>();
-            props.put("content", content);
-            props.put("page", new IntegerSchema());
-            props.put("size", new IntegerSchema());
-            props.put("totalElements", new IntegerSchema());
-            props.put("totalPages", new IntegerSchema());
-            props.put("last", new BooleanSchema());
-            page.setProperties(props);
+            page.addProperties("content", content);
+            page.addProperties("page", new IntegerSchema());
+            page.addProperties("size", new IntegerSchema());
+            page.addProperties("totalElements", new IntegerSchema());
+            page.addProperties("totalPages", new IntegerSchema());
             return page;
         }
 
@@ -861,36 +1026,28 @@ public class CodeToDocsService {
     }
 
     private static Schema<?> primitiveToSchema(String p) {
-        switch (p) {
-            case "byte":
-            case "short":
-            case "int":
-            case "long": return new IntegerSchema();
-            case "float":
-            case "double": return new NumberSchema();
-            case "boolean": return new BooleanSchema();
-            case "char": return new StringSchema();
-            default: return new ObjectSchema();
-        }
+        return switch (p) {
+            case "byte","short","int","long" -> new IntegerSchema();
+            case "float","double"            -> new NumberSchema();
+            case "boolean"                   -> new BooleanSchema();
+            case "char"                      -> new StringSchema();
+            default                          -> new ObjectSchema();
+        };
     }
 
     private static Schema<?> builtinToSchema(String s) {
-        switch (s) {
-            case "String": return new StringSchema();
-            case "Integer":
-            case "Long":   return new IntegerSchema();
-            case "Float":
-            case "Double":
-            case "BigDecimal": return new NumberSchema();
-            case "Boolean": return new BooleanSchema();
-            case "UUID": return new StringSchema().format("uuid");
-            case "LocalDate": return new StringSchema().format("date");
-            case "LocalDateTime":
-            case "OffsetDateTime":
-            case "Date": return new StringSchema().format("date-time");
-            case "Object":
-            default: return new ObjectSchema();
-        }
+        return switch (s) {
+            case "String"        -> new StringSchema();
+            case "Integer","Long"-> new IntegerSchema();
+            case "Float","Double","BigDecimal" -> new NumberSchema();
+            case "Boolean"       -> new BooleanSchema();
+            case "UUID"          -> new StringSchema().format("uuid");
+            case "LocalDate"     -> new StringSchema().format("date");
+            case "LocalDateTime",
+                 "OffsetDateTime",
+                 "Date"          -> new StringSchema().format("date-time");
+            default              -> new ObjectSchema();
+        };
     }
 
     private static String simpleName(String qname) {
@@ -917,176 +1074,29 @@ public class CodeToDocsService {
             else if (c == '>') depth--;
             else if (c == ',' && depth == 0) { commaPos = i; break; }
         }
-        if (commaPos < 0) return new String[]{"String","Object"};
+        if (commaPos < 0) return new String[]{"String", "Object"};
         String k = inner.substring(0, commaPos).trim();
         String v = inner.substring(commaPos + 1).trim();
         return new String[]{k, v};
     }
 
-    private static Schema<?> schemaOrString(Schema<?> s) { return (s == null) ? new StringSchema() : s; }
-
-    private static String normalizeCurl(String s) {
-        String t = s.replace("\\n", "\n").replace("\\\"", "\"").trim();
-        if (!t.contains("\n")) {
-            t = t.replaceAll("\\s+-X\\s+", " \\\n  -X ")
-                 .replaceAll("\\s+-H\\s+", " \\\n  -H ")
-                 .replaceAll("\\s+-d\\s+", " \\\n  -d ")
-                 .replaceAll("\\s+--data-raw\\s+", " \\\n  --data-raw ")
-                 .replaceAll("\\s+--data\\s+", " \\\n  --data ")
-                 .replaceAll("\\s+--form\\s+", " \\\n  --form ");
+    private Schema<?> resolveRefSchema(OpenAPI api, Schema<?> s) {
+        if (s == null) return null;
+        String ref = s.get$ref();
+        if (ref == null || ref.isBlank()) {
+            return s;
         }
-        if (!t.startsWith("curl ")) t = "curl " + t;
-        return t;
-    }
-
-    // ============= Lekki validator cURL =============
-
-    private static final Set<String> DATA_FLAGS = Set.of("-d", "--data", "--data-raw", "--data-binary", "--form", "-F");
-
-    private void validateAndAnnotateCurlExamples(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        if (op.getExtensions() == null) return;
-        Object xr = op.getExtensions().get("x-request-examples");
-        if (!(xr instanceof List)) return;
-
-        @SuppressWarnings("unchecked")
-        List<Object> raw = (List<Object>) xr;
-        if (raw.isEmpty()) return;
-
-        String pathRegex = templateToRegex(ep.path);
-        List<Map<String, Object>> annotated = new ArrayList<>();
-        List<String> cleaned = new ArrayList<>();
-
-        for (Object o : raw) {
-            String curl = Objects.toString(o, "").trim();
-            if (curl.isBlank()) continue;
-
-            CurlInfo info = parseCurl(curl);
-            List<String> issues = new ArrayList<>();
-
-            if (info.url == null) issues.add("Brak URL w komendzie cURL.");
-            if (info.method == null) issues.add("Brak metody HTTP (ani -X, ani flag danych).");
-
-            if (info.method != null && ep.http != null) {
-                if (!info.method.equalsIgnoreCase(ep.http)) {
-                    issues.add("Metoda w cURL (" + info.method + ") ≠ definicja (" + ep.http + ").");
-                }
-            }
-
-            String urlPath = null;
-            if (info.url != null) {
-                try {
-                    URI u = new URI(info.url);
-                    urlPath = u.getPath();
-                    if (urlPath == null || urlPath.isEmpty()) {
-                        issues.add("URL bez ścieżki.");
-                    } else {
-                        if (!urlPath.matches(pathRegex)) {
-                            issues.add("Ścieżka URL nie pasuje do wzorca " + ep.path + ".");
-                        }
-                    }
-                } catch (URISyntaxException e) {
-                    issues.add("Nieprawidłowy URL: " + e.getMessage());
-                }
-            }
-
-            boolean valid = issues.isEmpty();
-            Map<String, Object> row = new LinkedHashMap<>();
-            row.put("curl", curl);
-            row.put("method", info.method);
-            row.put("url", info.url);
-            row.put("path", urlPath);
-            row.put("valid", valid);
-            if (!issues.isEmpty()) row.put("issues", issues);
-            annotated.add(row);
-
-            cleaned.add(curl);
-        }
-
-        if (!cleaned.isEmpty()) {
-            op.addExtension("x-request-examples", cleaned);
-        }
-        op.addExtension("x-curl-validated", annotated);
-    }
-
-    private static class CurlInfo {
-        String method;
-        String url;
-    }
-
-    private static CurlInfo parseCurl(String normalizedCurl) {
-        CurlInfo out = new CurlInfo();
-        String s = normalizedCurl.trim();
-
-        s = s.replace("\r", " ").replace("\n", " ");
-        if (s.startsWith("curl ")) s = s.substring(5).trim();
-
-        String[] tokens = s.split("\\s+");
-        String method = null;
-        String url = null;
-        boolean sawDataFlag = false;
-
-        for (int i = 0; i < tokens.length; i++) {
-            String t = tokens[i];
-
-            if ("-X".equals(t) && i + 1 < tokens.length) {
-                String m = tokens[i + 1].replaceAll("[\"']", "");
-                if (!m.isBlank()) method = m.toUpperCase(Locale.ROOT);
-                i++;
-                continue;
-            }
-
-            if (DATA_FLAGS.contains(t)) {
-                sawDataFlag = true;
-                if (i + 1 < tokens.length) {
-                    String next = tokens[i + 1];
-                    if (!next.startsWith("-")) i++;
-                }
-                continue;
-            }
-
-            if (t.startsWith("http://") || t.startsWith("https://")) {
-                url = stripQuotes(t);
-                continue;
-            }
-            if ((t.startsWith("\"http://") || t.startsWith("\"https://") ||
-                    t.startsWith("'http://") || t.startsWith("'https://"))) {
-                url = stripQuotes(t);
+        int idx = ref.lastIndexOf('/');
+        String name = (idx >= 0) ? ref.substring(idx + 1) : ref;
+        if (api != null
+                && api.getComponents() != null
+                && api.getComponents().getSchemas() != null) {
+            Schema<?> target = api.getComponents().getSchemas().get(name);
+            if (target != null) {
+                return target;
             }
         }
-
-        if (method == null) method = sawDataFlag ? "POST" : "GET";
-        out.method = method;
-        out.url = url;
-        return out;
-    }
-
-    private static String stripQuotes(String s) {
-        String t = s.trim();
-        if ((t.startsWith("\"") && t.endsWith("\"")) || (t.startsWith("'") && t.endsWith("'"))) {
-            return t.substring(1, t.length() - 1);
-        }
-        return t;
-    }
-
-    /** /users/{id}/files/{name} → regex ^/users/[^/]+/files/[^/]+/?$ */
-    private static String templateToRegex(String template) {
-        if (template == null || template.isBlank()) return ".*";
-        String t = template.trim();
-        String esc = t.replaceAll("([.\\\\+*?\\[^\\]$(){}=!<>|:-])", "\\\\$1");
-        String rx = esc.replaceAll("\\\\\\{[^}]+\\\\\\}", "[^/]+");
-        return "^" + rx + "/?$";
-    }
-
-    // --- helper: budowa prostego JSON request body z typu parametru ---
-    private RequestBody buildJsonRequestBody(ParamIR p) {
-        return new RequestBody()
-                .description(p.description)
-                .required(p.required)
-                .content(new Content().addMediaType(
-                        "application/json",
-                        new io.swagger.v3.oas.models.media.MediaType()
-                                .schema(schemaForType(p.type))
-                ));
+        return s;
     }
 
     @SuppressWarnings("unchecked")
@@ -1111,669 +1121,36 @@ public class CodeToDocsService {
         }
 
         if (s.get$ref() != null) {
-            // bez deref – zwracamy „pusty” obiekt; w PageResponse i tak dokładamy 1 element
             return Map.of();
         }
 
-        if (s instanceof ObjectSchema || "object".equalsIgnoreCase(Objects.toString(s.getType(),""))) {
+        if (s instanceof ObjectSchema || "object".equalsIgnoreCase(String.valueOf(s.getType()))) {
             Map<String, Object> out = new LinkedHashMap<>();
             Object props = s.getProperties();
-            if (props instanceof Map) {
-                ((Map<String, Schema<?>>) props).forEach((k, v) -> out.put(k, synthExampleNeutral(v)));
+            if (props instanceof Map<?, ?> m) {
+                for (Map.Entry<?, ?> e : m.entrySet()) {
+                    if (e.getKey() != null && e.getValue() instanceof Schema<?> ps) {
+                        out.put(String.valueOf(e.getKey()), synthExampleNeutral(ps));
+                    }
+                }
             }
             return out.isEmpty() ? Map.of() : out;
         }
-        return Map.of();
-    }
 
-    // ================== DODATKI: helper do rozpoznania metody w sanitizeOpenApi ==================
-    private static String methodOf(PathItem pi, io.swagger.v3.oas.models.Operation op) {
-        if (op == null || pi == null) return null;
-        if (op == pi.getGet())     return "GET";
-        if (op == pi.getPost())    return "POST";
-        if (op == pi.getPut())     return "PUT";
-        if (op == pi.getDelete())  return "DELETE";
-        if (op == pi.getPatch())   return "PATCH";
-        if (op == pi.getHead())    return "HEAD";
-        if (op == pi.getOptions()) return "OPTIONS";
-        if (op == pi.getTrace())   return "TRACE";
-        return null;
-    }
-
-    // === P0 SWEEP: brak „gołych” array, brak „schematów widmo”, każda 2xx z JSON ma schema ===
-    private void sanitizeOpenApi(OpenAPI api) {
-        if (api == null) return;
-
-        // === 1) Components.schemas – rekursyjne domknięcie i naprawy P0 ===
-        if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
-            api.getComponents().getSchemas().forEach((name, schema) -> {
-                // a) pełna rekursywna sanizacja
-                sanitizeSchemaTree(schema);
-                // b) domknij „gołe” tablice w components
-                if (schema instanceof ArraySchema arr && arr.getItems() == null) {
-                    arr.setItems(new ObjectSchema());
-                }
-                // c) usuń błędne $ref kończące się na "/?"
-                if (schema != null && schema.get$ref() != null && schema.get$ref().endsWith("/?")) {
-                    schema.set$ref(null);
-                    schema.setType("object");
-                }
-            });
-        }
-
-        // === 2) Paths/Operations – requestBody + responses ===
-        if (api.getPaths() != null) {
-            api.getPaths().forEach((p, pi) -> {
-                if (pi == null) return;
-
-                Arrays.asList(pi.getGet(), pi.getPost(), pi.getPut(), pi.getDelete(), pi.getPatch())
-                        .stream().filter(Objects::nonNull).forEach(op -> {
-
-                            // 2a) RequestBody – domknij schema + „gołe” array + fix $ref "/?"
-                            RequestBody rb = op.getRequestBody();
-                            if (rb != null && rb.getContent() != null) {
-                                rb.getContent().forEach((ct, mt) -> {
-                                    ensureMediaTypeHasSchema(mt);
-                                    Schema<?> s = mt.getSchema();
-                                    sanitizeSchemaTree(s);
-                                    if (s instanceof ArraySchema arr && arr.getItems() == null) {
-                                        arr.setItems(new ObjectSchema());
-                                    }
-                                    if (s != null && s.get$ref() != null && s.get$ref().endsWith("/?")) {
-                                        mt.setSchema(new ObjectSchema()); // zamieniamy błędny ref na obiekt
-                                    }
-                                });
-                            }
-
-                            // 2b) Responses – 204 bez contentu, 201 z opisem Created, domykanie schematów
-                            if (op.getResponses() != null) {
-                                op.getResponses().forEach((code, resp) -> {
-                                    if (resp == null) return;
-
-                                    if ("204".equals(code)) {
-                                        resp.setContent(null);
-                                        resp.setDescription("No Content");
-                                        return;
-                                    }
-
-                                    if (resp.getContent() != null) {
-                                        resp.getContent().forEach((ct, mt) -> {
-                                            ensureMediaTypeHasSchema(mt);
-                                            Schema<?> s = mt.getSchema();
-                                            sanitizeSchemaTree(s);
-
-                                            if (s instanceof ArraySchema arr && arr.getItems() == null) {
-                                                arr.setItems(new ObjectSchema());
-                                            }
-                                            if (s != null && s.get$ref() != null && s.get$ref().endsWith("/?")) {
-                                                mt.setSchema(new ObjectSchema());
-                                            }
-                                        });
-                                    }
-                                });
-
-                                ApiResponse r201 = op.getResponses().get("201");
-                                if (r201 != null) {
-                                    String desc = r201.getDescription();
-                                    if (desc == null || desc.isBlank() || "OK".equalsIgnoreCase(desc.trim())) {
-                                        r201.setDescription("Created");
-                                    }
-                                }
-                            }
-
-                            // [P0] Specjalny kontrakt: POST /api/orders/{orderId}/items (bez zmian)
-                            String _method = methodOf(pi, op);
-                            if ("POST".equalsIgnoreCase(_method)
-                                    && p != null
-                                    && p.matches(".*/api/orders/\\{[^}/]+}/items$")) {
-
-                                RequestBody rb2 = op.getRequestBody();
-                                boolean needsFix = true;
-                                ObjectSchema desired = new ObjectSchema();
-                                desired.addProperties("sku", new StringSchema().description("Kod SKU dodawanej pozycji."));
-                                desired.addProperties("qty", new IntegerSchema().description("Ilość sztuk."));
-                                desired.setRequired(java.util.List.of("sku","qty"));
-
-                                if (rb2 != null && rb2.getContent() != null) {
-                                    io.swagger.v3.oas.models.media.MediaType mt = rb2.getContent()
-                                            .get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-                                    if (mt != null && mt.getSchema() instanceof ObjectSchema os) {
-                                        Object props = os.getProperties();
-                                        if (props instanceof java.util.Map<?,?> map) {
-                                            needsFix = !(map.containsKey("sku") && map.containsKey("qty"));
-                                        }
-                                    }
-                                }
-                                if (rb2 == null || rb2.getContent() == null || needsFix) {
-                                    Content cnt = new Content().addMediaType(
-                                            org.springframework.http.MediaType.APPLICATION_JSON_VALUE,
-                                            new io.swagger.v3.oas.models.media.MediaType().schema(desired)
-                                    );
-                                    op.setRequestBody(new RequestBody().content(cnt).required(true));
-                                }
-
-                                ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
-
-                                ApiResponse r200 = rs.get("200");
-                                if (r200 != null) {
-                                    boolean empty200 = true;
-                                    if (r200.getContent() != null) {
-                                        io.swagger.v3.oas.models.media.MediaType mt = r200.getContent().get("application/json");
-                                        if (mt != null && mt.getSchema() != null) empty200 = false;
-                                    }
-                                    if (empty200) {
-                                        ApiResponse created = new ApiResponse()
-                                                .description((r200.getDescription() == null || r200.getDescription().isBlank())
-                                                        ? "Created" : r200.getDescription());
-                                        rs.remove("200");
-                                        rs.addApiResponse("201", created);
-                                    }
-                                }
-
-                                boolean has2xx = rs.keySet().stream().anyMatch(k -> k.startsWith("2"));
-                                if (!has2xx) {
-                                    rs.addApiResponse("201", new ApiResponse().description("Created"));
-                                }
-
-                                ApiResponse r201x = rs.get("201");
-                                if (r201x == null) {
-                                    r201x = new ApiResponse().description("Created");
-                                    rs.addApiResponse("201", r201x);
-                                }
-                                Content rc = (r201x.getContent() == null) ? new Content() : r201x.getContent();
-                                io.swagger.v3.oas.models.media.MediaType rmt = rc.get("application/json");
-                                if (rmt == null) {
-                                    rmt = new io.swagger.v3.oas.models.media.MediaType();
-                                    rc.addMediaType("application/json", rmt);
-                                }
-                                if (rmt.getSchema() == null) {
-                                    ObjectSchema item = new ObjectSchema();
-                                    item.addProperties("id", new StringSchema().format("uuid"));
-                                    item.addProperties("sku", new StringSchema());
-                                    item.addProperties("qty", new IntegerSchema());
-                                    rmt.setSchema(item);
-                                }
-                                if (rmt.getExample() == null) {
-                                    Map<String,Object> ex = new LinkedHashMap<>();
-                                    ex.put("id", "7b2f3c4e-2a1b-4c5d-9e8f-001122334455");
-                                    ex.put("sku", "ABC-123");
-                                    ex.put("qty", 2);
-                                    rmt.setExample(ex);
-                                }
-                                op.setResponses(rs);
-                            }
-                        });
-            });
-        }
-    }
-
-    /** Upewnij się, że MediaType ma schema; jeśli brak – wstaw ObjectSchema. */
-    private void ensureMediaTypeHasSchema(io.swagger.v3.oas.models.media.MediaType mt) {
-        if (mt == null) return;
-        if (mt.getSchema() == null) {
-            mt.setSchema(new ObjectSchema());
-        }
-    }
-
-    /** Rekursyjne domknięcie drzewka schematu: items w tablicach, additionalProperties w mapach itd. */
-    @SuppressWarnings("unchecked")
-    private void sanitizeSchemaTree(Schema<?> s) {
-        if (s == null) return;
-
-        if (s.get$ref() != null && !s.get$ref().isBlank()) return;
-
-        if (s instanceof ArraySchema arr) {
-            if (arr.getItems() == null) {
-                arr.setItems(new ObjectSchema());
-            } else {
-                sanitizeSchemaTree(arr.getItems());
-            }
-            return;
-        }
-
-        if (s instanceof MapSchema ms) {
-            Object ap = ms.getAdditionalProperties();
-            if (ap == null || ap instanceof Boolean) {
-                ms.setAdditionalProperties(new ObjectSchema());
-            } else if (ap instanceof Schema) {
-                sanitizeSchemaTree((Schema<?>) ap);
-            }
-            return;
-        }
-
-        if (s instanceof ComposedSchema cs) {
-            if (cs.getAllOf() != null) cs.getAllOf().forEach(this::sanitizeSchemaTree);
-            if (cs.getAnyOf() != null) cs.getAnyOf().forEach(this::sanitizeSchemaTree);
-            if (cs.getOneOf() != null) cs.getOneOf().forEach(this::sanitizeSchemaTree);
-            return;
-        }
-
-        if (s instanceof ObjectSchema || "object".equalsIgnoreCase(Objects.toString(s.getType(), ""))) {
-            Object props = s.getProperties();
-            if (props instanceof Map) {
-                ((Map<String, Schema<?>>) props).forEach((k, v) -> sanitizeSchemaTree(v));
-            }
-            return;
-        }
-
-        boolean noTypeLike = s.getType() == null
-                && !(s instanceof StringSchema)
-                && !(s instanceof IntegerSchema)
-                && !(s instanceof NumberSchema)
-                && !(s instanceof BooleanSchema);
-        if (noTypeLike) {
-            s.setType("object");
-        }
-    }
-
-    // ====== BEGIN: naming warnings (optional, non-breaking) ======
-    private static final java.util.Map<String, String> NAME_FIXES = new java.util.HashMap<>();
-    static {
-        NAME_FIXES.put("Anonimous", "Anonymous");
-        NAME_FIXES.put("anonimous", "anonymous");
-        NAME_FIXES.put("DEFAUL_",  "DEFAULT_");
-    }
-
-    private void collectNameWarnings(io.swagger.v3.oas.models.OpenAPI api) {
-        if (api == null) return;
-
-        java.util.List<String> warns = new java.util.ArrayList<>();
-
-        if (api.getComponents() != null && api.getComponents().getSchemas() != null) {
-            api.getComponents().getSchemas().forEach((schemaName, schema) -> {
-                NAME_FIXES.forEach((bad, good) -> {
-                    if (schemaName != null && schemaName.contains(bad)) {
-                        warns.add("Schema name contains '" + bad + "': " + schemaName +
-                                " → suggestion: " + schemaName.replace(bad, good));
-                    }
-                });
-                if (schema != null && schema.getProperties() instanceof java.util.Map) {
-                    @SuppressWarnings("unchecked")
-                    java.util.Map<String, io.swagger.v3.oas.models.media.Schema<?>> props =
-                            (java.util.Map<String, io.swagger.v3.oas.models.media.Schema<?>>) schema.getProperties();
-                    props.forEach((propName, propSchema) -> {
-                        NAME_FIXES.forEach((bad, good) -> {
-                            if (propName != null && propName.contains(bad)) {
-                                warns.add("Property contains '" + bad + "': " + schemaName + "." + propName +
-                                        " → suggestion: " + propName.replace(bad, good));
-                            }
-                        });
-                    });
-                }
-            });
-        }
-
-        if (api.getPaths() != null) {
-            api.getPaths().forEach((path, item) -> {
-                java.util.stream.Stream
-                        .of(item.getGet(), item.getPost(), item.getPut(), item.getDelete(), item.getPatch())
-                        .filter(java.util.Objects::nonNull)
-                        .forEach(op -> {
-                            if (op.getOperationId() != null) {
-                                final String opId = op.getOperationId();
-                                NAME_FIXES.forEach((bad, good) -> {
-                                    if (opId.contains(bad)) {
-                                        warns.add("operationId contains '" + bad + "': " + opId +
-                                                " → suggestion: " + opId.replace(bad, good));
-                                    }
-                                });
-                            }
-                            if (op.getParameters() != null) {
-                                op.getParameters().forEach(param -> {
-                                    if (param.getName() != null) {
-                                        final String pn = param.getName();
-                                        NAME_FIXES.forEach((bad, good) -> {
-                                            if (pn.contains(bad)) {
-                                                warns.add("Parameter contains '" + bad + "': " + pn +
-                                                        " (path: " + path + ") → suggestion: " + pn.replace(bad, good));
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                        });
-            });
-        }
-
-        if (!warns.isEmpty()) {
-            api.addExtension("x-warnings", warns);
-
-            io.swagger.v3.oas.models.info.Info info = api.getInfo();
-            if (info == null) info = new io.swagger.v3.oas.models.info.Info();
-            String desc = info.getDescription() == null ? "" : info.getDescription() + "\n\n";
-            info.setDescription(desc + "⚠ Naming warnings (non-blocking). Full list in `x-warnings`.");
-            api.setInfo(info);
-        }
-    }
-    // ====== END: naming warnings ======
-
-    /** [SECURITY] Dodaje components.securitySchemes.bearerAuth (HTTP bearer, JWT). */
-    private void ensureBearerAuth(OpenAPI api) {
-        if (api == null) return;
-        if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
-        io.swagger.v3.oas.models.Components comps = api.getComponents();
-        if (comps.getSecuritySchemes() == null) comps.setSecuritySchemes(new LinkedHashMap<>());
-
-        if (!comps.getSecuritySchemes().containsKey("bearerAuth")) {
-            SecurityScheme bearer = new SecurityScheme()
-                    .type(SecurityScheme.Type.HTTP)
-                    .scheme("bearer")
-                    .bearerFormat("JWT")
-                    .description("JWT bearer token. Używaj nagłówka: Authorization: Bearer <token>");
-            comps.addSecuritySchemes("bearerAuth", bearer);
-        }
-    }
-
-    /** [SECURITY] Ustaw globalne security: [{ bearerAuth: [] }]. */
-    private void applyGlobalSecurity(OpenAPI api) {
-        if (api == null) return;
-        List<SecurityRequirement> sec = api.getSecurity();
-        if (sec == null) sec = new ArrayList<>();
-        boolean hasBearer = sec.stream().anyMatch(sr -> sr != null && sr.containsKey("bearerAuth"));
-        if (!hasBearer) {
-            SecurityRequirement req = new SecurityRequirement().addList("bearerAuth", Collections.emptyList());
-            sec.add(req);
-            api.setSecurity(sec);
-        }
-    }
-
-    /**
-     * [SECURITY] Heurystyka: czy endpoint jest publiczny (bez JWT).
-     */
-    private boolean isPublicEndpoint(EndpointIR ep) {
-        if (ep == null) return false;
-        String p = nz(ep.path).toLowerCase(Locale.ROOT);
-        String h = nz(ep.http).toUpperCase(Locale.ROOT);
-        String opId = nz(ep.operationId).toLowerCase(Locale.ROOT);
-        String desc = nz(ep.description).toLowerCase(Locale.ROOT);
-        String jdoc = nz(ep.javadoc).toLowerCase(Locale.ROOT);
-
-        if (p.startsWith("/auth") || p.startsWith("/public")) return true;
-        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator"))) return true;
-
-        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh")) return true;
-        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh")) return true;
-        if (jdoc.contains("@public") || jdoc.contains("[public]")) return true;
-
-        return false;
-    }
-
-    /** [PAGINATION] Dodaje reużywalne parametry i schemat odpowiedzi PageResponse<T>. */
-    private void ensurePaginationComponents(OpenAPI api) {
-        if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
-        var comps = api.getComponents();
-
-        if (comps.getParameters() == null) comps.setParameters(new LinkedHashMap<>());
-
-        Parameter page = new Parameter()
-                .name("page").in("query").required(false).description("Numer strony (0..N).")
-                .schema(new IntegerSchema()._default(0).minimum(BigDecimal.ZERO));
-        comps.getParameters().put("PageablePage", page);
-
-        IntegerSchema sizeSchema = new IntegerSchema();
-        sizeSchema.setMinimum(new BigDecimal(1));
-        sizeSchema.setMaximum(new BigDecimal(100));
-        sizeSchema.setDefault(20);
-        Parameter size = new Parameter()
-                .name("size").in("query").required(false)
-                .description("Rozmiar strony (1..100).")
-                .schema(sizeSchema);
-        comps.getParameters().put("PageableSize", size);
-
-        StringSchema sortSchema = new StringSchema();
-        sortSchema.setExample("createdAt,desc");
-        Parameter sort = new Parameter()
-                .name("sort").in("query").required(false)
-                .description("Sortowanie: pole,(asc|desc). Można powtórzyć parametr wielokrotnie.")
-                .schema(sortSchema);
-        comps.getParameters().put("PageableSort", sort);
-
-        if (comps.getSchemas() == null) comps.setSchemas(new LinkedHashMap<>());
-        if (!comps.getSchemas().containsKey("PageResponse")) {
-            ObjectSchema pageResp = new ObjectSchema();
-            ArraySchema content = new ArraySchema().items(new ObjectSchema());
-            pageResp.addProperties("content", content);
-            pageResp.addProperties("page", new IntegerSchema().description("Numer strony (0..N)."));
-            pageResp.addProperties("size", new IntegerSchema().description("Rozmiar strony."));
-            pageResp.addProperties("totalElements", new IntegerSchema().description("Łączna liczba rekordów."));
-            pageResp.addProperties("totalPages", new IntegerSchema().description("Łączna liczba stron."));
-            comps.getSchemas().put("PageResponse", pageResp);
-        }
-    }
-
-    /** Heurystyka: czy endpoint zwraca listę/stronicowaną kolekcję. */
-    private boolean isListEndpoint(EndpointIR ep) {
-        if (ep == null) return false;
-        String h = (ep.http == null ? "" : ep.http).toUpperCase(Locale.ROOT);
-        if (!"GET".equals(h)) return false;
-
-        String t = ep.returns == null ? "" : (ep.returns.type == null ? "" : ep.returns.type);
-        String path = ep.path == null ? "" : ep.path;
-
-        if (t.startsWith("List<") || t.endsWith("[]")) return true;
-        if (t.startsWith("Page<")) return true;
-        if (path.matches(".*/(users|orders|items|products|entries|posts|comments|[a-zA-Z]+s)(/)?$")) return true;
-
-        return false;
-    }
-
-    /** Przypina reużywalne parametry i ustawia PageResponse<T> dla 200. */
-    private void attachPageableToOperation(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        if (op == null) return;
-
-        List<Parameter> ps = (op.getParameters() == null) ? new ArrayList<>(): new ArrayList<>(op.getParameters());
-        ps.removeIf(p -> {
-            String place = (p.getIn() == null ? "" : p.getIn()).toLowerCase(Locale.ROOT);
-            String name  = (p.getName() == null ? "" : p.getName()).toLowerCase(Locale.ROOT);
-            return "query".equals(place) && (name.equals("page") || name.equals("size") || name.equals("sort"));
-        });
-
-        Parameter pPage = new Parameter().$ref("#/components/parameters/PageablePage");
-        Parameter pSize = new Parameter().$ref("#/components/parameters/PageableSize");
-        Parameter pSort = new Parameter().$ref("#/components/parameters/PageableSort");
-
-        var keys = ps.stream()
-                .map(p -> (String.valueOf(p.getIn()) + ":" + String.valueOf(p.getName())).toLowerCase(Locale.ROOT))
-                .collect(java.util.stream.Collectors.toSet());
-        if (!keys.contains("query:page")) ps.add(pPage);
-        if (!keys.contains("query:size")) ps.add(pSize);
-        if (!keys.contains("query:sort")) ps.add(pSort);
-        op.setParameters(ps);
-
-        ApiResponses rs = (op.getResponses() == null) ? new ApiResponses() : op.getResponses();
-        ApiResponse ok = rs.get("200");
-        if (ok == null) {
-            ok = new ApiResponse().description("OK");
-            rs.addApiResponse("200", ok);
-        }
-        Content c = (ok.getContent() == null) ? new Content() : ok.getContent();
-        io.swagger.v3.oas.models.media.MediaType mt = (c.get("application/json") == null)
-                ? new io.swagger.v3.oas.models.media.MediaType()
-                : c.get("application/json");
-
-        String returns = (ep.returns == null) ? null : ep.returns.type;
-        Schema<?> itemSchema = schemaForType(extractElementType(returns));
-        if (itemSchema == null) itemSchema = new ObjectSchema();
-
-        Schema<?> pageBaseRef = new Schema<>().$ref("#/components/schemas/PageResponse");
-        ObjectSchema pageOverride = new ObjectSchema();
-        ArraySchema content = new ArraySchema().items(itemSchema);
-        pageOverride.addProperties("content", content);
-
-        ComposedSchema pageComposed = new ComposedSchema();
-        pageComposed.addAllOfItem(pageBaseRef);
-        pageComposed.addAllOfItem(pageOverride);
-
-        Map<String,Object> ex = new LinkedHashMap<>();
-        ex.put("page", 0);
-        ex.put("size", 20);
-        ex.put("totalElements", 128);
-        ex.put("totalPages", 7);
-        Object itemEx = synthExampleNeutral(itemSchema);
-        ex.put("content", java.util.List.of(itemEx));
-
-        mt.setSchema(pageComposed);
-        mt.setExample(ex);
-
-        c.addMediaType("application/json", mt);
-        ok.setContent(c);
-        rs.addApiResponse("200", ok);
-        op.setResponses(rs);
-    }
-
-    /** Wyciąga typ elementu: List<X> / Page<X> / X[] → X; w przeciwnym razie null. */
-    private String extractElementType(String t) {
-        if (t == null || t.isBlank()) return null;
-        String s = t.trim();
-        if (s.startsWith("List<") || s.startsWith("Page<")) {
-            int lt = s.indexOf('<'); int gt = s.lastIndexOf('>');
-            if (lt >= 0 && gt > lt) return s.substring(lt + 1, gt).trim();
-        }
-        if (s.endsWith("[]")) return s.substring(0, s.length() - 2);
-        return null;
-    }
-
-    // ===================== DODANE: Request/Response/Curl Examples =====================
-
-    /** Minimalny „happy path” example w 2xx (preferencja: 200 → 201 → inne 2xx). */
-    private void ensureHappyResponseExample(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        if (op == null || op.getResponses() == null || op.getResponses().isEmpty()) return;
-
-        // wybór kodu 2xx
-        String[] prefs = {"200","201"};
-        String pick = null;
-        for (String p : prefs) if (op.getResponses().containsKey(p)) { pick = p; break; }
-        if (pick == null) {
-            for (String k : op.getResponses().keySet()) {
-                if (k != null && k.startsWith("2")) { pick = k; break; }
-            }
-        }
-        if (pick == null) return;
-
-        ApiResponse r = op.getResponses().get(pick);
-        if (r == null) return;
-        Content rc = (r.getContent() == null) ? new Content() : r.getContent();
-        io.swagger.v3.oas.models.media.MediaType mt = rc.get("application/json");
-        if (mt == null) {
-            mt = new io.swagger.v3.oas.models.media.MediaType();
-            rc.addMediaType("application/json", mt);
-        }
-
-        if (mt.getSchema() == null) {
-            mt.setSchema(schemaForType(ep.returns != null ? ep.returns.type : null));
-        }
-
-        if (mt.getExample() == null) {
-            Object ex = exampleFromSchema(mt.getSchema());
-            // jeśli dalej pusto, wypełnij neutralnie
-            if (ex == null || (ex instanceof Map && ((Map<?,?>) ex).isEmpty())) {
-                ex = synthExampleNeutral(mt.getSchema());
-            }
-            mt.setExample(ex);
-        }
-
-        r.setContent(rc);
-        op.getResponses().put(pick, r);
-    }
-
-    /** cURL: jeśli nie ma żadnego, wygeneruj prosty przykład zgodny z metodą i ścieżką. */
-    private void ensureCurlExample(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        if (op == null) return;
-        Map<String, Object> ext = op.getExtensions();
-        if (ext == null) { ext = new LinkedHashMap<>(); op.setExtensions(ext); }
-
-        Object xr = ext.get("x-request-examples");
-        boolean hasAny = (xr instanceof List) && !((List<?>) xr).isEmpty();
-        if (hasAny) return;
-
-        String base = "{{BASE_URL}}"; // zostawiamy placeholder do podmiany w PDF/SDK
-        String url = base + ep.path;
-        String method = nz(ep.http).isBlank() ? "GET" : ep.http.toUpperCase(Locale.ROOT);
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("curl -X ").append(method).append(" \"").append(url).append("\" \\\n")
-          .append("  -H \"Authorization: Bearer <token>\"");
-
-        // jeśli body → dołącz JSON z example
-        if (op.getRequestBody() != null) {
-            Content c = op.getRequestBody().getContent();
-            io.swagger.v3.oas.models.media.MediaType mt = (c == null) ? null : c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-            Object bodyEx = (mt != null) ? mt.getExample() : null;
-            if (bodyEx == null && mt != null && mt.getSchema() != null) {
-                bodyEx = synthExampleNeutral(mt.getSchema());
-            }
-            sb.append(" \\\n  -H \"Content-Type: application/json\"");
-            if (bodyEx != null) {
-                sb.append(" \\\n  --data-raw '").append(jsonMin(bodyEx)).append("'");
-            }
-        }
-
-        List<String> list = new ArrayList<>();
-        list.add(normalizeCurl(sb.toString()));
-        ext.put("x-request-examples", list);
-
-        // od razu walidacja/annotacja
-        validateAndAnnotateCurlExamples(op, ep);
-    }
-
-    // ========== Helpery do przykładów ==========
-    private Schema<?> resolveRef(Schema<?> s) {
-        // Minimalny resolver – zostawiamy s jak jest; dla $ref synthExampleNeutral zwróci {} (bezpieczny fallback)
-        return s;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object exampleFromSchema(Schema<?> schema) {
-        if (schema == null) return Map.of();
-
-        if (schema instanceof ArraySchema arr) {
-            return List.of(synthExampleNeutral(arr.getItems()));
-        }
-        if (schema instanceof ObjectSchema obj) {
-            Map<String, Object> out = new LinkedHashMap<>();
-            Object props = obj.getProperties();
-            if (props instanceof Map<?,?> m) {
-                for (Map.Entry<?,?> e : m.entrySet()) {
-                    if (e.getKey() == null || !(e.getValue() instanceof Schema<?> ps)) continue;
-                    out.put(String.valueOf(e.getKey()), synthExampleNeutral(ps));
-                }
-            }
-            return out;
-        }
-        if (schema instanceof ComposedSchema cs) {
-            // najczęstszy przypadek: allOf[ $ref(PageResponse), { content: array<T> } ]
-            Map<String,Object> merged = new LinkedHashMap<>();
-            if (cs.getAllOf() != null) {
-                for (Schema<?> part : cs.getAllOf()) {
-                    Object ex = exampleFromSchema(part);
-                    if (ex instanceof Map<?,?> map) {
-                        map.forEach((k,v) -> merged.put(String.valueOf(k), v));
-                    }
-                }
-            }
-            return merged.isEmpty() ? Map.of() : merged;
-        }
-        if (schema instanceof StringSchema || schema instanceof IntegerSchema || schema instanceof NumberSchema || schema instanceof BooleanSchema) {
-            return synthExampleNeutral(schema);
-        }
-        if (schema.get$ref() != null) {
-            return Map.of();
-        }
         return Map.of();
     }
 
     private String jsonMin(Object o) {
-        // najprostszy, bez zależności – na nasze proste przykłady wystarczy
         if (o == null) return "null";
-        if (o instanceof String) return ((String) o).replace("\"","\\\"");
+        if (o instanceof String) return ((String) o).replace("\"", "\\\"");
         if (o instanceof Number || o instanceof Boolean) return String.valueOf(o);
-        if (o instanceof Map<?,?> m) {
+        if (o instanceof Map<?, ?> m) {
             StringBuilder sb = new StringBuilder("{");
             boolean first = true;
-            for (Map.Entry<?,?> e : m.entrySet()) {
+            for (Map.Entry<?, ?> e : m.entrySet()) {
                 if (!first) sb.append(',');
                 first = false;
-                sb.append('"').append(String.valueOf(e.getKey()).replace("\"","\\\"")).append("\":");
+                sb.append('"').append(String.valueOf(e.getKey()).replace("\"", "\\\"")).append("\":");
                 sb.append(jsonMin(e.getValue()));
             }
             sb.append('}');
@@ -1793,454 +1170,137 @@ public class CodeToDocsService {
         return "\"\"";
     }
 
-    // ===== Canonical Schema utils (single source of truth) =====
+    // ========================================================================
+    // SANITY / UTILS
+    // ========================================================================
 
-    private boolean isBinaryLikeSchema(io.swagger.v3.oas.models.media.Schema<?> s) {
-        if (s == null) return false;
+    private void sanitizeOpenApi(OpenAPI api) {
+        if (api == null || api.getPaths() == null) return;
 
-        if (s.get$ref() != null) return false;
+        api.getPaths().forEach((path, pi) -> {
+            if (pi == null) return;
+            for (io.swagger.v3.oas.models.Operation op : Arrays.asList(
+                    pi.getGet(), pi.getPost(), pi.getPut(), pi.getPatch(), pi.getDelete()
+            )) {
+                if (op == null || op.getResponses() == null) continue;
 
-        String type = s.getType();
-        String fmt  = s.getFormat();
-
-        if ("string".equalsIgnoreCase(type)) {
-            if ("binary".equalsIgnoreCase(fmt) || "base64".equalsIgnoreCase(fmt)) return true;
-        }
-
-        if (s instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
-            return isBinaryLikeSchema(arr.getItems());
-        }
-        if (s instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
-            if (obj.getProperties() != null) {
-                for (io.swagger.v3.oas.models.media.Schema<?> p : obj.getProperties().values()) {
-                    if (isBinaryLikeSchema(p)) return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private io.swagger.v3.oas.models.media.Schema<?> toMultipartSchema(io.swagger.v3.oas.models.media.Schema<?> original) {
-        if (original == null) {
-            return new io.swagger.v3.oas.models.media.ObjectSchema();
-        }
-
-        if (original instanceof io.swagger.v3.oas.models.media.ObjectSchema obj) {
-            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
-
-            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> src = obj.getProperties();
-            if (src != null && !src.isEmpty()) {
-                java.util.Map<String, io.swagger.v3.oas.models.media.Schema> dst = new java.util.LinkedHashMap<>();
-                for (java.util.Map.Entry<String, io.swagger.v3.oas.models.media.Schema> e : src.entrySet()) {
-                    io.swagger.v3.oas.models.media.Schema<?> p = e.getValue();
-                    if (isBinaryLikeSchema(p)) {
-                        dst.put(e.getKey(), new io.swagger.v3.oas.models.media.StringSchema().format("binary"));
-                    } else {
-                        dst.put(e.getKey(), p);
+                ApiResponses rs = op.getResponses();
+                ApiResponse r204 = rs.get("204");
+                if (r204 != null) {
+                    r204.setContent(null);
+                    if (r204.getDescription() == null || r204.getDescription().isBlank()) {
+                        r204.setDescription("No Content");
                     }
                 }
-                mp.setProperties(dst);
+
+                String m = methodOf(pi, op);
+                if ("DELETE".equalsIgnoreCase(m)) {
+                    if (rs.get("204") == null) {
+                        rs.addApiResponse("204", new ApiResponse().description("No Content"));
+                    }
+                    rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
+                }
             }
-            if (obj.getRequired() != null && !obj.getRequired().isEmpty()) {
-                mp.setRequired(new java.util.ArrayList<>(obj.getRequired()));
-            }
-            if (mp.getDescription() == null) mp.setDescription(original.getDescription());
-            return mp;
-        }
-
-        if (original instanceof io.swagger.v3.oas.models.media.ArraySchema arr) {
-            io.swagger.v3.oas.models.media.ObjectSchema mp = new io.swagger.v3.oas.models.media.ObjectSchema();
-            java.util.Map<String, io.swagger.v3.oas.models.media.Schema> props = new java.util.LinkedHashMap<>();
-            props.put("files", arr);
-            mp.setProperties(props);
-            return mp;
-        }
-
-        if (original.get$ref() != null) {
-            return original;
-        }
-
-        return new io.swagger.v3.oas.models.media.ObjectSchema();
-    }
-
-    /** [SECURITY] Dodaje ApiError do components.schemas jeśli brakuje. */
-    private void ensureApiErrorComponent(OpenAPI api) {
-        if (api == null) return;
-        if (api.getComponents() == null) api.setComponents(new io.swagger.v3.oas.models.Components());
-        Map<String, Schema> schemas = api.getComponents().getSchemas();
-        if (schemas == null) {
-            schemas = new LinkedHashMap<>();
-            api.getComponents().setSchemas(schemas);
-        }
-        if (!schemas.containsKey("ApiError")) {
-            ObjectSchema err = new ObjectSchema();
-            err.addProperties("code", new StringSchema().description("Krótki kod błędu, np. USER_NOT_FOUND"));
-            err.addProperties("message", new StringSchema().description("Ludzki opis błędu"));
-            err.addProperties("details", new Schema<>().type("object").description("Szczegóły/konkretne pola (opcjonalnie)"));
-            err.addProperties("traceId", new StringSchema().description("Identyfikator żądania"));
-            err.addProperties("timestamp", new StringSchema().format("date-time").description("Znacznik czasu"));
-            err.setRequired(Arrays.asList("code","message"));
-            schemas.put("ApiError", err);
-        }
-    }
-
-    /** Buduje ref do ApiError. */
-    private Schema<?> apiErrorRef() {
-        return new Schema<>().$ref("#/components/schemas/ApiError");
-    }
-
-    /** Zapewnia, że dana operacja ma odpowiedź błędu o wskazanym kodzie; nie nadpisuje istniejącej. */
-    private void ensureErrorResponse(
-            io.swagger.v3.oas.models.Operation op,
-            String status,
-            String description,
-            Map<String, Object> example,
-            Map<String, Header> headersIfAny
-    ) {
-        if (op.getResponses() == null) {
-            op.setResponses(new ApiResponses());
-        }
-        ApiResponses rs = op.getResponses();
-        if (rs.get(status) != null) {
-            return;
-        }
-
-        ApiResponse resp = new ApiResponse().description(description);
-
-        Content c = new Content();
-        io.swagger.v3.oas.models.media.MediaType mt = new io.swagger.v3.oas.models.media.MediaType();
-        mt.setSchema(apiErrorRef());
-        if (example != null && !example.isEmpty()) {
-            mt.setExample(example);
-        }
-        c.addMediaType("application/json", mt);
-        resp.setContent(c);
-
-        if (headersIfAny != null && !headersIfAny.isEmpty()) {
-            resp.setHeaders(headersIfAny);
-        }
-
-        rs.addApiResponse(status, resp);
-    }
-
-    /** Przykłady dla błędów – proste i czytelne w PDF/SDK. */
-    private Map<String,Object> exErr(String code, String message) {
-        Map<String,Object> m = new LinkedHashMap<>();
-        m.put("code", code);
-        m.put("message", message);
-        m.put("traceId", "0000000000000000");
-        m.put("timestamp", "2025-01-01T12:00:00Z");
-        return m;
-    }
-
-    /** Nagłówek String. */
-    private Header hdrString(String desc) {
-        Header h = new Header();
-        h.setSchema(new StringSchema());
-        h.setDescription(desc);
-        return h;
-    }
-
-    /** Nagłówek Integer. */
-    private Header hdrInteger(String desc) {
-        Header h = new Header();
-        h.setSchema(new IntegerSchema());
-        h.setDescription(desc);
-        return h;
-    }
-
-    /**
-     * Dokleja standardowy zestaw błędów do operacji.
-     */
-    private void attachStandardErrors(OpenAPI api, io.swagger.v3.oas.models.Operation op, boolean isWrite) {
-        if (op == null) return;
-
-        ensureErrorResponse(op, "400", "Bad Request",
-                exErr("INVALID_REQUEST", "Parametry niepoprawne lub niekompletne."), null);
-
-        Map<String,Header> h401 = new LinkedHashMap<>();
-        h401.put("WWW-Authenticate", hdrString("Schemat autoryzacji, np. Bearer"));
-        ensureErrorResponse(op, "401", "Unauthorized",
-                exErr("UNAUTHORIZED", "Wymagany token dostępu."), h401);
-
-        ensureErrorResponse(op, "403", "Forbidden",
-                exErr("FORBIDDEN", "Brak uprawnień do tej operacji."), null);
-
-        ensureErrorResponse(op, "404", "Not Found",
-                exErr("NOT_FOUND", "Zasób nie istnieje lub został usunięty."), null);
-
-        if (isWrite) {
-            ensureErrorResponse(op, "409", "Conflict",
-                    exErr("CONFLICT", "Konflikt stanu, np. duplikat lub wersjonowanie."), null);
-            ensureErrorResponse(op, "422", "Unprocessable Entity",
-                    exErr("VALIDATION_ERROR", "Dane poprawne syntaktycznie, lecz nie przechodzą walidacji domenowej."), null);
-        }
-
-        Map<String,Header> h429 = new LinkedHashMap<>();
-        h429.put("Retry-After", hdrInteger("Sekundy do kolejnej próby"));
-        ensureErrorResponse(op, "429", "Too Many Requests",
-                exErr("RATE_LIMITED", "Przekroczono limit zapytań."), h429);
-
-        ensureErrorResponse(op, "500", "Internal Server Error",
-                exErr("INTERNAL_ERROR", "Nieoczekiwany błąd serwera."), null);
-    }
-
-    @SuppressWarnings("unchecked")
-    private List<String> getStringListExt(Map<String, Object> ext, String key) {
-        List<String> out = new ArrayList<>();
-        if (ext == null) return out;
-        Object v = ext.get(key);
-        if (v == null) return out;
-
-        if (v instanceof List<?>) {
-            for (Object o : (List<?>) v) {
-                if (o != null) out.add(o.toString());
-            }
-            return out;
-        }
-        if (v instanceof String) {
-            out.add((String) v);
-            return out;
-        }
-        return out;
-    }
-
-    /** Jeśli brak przykładu w 2xx -> zbuduj neutralny example na bazie schematu. */
-    private void ensureResponseExample(io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        if (op.getResponses() == null) return;
-        op.getResponses().forEach((code, resp) -> {
-            if (resp == null) return;
-            // tylko 2xx
-            if (!code.startsWith("2")) return;
-            Content c = resp.getContent();
-            if (c == null) return;
-            io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-            if (mt == null) return;
-
-            // nie nadpisuj istniejących przykładów
-            if (mt.getExample() != null) return;
-
-            Schema<?> s = mt.getSchema();
-            if (s == null) return;
-
-            // Bez enforceRefIfPossible – utrzymujemy istniejący schema i generujemy neutralny example
-            Object ex = synthExampleNeutral(s);
-            if (ex != null) mt.setExample(ex);
         });
     }
 
-    /** Dodaje automatyczne happy-path examples wg metody i typu endpointu. */
-    private void addHappyPathExamples(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
-        if (op == null) return;
+    private static String methodOf(PathItem pi, io.swagger.v3.oas.models.Operation op) {
+        if (pi == null || op == null) return null;
+        if (op == pi.getGet())    return "GET";
+        if (op == pi.getPost())   return "POST";
+        if (op == pi.getPut())    return "PUT";
+        if (op == pi.getPatch())  return "PATCH";
+        if (op == pi.getDelete()) return "DELETE";
+        return null;
+    }
 
-        boolean isGet    = "GET".equalsIgnoreCase(nz(ep.http));
-        boolean isPost   = "POST".equalsIgnoreCase(nz(ep.http));
-        boolean isPut    = "PUT".equalsIgnoreCase(nz(ep.http));
-        boolean isPatch  = "PATCH".equalsIgnoreCase(nz(ep.http));
-        boolean isDelete = "DELETE".equalsIgnoreCase(nz(ep.http));
+    private Path resolveProjectPath(Path projectRoot) {
+        try {
+            Path base = (projectRoot != null) ? projectRoot : Path.of(System.getProperty("user.dir"));
+            Path src = base.resolve("src/main/java");
+            if (Files.exists(src)) return src;
+            Path classes = base.resolve("target/classes");
+            if (Files.exists(classes)) return classes;
 
-        // GET /{id} — przykład 200 z konkretnym obiektem
-        if (isGet && isGetById(ep)) {
-            ensureResponseExample(op, "200", buildHappyResponseExampleFor(ep, api));
-            // kluczowe ścieżki mogą mieć dodatkowy wariant:
-            if (isKeyEndpoint(ep)) {
-                ensureResponseExamples(op, "200", Map.of(
-                    "basic", buildHappyResponseExampleFor(ep, api),
-                    "withExtra", buildHappyResponseExampleFor(ep, api)
-                ));
+            try (Stream<Path> s = Files.find(base, 4,
+                    (p, a) -> a.isDirectory() && p.endsWith("src/main/java"))) {
+                Optional<Path> hit = s.findFirst();
+                if (hit.isPresent()) return hit.get();
             }
-        }
-
-        // POST/PUT/PATCH — przykład request + response (201/200)
-        if (isPost || isPut || isPatch) {
-            ensureRequestExample(op); // ma już szkic
-            String success = isPost ? "201" : "200";
-            ensureResponseExample(op, success, buildHappyResponseExampleFor(ep, api));
-
-            if (isKeyEndpoint(ep)) {
-                // 2–3 warianty: minimalny / pełny
-                addMultipleRequestExamples(op, Map.of(
-                    "minimal", synthRequestExample(op, /*minimal*/ true),
-                    "full",    synthRequestExample(op, /*minimal*/ false)
-                ));
-                ensureResponseExamples(op, success, Map.of(
-                    "okBasic", buildHappyResponseExampleFor(ep, api),
-                    "okExtended", buildHappyResponseExampleFor(ep, api)
-                ));
+            try (Stream<Path> s2 = Files.find(base, 4,
+                    (p, a) -> a.isRegularFile() && p.toString().endsWith(".java"))) {
+                Optional<Path> anyJava = s2.findFirst();
+                if (anyJava.isPresent()) return anyJava.get().getParent();
             }
-        }
-
-        // DELETE — 204 (albo 200 z payloadem, jeśli tak macie)
-        if (isDelete) {
-            ApiResponses rs = op.getResponses();
-            boolean has200 = rs != null && rs.get("200") != null;
-            if (has200) {
-                ensureResponseExample(op, "200", Map.of("status", "deleted"));
-            } else {
-                if (rs == null) { rs = new ApiResponses(); op.setResponses(rs); }
-                if (rs.get("204") == null) rs.addApiResponse("204", new ApiResponse().description("No Content"));
-                // 204 nie ma body – nic nie dodajemy
-            }
-        }
-
-        // Listy (GET kolekcji) – PageResponse + 1–3 warianty (sort/filtry)
-        if (isGet && isListEndpoint(ep)) {
-            String code = "200";
-            Object pageEx = buildPageExampleFor(ep, api);
-            ensureResponseExample(op, code, pageEx);
-
-            if (isKeyEndpoint(ep)) {
-                ensureResponseExamples(op, code, Map.of(
-                    "sortCreatedDesc", pageEx,
-                    "sortCreatedAsc",  pageEx,
-                    "filtered",        pageEx
-                ));
-            }
+            return base;
+        } catch (Exception e) {
+            System.err.println("[WARN] resolveProjectPath error: " + e.getMessage());
+            return (projectRoot != null) ? projectRoot : Path.of(System.getProperty("user.dir"));
         }
     }
 
-    /** Czy endpoint wygląda na GET /.../{id} (pojedynczy zasób). */
-    private boolean isGetById(EndpointIR ep) {
-        if (ep == null || ep.path == null) return false;
-        if (!"GET".equalsIgnoreCase(nz(ep.http))) return false;
-        Set<String> vars = findPathVars(ep.path);
-        return !vars.isEmpty() && !isListEndpoint(ep);
+    private static boolean isWriteMethod(String http) {
+        String h = nz(http).toUpperCase(Locale.ROOT);
+        return h.equals("POST") || h.equals("PUT") || h.equals("PATCH");
     }
 
-    /** Dodaje jeden example do odpowiedzi (200/201/...) – jako 'example' (pojedynczy). */
-    private void ensureResponseExample(io.swagger.v3.oas.models.Operation op, String code, Object example) {
-        if (op.getResponses() == null) op.setResponses(new ApiResponses());
-        ApiResponse r = op.getResponses().get(code);
-        if (r == null) { r = new ApiResponse().description(code.equals("201") ? "Created" : "OK"); op.getResponses().addApiResponse(code, r); }
-        Content c = (r.getContent() == null) ? new Content() : r.getContent();
-        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-        if (mt == null) {
-            mt = new io.swagger.v3.oas.models.media.MediaType();
-            // jeśli brak schematu, ustaw prosty ObjectSchema
-            if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
-            c.addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
+    private static String normalizeCurl(String s) {
+        String t = s.replace("\\n", "\n").replace("\\\"", "\"").trim();
+        if (!t.contains("\n")) {
+            t = t.replaceAll("\\s+-X\\s+", " \\\n  -X ")
+                 .replaceAll("\\s+-H\\s+", " \\\n  -H ")
+                 .replaceAll("\\s+--data-raw\\s+", " \\\n  --data-raw ")
+                 .replaceAll("\\s+-d\\s+", " \\\n  -d ");
         }
-        if (mt.getSchema() == null) {
-            mt.setSchema(new ObjectSchema());
-        }
-        mt.setExample(example);
-        r.setContent(c);
+        if (!t.startsWith("curl ")) t = "curl " + t;
+        return t;
     }
 
-    /** Dodaje wiele nazwanych examples do odpowiedzi. Nadpisuje/łączy mapę .examples. */
-    private void ensureResponseExamples(io.swagger.v3.oas.models.Operation op, String code, Map<String, Object> examples) {
-        if (examples == null || examples.isEmpty()) return;
-        if (op.getResponses() == null) op.setResponses(new ApiResponses());
-        ApiResponse r = op.getResponses().get(code);
-        if (r == null) { r = new ApiResponse().description(code.equals("201") ? "Created" : "OK"); op.getResponses().addApiResponse(code, r); }
-        Content c = (r.getContent() == null) ? new Content() : r.getContent();
-        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-        if (mt == null) {
-            mt = new io.swagger.v3.oas.models.media.MediaType();
-            c.addMediaType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE, mt);
-        }
-        if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
-
-        Map<String, Example> exMap = (mt.getExamples() == null) ? new LinkedHashMap<>() : new LinkedHashMap<>(mt.getExamples());
-        for (Map.Entry<String, Object> e : examples.entrySet()) {
-            Example ex = new Example();
-            ex.setValue(e.getValue());
-            exMap.put(e.getKey(), ex);
-        }
-        mt.setExamples(exMap);
-        r.setContent(c);
+    private static String sanitizeNlp(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.isEmpty()) return null;
+        if (!t.endsWith(".")) t += ".";
+        return t;
     }
 
-    /** Dodaje wiele request examples (minimal/full). */
-    private void addMultipleRequestExamples(io.swagger.v3.oas.models.Operation op, Map<String, Object> examples) {
-        if (op.getRequestBody() == null) return;
-        Content c = op.getRequestBody().getContent();
-        if (c == null) return;
-        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-        if (mt == null) return;
-        if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
+    private static String pickByLevel(String s, String m, String l, String level) {
+        String lv = level == null ? "" : level.trim().toLowerCase(Locale.ROOT);
+        return switch (lv) {
+            case "beginner", "short", "junior" -> firstNonBlank(s, m, l);
+            case "advanced", "long", "senior"  -> firstNonBlank(l, m, s);
+            default                            -> firstNonBlank(m, s, l);
+        };
+    }
 
-        Map<String, Example> exMap = (mt.getExamples() == null) ? new LinkedHashMap<>() : new LinkedHashMap<>(mt.getExamples());
-        for (Map.Entry<String, Object> e : examples.entrySet()) {
-            Example ex = new Example(); ex.setValue(e.getValue());
-            exMap.put(e.getKey(), ex);
+    private static String firstNonBlank(String... xs) {
+        if (xs == null) return null;
+        for (String x : xs) {
+            if (x != null && !x.isBlank()) return x;
         }
-        mt.setExamples(exMap);
+        return null;
     }
 
-    /** Buduje neutralny „happy path” example 200/201 dla pojedynczego zasobu. */
-    private Object buildHappyResponseExampleFor(EndpointIR ep, OpenAPI api) {
-        String success = "POST".equalsIgnoreCase(nz(ep.http)) ? "201" : "200";
-        Schema<?> s = null;
-        if (ep != null && ep.returns != null) s = schemaForType(ep.returns.type);
-        if (s instanceof ArraySchema) {
-            return List.of(synthExampleNeutral(((ArraySchema) s).getItems()));
-        }
-        return synthExampleNeutral(s == null ? new ObjectSchema() : s);
+    private static String asStr(Object o) {
+        return (o == null) ? null : Objects.toString(o, null);
     }
 
-    /** Buduje example dla stron (PageResponse<T>) – 1 strona z jednym elementem. */
-    private Object buildPageExampleFor(EndpointIR ep, OpenAPI api) {
-        String returns = (ep.returns == null) ? null : ep.returns.type;
-        Schema<?> item = schemaForType(extractElementType(returns));
-        Map<String,Object> ex = new LinkedHashMap<>();
-        ex.put("page", 0);
-        ex.put("size", 20);
-        ex.put("totalElements", 1);
-        ex.put("totalPages", 1);
-        ex.put("content", List.of(synthExampleNeutral(item == null ? new ObjectSchema() : item)));
-        return ex;
+    private static String trim(String s, int max) {
+        if (s == null) return null;
+        if (s.length() <= max) return s;
+        return s.substring(0, max) + "…";
     }
 
-    /** Minimalny/pełny przykład request body na bazie schematu. */
-    private Object synthRequestExample(io.swagger.v3.oas.models.Operation op, boolean minimal) {
-        if (op.getRequestBody() == null) return Map.of();
-        Content c = op.getRequestBody().getContent();
-        if (c == null) return Map.of();
-        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-        if (mt == null) return Map.of();
-        Schema<?> s = mt.getSchema();
-        if (s == null) return Map.of();
-
-        Object ex = synthExampleNeutral(s);
-        if (minimal && ex instanceof Map) {
-            Set<String> req = (s.getRequired() == null) ? Set.of() : new LinkedHashSet<>(s.getRequired());
-            if (!req.isEmpty()) {
-                Map<?,?> full = (Map<?,?>) ex;
-                Map<String,Object> min = new LinkedHashMap<>();
-                for (String r : req) {
-                    if (full.containsKey(r)) min.put(r, full.get(r));
-                }
-                return min.isEmpty() ? ex : min;
-            }
-        }
-        return ex;
+    private static String nz(String s) {
+        return (s == null) ? "" : s;
     }
 
-    /** Uzupełnia single 'example' dla request body, jeśli nie ustawiono. */
-    private void ensureRequestExample(io.swagger.v3.oas.models.Operation op) {
-        if (op.getRequestBody() == null) return;
-        Content c = op.getRequestBody().getContent();
-        if (c == null) return;
-        io.swagger.v3.oas.models.media.MediaType mt = c.get(org.springframework.http.MediaType.APPLICATION_JSON_VALUE);
-        if (mt == null) return;
-        if (mt.getSchema() == null) mt.setSchema(new ObjectSchema());
-        if (mt.getExample() == null) {
-            mt.setExample(synthExampleNeutral(mt.getSchema()));
-        }
-    }
-
-    /** Heurystyka: które endpointy traktujemy jako „kluczowe” (dostaną 2–3 warianty). */
-    private boolean isKeyEndpoint(EndpointIR ep) {
-        if (ep == null) return false;
-        String p = nz(ep.path).toLowerCase(Locale.ROOT);
-        String opId = nz(ep.operationId).toLowerCase(Locale.ROOT);
-        return
-            p.startsWith("/auth") ||
-            p.startsWith("/api/profile") ||
-            p.startsWith("/api/suggestions") ||
-            opId.contains("login") || opId.contains("register") ||
-            opId.contains("profile") || opId.contains("suggest");
+    private static String firstSentenceOf(String text) {
+        if (text == null) return "";
+        String t = text.trim();
+        if (t.isEmpty()) return "";
+        int idx = t.indexOf('.');
+        if (idx < 0) return t;
+        return t.substring(0, idx).trim();
     }
 }

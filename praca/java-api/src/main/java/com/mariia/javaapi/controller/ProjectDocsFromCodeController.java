@@ -10,7 +10,6 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -35,181 +34,246 @@ public class ProjectDocsFromCodeController {
         this.pdfDocService = pdfDocService;
     }
 
-    /**
-     * Generuje OpenAPI (AI) z kodu i zwraca pojedynczy plik: openapi.ai.yaml
-     * Parametr level: beginner | intermediate | advanced (domyślnie: intermediate)
-     * Zwraca jako ZAŁĄCZNIK (download).
-     */
+    // =========================================================
+    //  YAML z kodu (AI)
+    // =========================================================
+
     @PostMapping(value = "/{id}/docs/from-code")
     public ResponseEntity<byte[]> fromCode(
             @PathVariable String id,
             @RequestParam(defaultValue = "intermediate") String level
     ) throws Exception {
+
         Path projectDir = storage.resolveProjectDir(id);
         if (!Files.exists(projectDir)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body(("Project not found: " + id).getBytes());
+            return notFound("Project not found: " + id);
         }
 
         List<EndpointIR> endpoints = parser.parseProject(projectDir);
         if (endpoints.isEmpty()) {
-            return ResponseEntity.badRequest()
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body("No endpoints found in source code.".getBytes());
+            return badRequest("No endpoints found in source code.");
         }
 
         Files.createDirectories(projectDir);
-        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
 
-        // Zawsze generujemy świeży YAML w trybie AI dla zadanego poziomu
+        String audience = normalizeAudience(level);
+        String projectName = resolveProjectName(id);
+        Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
+
         code2docs.generateYamlFromCode(
-                endpoints, "Project " + id, normalizeAudience(level),
-                aiYaml, projectDir,
+                endpoints,
+                projectName,
+                audience,
+                aiYaml,
+                projectDir,
                 CodeToDocsService.DescribeMode.AI
         );
 
-        return asAttachment(aiYaml, "openapi.ai.yaml", "text/yaml");
+        String fileName = "openapi_" + audience + ".yaml";
+        return asAttachment(aiYaml, fileName, "text/yaml");
     }
 
-    /**
-     * Renderuje i ZWRACA PDF jako ZAŁĄCZNIK (download).
-     * Jeżeli YAML nie istnieje – najpierw go generuje (AI).
-     * Parametr level: beginner | intermediate | advanced
-     */
+    // =========================================================
+    //  PDF (download)
+    // =========================================================
+
     @PostMapping(value = "/{id}/docs/pdf")
     public ResponseEntity<byte[]> pdfFrom(
             @PathVariable String id,
             @RequestParam(defaultValue = "intermediate") String level
     ) throws Exception {
+
         Path projectDir = storage.resolveProjectDir(id);
         if (!Files.exists(projectDir)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body(("Project not found: " + id).getBytes());
+            return notFound("Project not found: " + id);
         }
 
-        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
-        Path aiPdf  = projectDir.resolve("openapi.ai.pdf");
-
-        if (!Files.exists(aiYaml)) {
-            List<EndpointIR> endpoints = parser.parseProject(projectDir);
-            if (endpoints.isEmpty()) {
-                return ResponseEntity.badRequest()
-                        .contentType(MediaType.TEXT_PLAIN)
-                        .body("No endpoints found in source code.".getBytes());
-            }
-            code2docs.generateYamlFromCode(
-                    endpoints, "Project " + id, normalizeAudience(level),
-                    aiYaml, projectDir,
-                    CodeToDocsService.DescribeMode.AI
-            );
+        List<EndpointIR> endpoints = parser.parseProject(projectDir);
+        if (endpoints.isEmpty()) {
+            return badRequest("No endpoints found in source code.");
         }
 
-        // Render PDF z YAML
+        Files.createDirectories(projectDir);
+
+        String audience = normalizeAudience(level);
+        String projectName = resolveProjectName(id);
+        Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
+        Path aiPdf  = projectDir.resolve("openapi_" + audience + ".pdf");
+
+        code2docs.generateYamlFromCode(
+                endpoints,
+                projectName,
+                audience,
+                aiYaml,
+                projectDir,
+                CodeToDocsService.DescribeMode.AI
+        );
+
         pdfDocService.renderPdfFromYaml(aiYaml, aiPdf);
-        return asAttachment(aiPdf, "openapi.ai.pdf", MediaType.APPLICATION_PDF_VALUE);
+
+        String fileName = "openapi_" + audience + ".pdf";
+        return asAttachment(aiPdf, fileName, MediaType.APPLICATION_PDF_VALUE);
     }
 
-    /* =========================
-       NOWE endpointy do PODGLĄDU
-       ========================= */
+    // =========================================================
+    //  PDF (inline preview)
+    // =========================================================
 
-    /**
-     * Web-podgląd PDF (Content-Disposition: inline).
-     * Jeśli PDF/YAML nie istnieją – generuje jak w /docs/pdf.
-     */
     @GetMapping(value = "/{id}/docs/pdf", produces = MediaType.APPLICATION_PDF_VALUE)
     public ResponseEntity<byte[]> viewPdfInline(
             @PathVariable String id,
             @RequestParam(defaultValue = "intermediate") String level
     ) throws Exception {
+
         Path projectDir = storage.resolveProjectDir(id);
         if (!Files.exists(projectDir)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body(("Project not found: " + id).getBytes());
+            return notFound("Project not found: " + id);
         }
 
-        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
-        Path aiPdf  = projectDir.resolve("openapi.ai.pdf");
-
-        if (!Files.exists(aiYaml)) {
-            List<EndpointIR> endpoints = parser.parseProject(projectDir);
-            if (endpoints.isEmpty()) {
-                return ResponseEntity.badRequest()
-                        .contentType(MediaType.TEXT_PLAIN)
-                        .body("No endpoints found in source code.".getBytes());
-            }
-            code2docs.generateYamlFromCode(
-                    endpoints, "Project " + id, normalizeAudience(level),
-                    aiYaml, projectDir,
-                    CodeToDocsService.DescribeMode.AI
-            );
+        List<EndpointIR> endpoints = parser.parseProject(projectDir);
+        if (endpoints.isEmpty()) {
+            return badRequest("No endpoints found in source code.");
         }
 
-        if (!Files.exists(aiPdf)) {
-            pdfDocService.renderPdfFromYaml(aiYaml, aiPdf);
-        }
+        Files.createDirectories(projectDir);
 
-        return asInline(aiPdf, "openapi.ai.pdf", MediaType.APPLICATION_PDF_VALUE);
+        String audience = normalizeAudience(level);
+        String projectName = resolveProjectName(id);
+        Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
+        Path aiPdf  = projectDir.resolve("openapi_" + audience + ".pdf");
+
+        code2docs.generateYamlFromCode(
+                endpoints,
+                projectName,
+                audience,
+                aiYaml,
+                projectDir,
+                CodeToDocsService.DescribeMode.AI
+        );
+
+        pdfDocService.renderPdfFromYaml(aiYaml, aiPdf);
+
+        String fileName = "openapi_" + audience + ".pdf";
+        return asInline(aiPdf, fileName, MediaType.APPLICATION_PDF_VALUE);
     }
 
-    /**
-     * Web-podgląd YAML (inline).
-     */
+    // =========================================================
+    //  YAML (inline + download)
+    // =========================================================
+
     @GetMapping(value = "/{id}/docs/yaml", produces = "text/yaml")
-    public ResponseEntity<byte[]> viewYamlInline(@PathVariable String id) throws IOException {
+    public ResponseEntity<byte[]> viewYamlInline(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "intermediate") String level
+    ) throws Exception {
+
         Path projectDir = storage.resolveProjectDir(id);
         if (!Files.exists(projectDir)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body(("Project not found: " + id).getBytes());
+            return notFound("Project not found: " + id);
         }
-        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
-        if (!Files.exists(aiYaml)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body("YAML not found. Generate it first.".getBytes());
+
+        List<EndpointIR> endpoints = parser.parseProject(projectDir);
+        if (endpoints.isEmpty()) {
+            return badRequest("No endpoints found in source code.");
         }
-        return asInline(aiYaml, "openapi.ai.yaml", "text/yaml");
+
+        Files.createDirectories(projectDir);
+
+        String audience = normalizeAudience(level);
+        String projectName = resolveProjectName(id);
+        Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
+
+        code2docs.generateYamlFromCode(
+                endpoints,
+                projectName,
+                audience,
+                aiYaml,
+                projectDir,
+                CodeToDocsService.DescribeMode.AI
+        );
+
+        String fileName = "openapi_" + audience + ".yaml";
+        return asInline(aiYaml, fileName, "text/yaml");
     }
 
-    /**
-     * Pobierz YAML (download) – wygodny bliźniaczy endpoint.
-     */
     @GetMapping(value = "/{id}/docs/yaml/download")
-    public ResponseEntity<byte[]> downloadYaml(@PathVariable String id) throws IOException {
+    public ResponseEntity<byte[]> downloadYaml(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "intermediate") String level
+    ) throws Exception {
+
         Path projectDir = storage.resolveProjectDir(id);
         if (!Files.exists(projectDir)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body(("Project not found: " + id).getBytes());
+            return notFound("Project not found: " + id);
         }
-        Path aiYaml = projectDir.resolve("openapi.ai.yaml");
-        if (!Files.exists(aiYaml)) {
-            return ResponseEntity.status(404)
-                    .contentType(MediaType.TEXT_PLAIN)
-                    .body("YAML not found. Generate it first.".getBytes());
+
+        List<EndpointIR> endpoints = parser.parseProject(projectDir);
+        if (endpoints.isEmpty()) {
+            return badRequest("No endpoints found in source code.");
         }
-        return asAttachment(aiYaml, "openapi.ai.yaml", "text/yaml");
+
+        Files.createDirectories(projectDir);
+
+        String audience = normalizeAudience(level);
+        String projectName = resolveProjectName(id);
+        Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
+
+        code2docs.generateYamlFromCode(
+                endpoints,
+                projectName,
+                audience,
+                aiYaml,
+                projectDir,
+                CodeToDocsService.DescribeMode.AI
+        );
+
+        String fileName = "openapi_" + audience + ".yaml";
+        return asAttachment(aiYaml, fileName, "text/yaml");
     }
 
-    // —— helpers ——
+    // =========================================================
+    //  Helpers
+    // =========================================================
+
+    private String resolveProjectName(String id) {
+        // TODO: zaimplementuj w UploadStorage realne mapowanie id -> bazowa nazwa zipa.
+        // Tymczasowo: jeśli masz taką metodę, użyj jej tutaj.
+        String fromStorage = storage.getProjectName(id); // dodaj tę metodę w UploadStorage
+        if (fromStorage != null && !fromStorage.isBlank()) {
+            return fromStorage;
+        }
+        return id; // fallback awaryjny
+    }
+
     private static String normalizeAudience(String s) {
         String v = (s == null) ? "intermediate" : s.trim().toLowerCase(Locale.ROOT);
         switch (v) {
             case "short":
             case "junior":
-            case "beginner": return "beginner";
+            case "beginner":
+                return "beginner";
             case "long":
             case "senior":
-            case "advanced": return "advanced";
-            default: return "intermediate";
+            case "advanced":
+                return "advanced";
+            default:
+                return "intermediate";
         }
     }
 
-    private static ResponseEntity<byte[]> asAttachment(Path path, String filename, String contentType) throws IOException {
+    private static ResponseEntity<byte[]> notFound(String msg) {
+        return ResponseEntity.status(404)
+                .contentType(MediaType.TEXT_PLAIN)
+                .body(msg.getBytes());
+    }
+
+    private static ResponseEntity<byte[]> badRequest(String msg) {
+        return ResponseEntity.badRequest()
+                .contentType(MediaType.TEXT_PLAIN)
+                .body(msg.getBytes());
+    }
+
+    private static ResponseEntity<byte[]> asAttachment(Path path, String filename, String contentType) throws Exception {
         byte[] bytes = Files.readAllBytes(path);
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
@@ -218,7 +282,7 @@ public class ProjectDocsFromCodeController {
                 .body(bytes);
     }
 
-    private static ResponseEntity<byte[]> asInline(Path path, String filename, String contentType) throws IOException {
+    private static ResponseEntity<byte[]> asInline(Path path, String filename, String contentType) throws Exception {
         byte[] bytes = Files.readAllBytes(path);
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")

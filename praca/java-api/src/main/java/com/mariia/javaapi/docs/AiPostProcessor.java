@@ -11,7 +11,6 @@ import io.swagger.v3.oas.models.responses.ApiResponses;
 import io.swagger.v3.oas.models.responses.ApiResponse;
 
 import java.util.*;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class AiPostProcessor {
@@ -59,16 +58,13 @@ public class AiPostProcessor {
         // 3) GET/POST body & query porządek + ostrzeżenia
         cleanupQueryVsBody(method, op);
 
-        // 4) Normalizacja cURL
+        // 4) Normalizacja cURL (tylko formatowanie, BEZ walidacji/wywalania)
         normalizeCurlExamples(op);
-
-        // 4b) Walidacja cURL + filtr (po normalizacji)
-        validateAndFilterCurlExamples(method, path, op);
 
         // 5) Kody odpowiedzi (POST→201 + Location; DELETE→204)
         fixStatusesByHeuristics(method, op);
 
-        // 6) Delikatne doprecyzowania opisów dziedzinowych (orders/users) + sensowny summary
+        // 6) Delikatne doprecyzowania opisów dziedzinowych + sensowny summary
         enrichDomainDescriptions(method, path, op);
     }
 
@@ -160,23 +156,25 @@ public class AiPostProcessor {
         return text.trim().split("\\.\\s+|\\.$");
     }
 
-    // ————— 3) Query vs Body + ostrzeżenia (krok 2) —————
+    // ————— 3) Query vs Body + ostrzeżenia —————
     private void cleanupQueryVsBody(String method, Operation op) {
-        boolean isWrite = "POST".equalsIgnoreCase(method) || "PUT".equalsIgnoreCase(method) || "PATCH".equalsIgnoreCase(method);
+        boolean isWrite = "POST".equalsIgnoreCase(method)
+                || "PUT".equalsIgnoreCase(method)
+                || "PATCH".equalsIgnoreCase(method);
 
         RequestBody rb = op.getRequestBody();
         Content bodyContent = (rb != null) ? rb.getContent() : null;
         boolean hasBody = bodyContent != null && !bodyContent.isEmpty();
         boolean hasJsonBody = hasBody && bodyContent.get("application/json") != null;
 
-        // [RULE] GET nie może mieć body → usuń body + warning
+        // GET nie powinien mieć body → usuń
         if ("GET".equalsIgnoreCase(method) && hasBody) {
             op.setRequestBody(null);
             addOpWarning(op, "GET body removed: filtry przenieś do query.");
             return;
         }
 
-        // [RULE] jeśli mamy body JSON w metodzie zapisu → usuń zduplikowane 'request/payload' w query
+        // jeśli mamy body JSON w metodzie zapisu → usuń zduplikowane 'request/payload' w query
         if (hasJsonBody && isWrite) {
             List<Parameter> params = op.getParameters();
             if (params != null && !params.isEmpty()) {
@@ -186,7 +184,7 @@ public class AiPostProcessor {
                     String loc = safe(p.getIn());
                     String name = safe(p.getName());
                     if ("query".equals(loc) && BODYish_NAMES.contains(name)) {
-                        // drop param
+                        // drop
                     } else {
                         kept.add(p);
                     }
@@ -196,12 +194,13 @@ public class AiPostProcessor {
             return;
         }
 
-        // [HINT] POST bez body i same query → ostrzeż, że to wygląda na GET/search
+        // POST bez body, ale z query → hint
         if ("POST".equalsIgnoreCase(method) && !hasBody) {
             boolean anyQuery = op.getParameters() != null
                     && op.getParameters().stream().anyMatch(p -> "query".equalsIgnoreCase(safe(p.getIn())));
             if (anyQuery) {
-                addOpWarning(op, "POST bez body, z filtrami w query — rozważ GET (lub POST /.../search z body dla filtrów złożonych).");
+                addOpWarning(op,
+                        "POST bez body, z filtrami w query — rozważ GET (lub POST /.../search z body dla filtrów złożonych).");
             }
         }
     }
@@ -209,7 +208,10 @@ public class AiPostProcessor {
     private void addOpWarning(Operation op, String msg) {
         if (op == null) return;
         Map<String, Object> ext = op.getExtensions();
-        if (ext == null) { ext = new LinkedHashMap<>(); op.setExtensions(ext); }
+        if (ext == null) {
+            ext = new LinkedHashMap<>();
+            op.setExtensions(ext);
+        }
         List<String> warns;
         Object existing = ext.get("x-warnings");
         if (existing instanceof List) {
@@ -222,7 +224,7 @@ public class AiPostProcessor {
         ext.put("x-warnings", warns);
     }
 
-    // ————— 4) Normalizacja cURL —————
+    // ————— 4) Normalizacja cURL (bez kasowania) —————
     @SuppressWarnings("unchecked")
     private void normalizeCurlExamples(Operation op) {
         if (op.getExtensions() == null) return;
@@ -236,13 +238,16 @@ public class AiPostProcessor {
         for (Object o : list) {
             if (o == null) continue;
             String s = Objects.toString(o, "");
-            s = s.replace("\\n", "\n").replace("\\\"", "\"").trim();
+            s = s.replace("\\n", "\n")
+                 .replace("\\\"", "\"")
+                 .trim();
             String t = toMultilineCurl(s);
             if (!t.isBlank()) normalized.add(t);
         }
         if (!normalized.isEmpty()) {
             op.addExtension("x-request-examples", normalized);
         }
+        // jeśli nic nie przeszło normalizacji, zostaw oryginał jak jest
     }
 
     private String toMultilineCurl(String s) {
@@ -273,62 +278,7 @@ public class AiPostProcessor {
         return out.toString();
     }
 
-    // ————— 4b) Validator cURL + filtr —————
-    @SuppressWarnings("unchecked")
-    private void validateAndFilterCurlExamples(String method, String pathTemplate, Operation op) {
-        if (op.getExtensions() == null) return;
-        Object raw = op.getExtensions().get("x-request-examples");
-        if (!(raw instanceof List)) return;
-        List<?> src = (List<?>) raw;
-        if (src.isEmpty()) return;
-
-        List<String> ok = new ArrayList<>();
-        for (Object o : src) {
-            String curl = Objects.toString(o, "").trim();
-            if (curl.isEmpty()) continue;
-            if (isValidCurlExample(curl, method, pathTemplate)) ok.add(curl);
-        }
-        if (ok.isEmpty()) {
-            // usuń całkowicie, żeby PDF nie renderował „śmieci”
-            op.getExtensions().remove("x-request-examples");
-        } else {
-            op.addExtension("x-request-examples", ok);
-        }
-    }
-
-    private boolean isValidCurlExample(String curl, String expectedMethod, String pathTemplate) {
-        // 1) Zakaz '#' w host/path
-        if (curl.contains("://") && curl.contains("#")) return false;
-
-        // 2) Ustal metodę z -X <METHOD> lub domyślnie GET
-        String method = "GET";
-        Matcher m = Pattern.compile("(?i)\\s-?X\\s+([A-Z]+)").matcher(curl);
-        if (m.find()) method = m.group(1).toUpperCase(Locale.ROOT);
-        if (!curl.contains(" -X ") && curl.toLowerCase(Locale.ROOT).contains("--request")) {
-            Matcher m2 = Pattern.compile("(?i)--request\\s+([A-Z]+)").matcher(curl);
-            if (m2.find()) method = m2.group(1).toUpperCase(Locale.ROOT);
-        }
-        if (!method.equalsIgnoreCase(expectedMethod)) return false;
-
-        // 3) Wyciągnij URL
-        Matcher mu = Pattern.compile("(https?://\\S+)").matcher(curl);
-        if (!mu.find()) return false;
-        String url = mu.group(1);
-
-        // 4) Jeśli pathTemplate zawiera {var}, wymagamy segmentu zamiast query '?id='
-        String regexPath = Pattern.quote(pathTemplate);
-        regexPath = regexPath.replace("\\{", "{").replace("}", "}");
-        regexPath = regexPath.replaceAll("\\{[^}/]+}", "([^/]+)");
-        String mustMatch = "https?://[^\\s]+?" + regexPath + "(?:\\?|$)";
-        if (!url.matches(mustMatch)) return false;
-
-        // 5) Dodatkowo: dla szablonu z {id...} zabroń '?id='
-        if (pathTemplate.matches(".*\\{[^}]*id[^}]*}.*") && url.matches(".*\\?.*\\bid=.*")) return false;
-
-        return true;
-    }
-
-    // ————— 5) Statusy (krok 2): POST→201 (+Location), DELETE→204, 204 bez treści —————
+    // ————— 5) Statusy: POST/DELETE/204 —————
     private void fixStatusesByHeuristics(String method, Operation op) {
         if (op == null) return;
         ApiResponses rs = op.getResponses();
@@ -350,7 +300,7 @@ public class AiPostProcessor {
             return;
         }
 
-        // POST: jeżeli „tworzy” (200 bez ciała lub brak 2xx) → 201 Created (+Location)
+        // POST: ewentualna promocja 200 -> 201
         if (isPost) {
             ApiResponse r200 = rs.get("200");
             boolean promoteTo201 = false;
@@ -371,7 +321,7 @@ public class AiPostProcessor {
                 rs.addApiResponse("201", created);
             }
 
-            // Jeśli już mamy 201, dopnij Location
+            // Jeśli mamy 201, dopnij Location
             ApiResponse r201 = rs.get("201");
             if (r201 != null) {
                 ensureLocationHeader(r201, null);
@@ -390,7 +340,6 @@ public class AiPostProcessor {
         }
     }
 
-    // Dodaje nagłówek Location do odpowiedzi 201/Created (jeśli jeszcze nie ma)
     private void ensureLocationHeader(ApiResponse resp, String exampleUri) {
         if (resp == null) return;
         Map<String, Header> headers = resp.getHeaders();
@@ -429,7 +378,10 @@ public class AiPostProcessor {
             }
             if (method.equalsIgnoreCase("POST") && path.endsWith("/items")) {
                 if (s.isBlank()) op.setSummary("Dodaj pozycję do zamówienia.");
-                if (d.isBlank()) op.setDescription("Tworzy nową pozycję w zamówieniu wskazanym przez {orderId}. Prześlij JSON z polami „sku” i „qty”.");
+                if (d.isBlank()) op.setDescription(
+                        "Tworzy nową pozycję w zamówieniu wskazanym przez {orderId}. " +
+                        "Prześlij JSON z polami „sku” i „qty”."
+                );
             }
         }
         if (isUsers) {
@@ -438,12 +390,15 @@ public class AiPostProcessor {
             }
             if (method.equalsIgnoreCase("POST") && path.endsWith("/users")) {
                 if (s.isBlank()) op.setSummary("Utwórz nowego użytkownika.");
-                if (d.isBlank()) op.setDescription("Tworzy użytkownika na podstawie JSON w formacie CreateUserRequest.");
+                if (d.isBlank()) op.setDescription(
+                        "Tworzy użytkownika na podstawie JSON w formacie CreateUserRequest."
+                );
             }
         }
 
         // jeżeli summary puste, spróbuj z 1. zdania description
-        if ((op.getSummary() == null || op.getSummary().isBlank()) && op.getDescription() != null && !op.getDescription().isBlank()) {
+        if ((op.getSummary() == null || op.getSummary().isBlank())
+                && op.getDescription() != null && !op.getDescription().isBlank()) {
             String fs = firstSentenceOf(op.getDescription());
             if (!fs.isBlank()) op.setSummary(trim100(fs + "."));
         }
@@ -457,7 +412,9 @@ public class AiPostProcessor {
         MediaType mt = c.get("application/json");
         if (mt == null) return true;
         Schema<?> s = mt.getSchema();
-        return (s == null) || ("object".equalsIgnoreCase(String.valueOf(s.getType())) && mt.getExample() == null);
+        return (s == null)
+                || ("object".equalsIgnoreCase(String.valueOf(s.getType()))
+                    && mt.getExample() == null);
     }
 
     private ApiResponse copyResponse(ApiResponse src) {

@@ -4,6 +4,7 @@ import com.openhtmltopdf.pdfboxout.PdfRendererBuilder;
 import io.swagger.v3.oas.models.Components;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
+import io.swagger.v3.oas.models.PathItem;
 import io.swagger.v3.oas.models.media.*;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.responses.ApiResponse;
@@ -16,14 +17,20 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 
+/**
+ * Generuje PDF z OpenAPI YAML, z różnicowaniem poziomów (beginner/intermediate/advanced).
+ * - Beginner:
+ *   - 1–2 zdania co robi endpoint, prosty scenariusz.
+ *   - 1 prosty curl.
+ *   - Tylko kluczowe statusy w tabelce odpowiedzi:
+ *     200/201/204 oraz 400, 401, 403, 404.
+ *   - Globalna sekcja z pełną macierzą błędów i słowniczkiem.
+ *   - Podsumowanie aplikacji na końcu, oparte o realne endpointy i nazwę projektu (nazwa zipa).
+ * - Wyższe poziomy widzą pełniejsze dane.
+ */
 @Service
 public class PdfDocService {
 
-    /**
-     * Renderuje PDF na podstawie pliku OpenAPI YAML.
-     * Wymaga obecności czcionki w classpath: /fonts/times.ttf
-     * (czyli: src/main/resources/fonts/times.ttf)
-     */
     public Path renderPdfFromYaml(Path openapiYaml, Path outPdf) throws Exception {
         OpenAPI api = new OpenAPIV3Parser().read(openapiYaml.toAbsolutePath().toString());
         if (api == null) {
@@ -55,72 +62,9 @@ public class PdfDocService {
         return outPdf;
     }
 
-    // ————————————————————— HTML helpers —————————————————————
-
-    private static String esc(String s) {
-        if (s == null) return "";
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
-    }
-
-    private static String nz(String s) { return (s == null) ? "" : s; }
-
-    private static String getInfoLevel(OpenAPI api) {
-        if (api.getInfo() != null && api.getInfo().getExtensions() != null) {
-            Object v = api.getInfo().getExtensions().get("x-user-level");
-            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
-        }
-        return "intermediate";
-    }
-
-    private static String getOpLevel(Operation op, String fallback) {
-        if (op != null && op.getExtensions() != null) {
-            Object v = op.getExtensions().get("x-user-level");
-            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
-        }
-        return fallback;
-    }
-
-    /** Nazwa projektu do nagłówka: x-project-name > info.title > "API". */
-    private static String getProjectName(OpenAPI api) {
-        if (api != null && api.getInfo() != null) {
-            Map<String, Object> ext = api.getInfo().getExtensions();
-            if (ext != null && ext.get("x-project-name") != null) {
-                String n = String.valueOf(ext.get("x-project-name")).trim();
-                if (!n.isBlank()) return n;
-            }
-            String t = nz(api.getInfo().getTitle()).trim();
-            if (!t.isBlank()) return t;
-        }
-        return "API";
-    }
-
-    /** Opcjonalny pakiet nagłówka: title/subtitle/generatedAt z info.extensions["x-doc-header"]. */
-    @SuppressWarnings("unchecked")
-    private static Map<String, Object> getDocHeader(OpenAPI api) {
-        if (api != null && api.getInfo() != null && api.getInfo().getExtensions() != null) {
-            Object v = api.getInfo().getExtensions().get("x-doc-header");
-            if (v instanceof Map) return (Map<String, Object>) v;
-        }
-        return Collections.emptyMap();
-    }
-
-    private static String levelLabelPl(String lvl) {
-        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
-            case "beginner":    return "Poziom: początkujący";
-            case "advanced":    return "Poziom: zaawansowany";
-            case "intermediate":
-            default:            return "Poziom: średniozaawansowany";
-        }
-    }
-
-    private static String levelClass(String lvl) {
-        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
-            case "beginner":    return "lvl-beginner";
-            case "advanced":    return "lvl-advanced";
-            case "intermediate":
-            default:            return "lvl-intermediate";
-        }
-    }
+    // ========================================================================
+    //  HTML / CSS / helpers
+    // ========================================================================
 
     private static final String CSS = """
       @page { size: A4; margin: 24mm; }
@@ -146,6 +90,99 @@ public class PdfDocService {
       .security{background:#fbfcff;border:1px solid #e6ecff;border-radius:6px;padding:8px;margin:10px 0}
     """;
 
+    private static String esc(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;");
+    }
+
+    private static String nz(String s) {
+        return (s == null) ? "" : s;
+    }
+
+    private static String getInfoLevel(OpenAPI api) {
+        if (api.getInfo() != null && api.getInfo().getExtensions() != null) {
+            Object v = api.getInfo().getExtensions().get("x-user-level");
+            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
+        }
+        return "intermediate";
+    }
+
+    private static String getOpLevel(Operation op, String fallback) {
+        if (op != null && op.getExtensions() != null) {
+            Object v = op.getExtensions().get("x-user-level");
+            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
+        }
+        return fallback;
+    }
+
+    /**
+     * Nazwa projektu:
+     * - info.extensions["x-project-name"] (pierwotna nazwa zipa),
+     * - potem info.title bez sufiksu "-API",
+     * - inaczej "API".
+     */
+    private static String getProjectName(OpenAPI api) {
+        if (api != null && api.getInfo() != null) {
+            Map<String, Object> ext = api.getInfo().getExtensions();
+            if (ext != null && ext.get("x-project-name") != null) {
+                String n = String.valueOf(ext.get("x-project-name")).trim();
+                if (!n.isBlank()) return n;
+            }
+            String t = nz(api.getInfo().getTitle()).trim();
+            if (!t.isBlank()) {
+                if (t.endsWith("-API") && t.length() > 4) {
+                    return t.substring(0, t.length() - 4);
+                }
+                return t;
+            }
+        }
+        return "API";
+    }
+
+    /** Opcjonalny pakiet nagłówka (subtitle, generatedAt) z info.extensions["x-doc-header"]. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> getDocHeader(OpenAPI api) {
+        if (api != null && api.getInfo() != null && api.getInfo().getExtensions() != null) {
+            Object v = api.getInfo().getExtensions().get("x-doc-header");
+            if (v instanceof Map) return (Map<String, Object>) v;
+        }
+        return Collections.emptyMap();
+    }
+
+    /** Tekstowe podsumowanie projektu z info.extensions["x-project-summary"] (genera NLP). */
+    private static String getProjectSummary(OpenAPI api) {
+        if (api != null && api.getInfo() != null && api.getInfo().getExtensions() != null) {
+            Object v = api.getInfo().getExtensions().get("x-project-summary");
+            if (v != null) {
+                String s = String.valueOf(v).trim();
+                if (!s.isBlank()) {
+                    return s;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String levelLabelPl(String lvl) {
+        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
+            case "beginner":    return "Poziom: początkujący";
+            case "advanced":    return "Poziom: zaawansowany";
+            case "intermediate":
+            default:            return "Poziom: średniozaawansowany";
+        }
+    }
+
+    private static String levelClass(String lvl) {
+        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
+            case "beginner":    return "lvl-beginner";
+            case "advanced":    return "lvl-advanced";
+            case "intermediate":
+            default:            return "lvl-intermediate";
+        }
+    }
+
     private String buildHtml(OpenAPI api) {
         StringBuilder sb = new StringBuilder(48_000);
         sb.append("<html xmlns=\"http://www.w3.org/1999/xhtml\"><head>")
@@ -153,7 +190,6 @@ public class PdfDocService {
           .append("<style>").append(CSS).append("</style>")
           .append("</head><body>");
 
-        // === Nagłówek z nazwą projektu ===
         String projectName = getProjectName(api);
         String spec  = api.getOpenapi() != null ? api.getOpenapi() : "3.x";
         String ver   = (api.getInfo() != null ? nz(api.getInfo().getVersion()) : "");
@@ -162,6 +198,7 @@ public class PdfDocService {
         String subtitle   = Objects.toString(hdr.getOrDefault("subtitle", ""), "");
         String generated  = Objects.toString(hdr.getOrDefault("generatedAt", ""), "");
 
+        // Nagłówek
         sb.append("<header>");
         sb.append("<h1>").append(esc(projectName)).append("</h1>");
         if (!subtitle.isBlank()) {
@@ -174,54 +211,70 @@ public class PdfDocService {
         if (!generated.isBlank()) {
             sb.append("<div class='muted'>Wygenerowano: ").append(esc(generated)).append("</div>");
         }
-        sb.append("<div class='lvl-badge ").append(levelClass(infoLevel)).append("'>")
+        sb.append("<div class='lvl-badge ")
+          .append(levelClass(infoLevel))
+          .append("'>")
           .append(esc(levelLabelPl(infoLevel)))
           .append("</div>");
         sb.append("</header>");
 
-        // === Sekcja SECURITY (global + schemes) tuż po nagłówku ===
+        // Security global + schemes
         renderSecuritySummary(sb, api);
         renderSecuritySchemes(sb, api.getComponents());
 
+        // Globalna macierz błędów
+        renderGlobalErrorsSection(sb);
+
+        // Słowniczek dla początkujących
+        sb.append(renderBeginnerGlossaryIfNeeded(api));
+
+        // Ścieżki + operacje
         if (api.getPaths() != null) {
             api.getPaths().forEach((path, pathItem) -> {
-                sb.append("<h2><span class='path'>").append(esc(path)).append("</span></h2>");
-                renderOp(sb, api, "GET",   pathItem.getGet(),    path, infoLevel);
-                renderOp(sb, api, "POST",  pathItem.getPost(),   path, infoLevel);
-                renderOp(sb, api, "PUT",   pathItem.getPut(),    path, infoLevel);
-                renderOp(sb, api, "PATCH", pathItem.getPatch(),  path, infoLevel);
-                renderOp(sb, api, "DELETE",pathItem.getDelete(), path, infoLevel);
+                sb.append("<h2><span class='path'>")
+                  .append(esc(path))
+                  .append("</span></h2>");
+                renderOp(sb, api, "GET",    pathItem.getGet(),    path, infoLevel);
+                renderOp(sb, api, "POST",   pathItem.getPost(),   path, infoLevel);
+                renderOp(sb, api, "PUT",    pathItem.getPut(),    path, infoLevel);
+                renderOp(sb, api, "PATCH",  pathItem.getPatch(),  path, infoLevel);
+                renderOp(sb, api, "DELETE", pathItem.getDelete(), path, infoLevel);
             });
         }
 
-        // —— sekcja components/schemas na końcu dokumentu ——
+        // Schematy
         renderComponents(sb, api.getComponents());
+
+        // Podsumowanie aplikacji na końcu (szczególnie dla beginner)
+        sb.append(renderAppSummaryIfNeeded(api));
 
         sb.append("</body></html>");
         return sb.toString();
     }
 
-    /** Render: zwięzłe podsumowanie globalnego security (dziedziczenie). */
+    // ========================================================================
+    //  SECURITY
+    // ========================================================================
+
     private void renderSecuritySummary(StringBuilder sb, OpenAPI api) {
         List<SecurityRequirement> sec = api.getSecurity();
         if (sec == null || sec.isEmpty()) return;
 
-        // Zbierz nazwy schematów z wszystkich wymagań
         Set<String> names = new LinkedHashSet<>();
         for (SecurityRequirement r : sec) {
             if (r != null) names.addAll(r.keySet());
         }
         if (names.isEmpty()) return;
 
-        sb.append("<div class='security'><strong>Security (global):</strong> ");
-        sb.append(esc(String.join(", ", names)));
-        sb.append("<div class='muted'>Ścieżki dziedziczą te wymagania, chyba że operacja jawnie ustawi własne security lub „public”.</div>");
-        sb.append("</div>");
+        sb.append("<div class='security'><strong>Security (global):</strong> ")
+          .append(esc(String.join(", ", names)))
+          .append("<div class='muted'>Ścieżki dziedziczą te wymagania, chyba że operacja jawnie ustawi własne security lub „public”.</div>")
+          .append("</div>");
     }
 
-    /** Render: lista components.securitySchemes (np. bearerAuth). */
     private void renderSecuritySchemes(StringBuilder sb, Components components) {
-        if (components == null || components.getSecuritySchemes() == null || components.getSecuritySchemes().isEmpty()) return;
+        if (components == null || components.getSecuritySchemes() == null || components.getSecuritySchemes().isEmpty())
+            return;
 
         sb.append("<div class='security'><strong>Security Schemes</strong>");
         sb.append("<table><thead><tr><th>Nazwa</th><th>Typ</th><th>Schemat</th><th>Format</th><th>Opis</th></tr></thead><tbody>");
@@ -241,24 +294,87 @@ public class PdfDocService {
         sb.append("</tbody></table></div>");
     }
 
-    private void renderOp(StringBuilder sb, OpenAPI api, String method, Operation op, String path, String infoLevel) {
+    // ========================================================================
+    //  GLOBAL ERRORS
+    // ========================================================================
+
+    private void renderGlobalErrorsSection(StringBuilder sb) {
+        sb.append("<section class='security'>")
+          .append("<strong>Standardowe kody błędów</strong>")
+          .append("<table><thead><tr>")
+          .append("<th>Status</th><th>Znaczenie</th></tr></thead><tbody>")
+          .append("<tr><td>400</td><td>Nieprawidłowe lub niekompletne dane w żądaniu.</td></tr>")
+          .append("<tr><td>401</td><td>Brak poprawnego tokenu uwierzytelniającego (nagłówek Authorization: Bearer &lt;token&gt;).</td></tr>")
+          .append("<tr><td>403</td><td>Token jest poprawny, ale użytkownik nie ma wymaganych uprawnień.</td></tr>")
+          .append("<tr><td>404</td><td>Żądany zasób nie istnieje lub nie jest dostępny.</td></tr>")
+          .append("<tr><td>409</td><td>Konflikt danych, np. duplikat lub niezgodny stan.</td></tr>")
+          .append("<tr><td>422</td><td>Dane są poprawne technicznie, ale nie spełniają reguł biznesowych.</td></tr>")
+          .append("<tr><td>429</td><td>Przekroczono limit zapytań – spróbuj ponownie później.</td></tr>")
+          .append("<tr><td>500</td><td>Nieoczekiwany błąd po stronie serwera.</td></tr>")
+          .append("</tbody></table>")
+          .append("<div class='muted'>Struktura błędu jest opisana w schemacie <code>ApiError</code> w sekcji Components.</div>")
+          .append("</section>");
+    }
+
+    // ========================================================================
+    //  BEGINNER GLOSSARY
+    // ========================================================================
+
+    private String renderBeginnerGlossaryIfNeeded(OpenAPI api) {
+        String level = getInfoLevel(api);
+        if (!isBeginnerLevel(level)) {
+            return "";
+        }
+
+        return """
+        <section>
+        <h2>Podstawowe pojęcia</h2>
+        <ul>
+            <li><b>Endpoint</b> – konkretny adres URL, pod który wysyłasz żądanie HTTP.</li>
+            <li><b>Metoda HTTP</b> (GET, POST, PUT, DELETE) – określa, czy pobierasz, tworzysz, zmieniasz lub usuwasz dane.</li>
+            <li><b>Token JWT</b> – „bilet” potwierdzający zalogowanie użytkownika.</li>
+            <li><b>Authorization: Bearer &lt;token&gt;</b> – nagłówek z tokenem wymagany przez większość chronionych endpointów.</li>
+            <li><b>Paginacja</b> – podział wyników na strony (page/size/sort), aby nie pobierać wszystkich danych naraz.</li>
+        </ul>
+        </section>
+        """;
+    }
+
+    // ========================================================================
+    //  RENDER ENDPOINT / OPERATION
+    // ========================================================================
+
+    private void renderOp(StringBuilder sb,
+                          OpenAPI api,
+                          String method,
+                          Operation op,
+                          String path,
+                          String infoLevel) {
         if (op == null) return;
 
         String opLevel = getOpLevel(op, infoLevel);
+        boolean isBeginnerDoc = isBeginnerLevel(infoLevel);
+        boolean isBeginnerOp  = isBeginnerLevel(opLevel);
+        boolean isBeginner    = isBeginnerDoc || isBeginnerOp;
+        String levelForResponses = isBeginner ? "beginner" : opLevel;
 
         sb.append("<div class='op'>");
+
+        // Pasek z metodą i ścieżką
         sb.append("<div class='badge'><span class='method'>")
           .append(esc(method))
           .append("</span> <span class='path'>")
           .append(esc(path))
           .append("</span></div>");
 
-        // badge poziomu per operacja
-        sb.append("<span class='lvl-badge ").append(levelClass(opLevel)).append("'>")
+        // Badge poziomu operacji
+        sb.append("<span class='lvl-badge ")
+          .append(levelClass(opLevel))
+          .append("'>")
           .append(esc(levelLabelPl(opLevel)))
           .append("</span>");
 
-        // ——— SECURITY per operacja ———
+        // Security label
         String opSecurityLabel = computeOperationSecurityLabel(api, op);
         if (!opSecurityLabel.isBlank()) {
             sb.append("<div class='muted' style='margin-top:6px'><strong>Security:</strong> ")
@@ -266,29 +382,62 @@ public class PdfDocService {
               .append("</div>");
         }
 
-        // ——— PAGINATION badge/linia ———
+        // Paginacja
         if (hasPaginationParams(op)) {
-            sb.append("<div class='muted' style='margin-top:4px'><strong>Pagination:</strong> page, size, sort</div>");
+            if (isBeginner) {
+                sb.append("<div class='muted' style='margin-top:4px'>")
+                  .append("Ten endpoint może zwracać dane podzielone na strony (paginacja).")
+                  .append("</div>");
+            } else {
+                sb.append("<div class='muted' style='margin-top:4px'><strong>Pagination:</strong> page, size, sort</div>");
+            }
         }
 
-        if (op.getSummary() != null && !op.getSummary().isBlank()) {
-            sb.append("<div style='margin-top:6px'><strong>")
-              .append(esc(op.getSummary()))
-              .append("</strong></div>");
+        // Opis (summary / description) + fallback dla beginner
+        String summary = nz(op.getSummary());
+        String description = nz(op.getDescription());
+
+        if (isBeginner && isGenericBeginnerSummary(summary)) {
+            summary = "";
         }
-        if (op.getDescription() != null && !op.getDescription().isBlank()) {
+
+        boolean printedSummaryOrDescription = false;
+
+        if (!summary.isBlank()) {
+            sb.append("<div style='margin-top:6px'><strong>")
+              .append(esc(summary))
+              .append("</strong></div>");
+            printedSummaryOrDescription = true;
+        }
+
+        if (!description.isBlank()) {
             sb.append("<div class='muted'>")
-              .append(esc(op.getDescription()).replace("\n", "<br />"))
+              .append(esc(description).replace("\n", "<br />"))
               .append("</div>");
+            printedSummaryOrDescription = true;
+        }
+
+        if (isBeginner && !printedSummaryOrDescription) {
+            String fb = buildBeginnerFallbackDescription(method, path);
+            if (!fb.isBlank()) {
+                sb.append("<div class='muted'>").append(esc(fb)).append("</div>");
+            }
         }
 
         // Parametry
         if (op.getParameters() != null && !op.getParameters().isEmpty()) {
             sb.append("<div style='margin-top:8px'><strong>Parametry</strong>");
-            sb.append("<table><thead><tr><th>Nazwa</th><th>W</th><th>Typ</th><th>Wymagany</th><th>Ograniczenia</th><th>Opis</th></tr></thead><tbody>");
+            sb.append("<table><thead><tr>")
+              .append("<th>Nazwa</th>")
+              .append("<th>W</th>")
+              .append("<th>Typ</th>")
+              .append("<th>Wymagany</th>")
+              .append("<th>Ograniczenia</th>")
+              .append("<th>Opis</th>")
+              .append("</tr></thead><tbody>");
             for (Parameter p : op.getParameters()) {
-                String typ = (p.getSchema() != null)
-                        ? (p.getSchema().getType() == null ? "" : p.getSchema().getType())
+                String typ = (p.getSchema() != null && p.getSchema().getType() != null)
+                        ? p.getSchema().getType()
                         : "";
                 String constraints = paramConstraints(p);
                 sb.append("<tr>")
@@ -303,10 +452,10 @@ public class PdfDocService {
             sb.append("</tbody></table></div>");
         }
 
-        // RequestBody (application/json)
+        // Request body (application/json)
         if (op.getRequestBody() != null && op.getRequestBody().getContent() != null) {
             Content c = op.getRequestBody().getContent();
-            var mt = c.get("application/json");
+            MediaType mt = c.get("application/json");
             if (mt != null) {
                 sb.append("<div style='margin-top:8px'><strong>Body (application/json)</strong>");
                 if (mt.getSchema() != null) {
@@ -323,7 +472,8 @@ public class PdfDocService {
                 }
                 if (mt.getExample() != null) {
                     String ex = toPrettyJson(mt.getExample());
-                    sb.append("<div class='examples'><div><strong>Przykład żądania</strong></div><pre><code>")
+                    sb.append("<div class='examples'><div><strong>Przykład żądania</strong></div>")
+                      .append("<pre><code>")
                       .append(esc(ex))
                       .append("</code></pre></div>");
                 }
@@ -331,13 +481,23 @@ public class PdfDocService {
             }
         }
 
-        // Responses (schema + przykłady)
+        // Odpowiedzi – filtr dla beginner
         if (op.getResponses() != null && !op.getResponses().isEmpty()) {
             sb.append("<div style='margin-top:8px'><strong>Odpowiedzi</strong>");
-            sb.append("<table><thead><tr><th>Status</th><th>Opis</th><th>Schema</th><th>Przykład</th></tr></thead><tbody>");
+            sb.append("<table><thead><tr>")
+              .append("<th>Status</th>")
+              .append("<th>Opis</th>")
+              .append("<th>Schema</th>")
+              .append("<th>Przykład</th>")
+              .append("</tr></thead><tbody>");
+
             for (Map.Entry<String, ApiResponse> e : op.getResponses().entrySet()) {
                 String code = e.getKey();
                 ApiResponse resp = e.getValue();
+
+                if (isBeginner && !shouldShowResponseForBeginner(code, levelForResponses)) {
+                    continue;
+                }
 
                 String schemaTxt = "";
                 String exTxt = "";
@@ -356,38 +516,51 @@ public class PdfDocService {
 
                 sb.append("<tr>")
                   .append("<td>").append(esc(code)).append("</td>")
-                  .append("<td>").append(esc(resp.getDescription())).append("</td>")
-                  .append("<td>").append(schemaTxt.isEmpty() ? "" : "<code>"+esc(schemaTxt)+"</code>").append("</td>")
-                  .append("<td>").append(exTxt.isEmpty() ? "" : "<pre><code>"+esc(exTxt)+"</code></pre>").append("</td>")
+                  .append("<td>").append(esc(nz(resp.getDescription()))).append("</td>")
+                  .append("<td>")
+                  .append(schemaTxt.isEmpty() ? "" : "<code>" + esc(schemaTxt) + "</code>")
+                  .append("</td>")
+                  .append("<td>")
+                  .append(exTxt.isEmpty() ? "" : "<pre><code>" + esc(exTxt) + "</code></pre>")
+                  .append("</td>")
                   .append("</tr>");
             }
+
             sb.append("</tbody></table></div>");
         }
 
-        // x-impl-notes
-        if (op.getExtensions() != null && op.getExtensions().get("x-impl-notes") instanceof List) {
+        // Notatki implementacyjne tylko dla nie-beginner
+        if (!isBeginner
+                && op.getExtensions() != null
+                && op.getExtensions().get("x-impl-notes") instanceof List) {
             @SuppressWarnings("unchecked")
             List<Object> notes = (List<Object>) op.getExtensions().get("x-impl-notes");
             if (!notes.isEmpty()) {
                 sb.append("<div class='notes'><strong>Notatki implementacyjne</strong><ul>");
                 notes.stream()
-                        .map(Objects::toString)
-                        .map(PdfDocService::esc)
-                        .forEach(n -> sb.append("<li>").append(n).append("</li>"));
+                     .map(Objects::toString)
+                     .map(PdfDocService::esc)
+                     .forEach(n -> sb.append("<li>").append(n).append("</li>"));
                 sb.append("</ul></div>");
             }
         }
 
-        // x-request-examples (lista cURL)
-        if (op.getExtensions() != null && op.getExtensions().get("x-request-examples") instanceof List) {
+        // Przykłady curl:
+        if (op.getExtensions() != null
+                && op.getExtensions().get("x-request-examples") instanceof List) {
             @SuppressWarnings("unchecked")
             List<Object> reqs = (List<Object>) op.getExtensions().get("x-request-examples");
             if (!reqs.isEmpty()) {
                 sb.append("<div class='examples'><strong>Przykłady wywołań</strong>");
-                reqs.stream()
-                        .map(Objects::toString)
-                        .map(PdfDocService::esc)
-                        .forEach(curl -> sb.append("<pre><code>").append(curl).append("</code></pre>"));
+                int limit = isBeginner ? 1 : reqs.size();
+                for (int i = 0; i < limit; i++) {
+                    String curl = Objects.toString(reqs.get(i), "");
+                    if (!curl.isBlank()) {
+                        sb.append("<pre><code>")
+                          .append(esc(curl))
+                          .append("</code></pre>");
+                    }
+                }
                 sb.append("</div>");
             }
         }
@@ -397,7 +570,6 @@ public class PdfDocService {
 
     /** Wylicza etykietę security dla operacji: lokalne -> globalne -> public. */
     private String computeOperationSecurityLabel(OpenAPI api, Operation op) {
-        // 1) Jeśli operacja jawnie ustawiła pustą listę: public
         if (op.getSecurity() != null) {
             if (op.getSecurity().isEmpty()) return "Public (no auth)";
             Set<String> names = new LinkedHashSet<>();
@@ -408,7 +580,6 @@ public class PdfDocService {
             return "Custom";
         }
 
-        // 2) Dziedziczenie z globalnego (api.security)
         List<SecurityRequirement> global = api.getSecurity();
         if (global != null && !global.isEmpty()) {
             Set<String> names = new LinkedHashSet<>();
@@ -419,14 +590,15 @@ public class PdfDocService {
             return "Custom";
         }
 
-        // 3) Brak local i global → traktuj jako public
         return "Public (no auth)";
     }
 
+    // ========================================================================
+    //  COMPONENTS / SCHEMAS
+    // ========================================================================
+
     private void renderComponents(StringBuilder sb, Components components) {
         if (components == null) return;
-
-        // Schematy (DTO, ApiError, itp.)
         if (components.getSchemas() == null || components.getSchemas().isEmpty()) return;
 
         sb.append("<h2>Components / Schemas</h2>");
@@ -472,16 +644,71 @@ public class PdfDocService {
         sb.append("</div>");
     }
 
+    // ========================================================================
+    //  APP SUMMARY
+    // ========================================================================
+
+    private String renderAppSummaryIfNeeded(OpenAPI api) {
+        String level = getInfoLevel(api);
+        if (!isBeginnerLevel(level)) {
+            return "";
+        }
+
+        String summaryFromExt = getProjectSummary(api);
+
+        // Jeśli model coś zwrócił → wstawiamy 1:1 (tylko escapowanie HTML + nowe linie)
+        if (summaryFromExt != null && !summaryFromExt.isBlank()) {
+            return "<section><h2>Podsumowanie aplikacji</h2><p>"
+                    + esc(summaryFromExt).replace("\n", "<br />")
+                    + "</p></section>";
+        }
+
+        // Jeśli nie chcesz żadnego fallbacku – po prostu:
+        return "";
+    }
+
+
+    private static List<String> splitIntoSentences(String text) {
+        String t = text.trim();
+        if (t.isEmpty()) return List.of();
+        String[] raw = t.split("(?<=[.!?])\\s+");
+        List<String> out = new ArrayList<>();
+        for (String s : raw) {
+            String ss = s.trim();
+            if (!ss.isEmpty()) out.add(ss);
+        }
+        return out;
+    }
+
+    private static String joinWithCommaAndAnd(List<String> items) {
+        if (items.isEmpty()) return "";
+        if (items.size() == 1) return items.get(0);
+        if (items.size() == 2) return items.get(0) + " oraz " + items.get(1);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) {
+                if (i == items.size() - 1) {
+                    sb.append(" oraz ");
+                } else {
+                    sb.append(", ");
+                }
+            }
+            sb.append(items.get(i));
+        }
+        return sb.toString();
+    }
+
     private String toPrettyJson(Object obj) {
         try {
-            var mapper = new com.fasterxml.jackson.databind.ObjectMapper().writerWithDefaultPrettyPrinter();
+            var mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .writerWithDefaultPrettyPrinter();
             return mapper.writeValueAsString(obj);
         } catch (Exception e) {
             return String.valueOf(obj);
         }
     }
 
-    /** Zwraca zwięzłą etykietę dla schema: wspiera $ref, typy proste, tablice i allOf(PageResponse<T>). */
+    /** Zwięzła etykieta schema. */
     private static String schemaToLabel(Schema<?> s) {
         if (s == null) return "";
         if (s.get$ref() != null && !s.get$ref().isBlank()) {
@@ -494,7 +721,7 @@ public class PdfDocService {
         if (s instanceof ComposedSchema cs && cs.getAllOf() != null && !cs.getAllOf().isEmpty()) {
             boolean isPage = cs.getAllOf().stream().anyMatch(x ->
                     (x.get$ref() != null && x.get$ref().endsWith("/PageResponse")) ||
-                            "PageResponse".equalsIgnoreCase(Objects.toString(x.getName(), ""))
+                    "PageResponse".equalsIgnoreCase(Objects.toString(x.getName(), ""))
             );
             if (isPage) {
                 Schema<?> t = extractPageItemSchema(cs);
@@ -502,9 +729,11 @@ public class PdfDocService {
                 if (tLabel.isBlank()) tLabel = "object";
                 return "PageResponse<" + tLabel + ">";
             }
-            return cs.getAllOf().stream().map(PdfDocService::schemaToLabel)
+            return cs.getAllOf().stream()
+                    .map(PdfDocService::schemaToLabel)
                     .filter(x -> x != null && !x.isBlank())
-                    .reduce((a, b) -> a + " + " + b).orElse("composed");
+                    .reduce((a, b) -> a + " + " + b)
+                    .orElse("composed");
         }
         if (s.getType() != null && !s.getType().isBlank()) {
             return s.getType();
@@ -512,8 +741,6 @@ public class PdfDocService {
         return "";
     }
 
-    /** Dla allOf(PageResponse, {...}) wyciąga schema elementu T z content.items. */
-    @SuppressWarnings("unchecked")
     private static Schema<?> extractPageItemSchema(ComposedSchema cs) {
         for (Schema<?> part : cs.getAllOf()) {
             if (part instanceof ObjectSchema obj && obj.getProperties() != null) {
@@ -529,7 +756,10 @@ public class PdfDocService {
         return null;
     }
 
-    /** Czy operacja ma standardowe parametry paginacji (page/size/sort)? */
+    // ========================================================================
+    //  UTILS
+    // ========================================================================
+
     private static boolean hasPaginationParams(Operation op) {
         if (op == null || op.getParameters() == null) return false;
         boolean page = false, size = false, sort = false;
@@ -544,20 +774,16 @@ public class PdfDocService {
         return page || size || sort;
     }
 
-    /** Buduje zwięzły opis ograniczeń parametru (min/max, długości, pattern, enum, default/example, itp.). */
     private static String paramConstraints(Parameter p) {
         if (p == null) return "";
         Schema<?> s = p.getSchema();
         String name = nz(p.getName()).toLowerCase(Locale.ROOT);
         StringJoiner j = new StringJoiner(", ");
 
-        // Heurystyki dla standardowych pageable:
         if ("page".equals(name)) j.add("≥ 0");
         if ("size".equals(name)) j.add("1..100");
-        // (sort zwykle bez sztywnych limitów – zostawiamy puste)
 
         if (s != null) {
-            // liczby
             if (s.getMinimum() != null) {
                 String op = Boolean.TRUE.equals(s.getExclusiveMinimum()) ? ">" : "≥";
                 j.add(op + " " + s.getMinimum());
@@ -566,34 +792,136 @@ public class PdfDocService {
                 String op = Boolean.TRUE.equals(s.getExclusiveMaximum()) ? "<" : "≤";
                 j.add(op + " " + s.getMaximum());
             }
-            // długości (string)
             if (s.getMinLength() != null) j.add("minLen " + s.getMinLength());
             if (s.getMaxLength() != null) j.add("maxLen " + s.getMaxLength());
             if (s.getPattern() != null && !s.getPattern().isBlank()) j.add("pattern /" + s.getPattern() + "/");
 
-            // tablice
             if (s instanceof ArraySchema arr) {
                 if (arr.getMinItems() != null) j.add("minItems " + arr.getMinItems());
                 if (arr.getMaxItems() != null) j.add("maxItems " + arr.getMaxItems());
             }
 
-            // enum
             if (s.getEnum() != null && !s.getEnum().isEmpty()) {
-                String values = s.getEnum().stream().limit(6).map(String::valueOf).reduce((a,b)->a+", "+b).orElse("");
+                String values = s.getEnum().stream()
+                        .limit(6)
+                        .map(String::valueOf)
+                        .reduce((a,b)->a+", "+b).orElse("");
                 j.add("enum {" + values + (s.getEnum().size() > 6 ? ", …" : "") + "}");
             }
 
-            // format (np. uuid, date-time)
             if (s.getFormat() != null && !s.getFormat().isBlank()) j.add("format " + s.getFormat());
-
-            // default / example
             if (s.getDefault() != null) j.add("default " + s.getDefault());
             if (s.getExample() != null) j.add("example " + s.getExample());
         }
 
-        // przykład ustawiony na parametrze (jeśli brak w schemacie)
         if (p.getExample() != null) j.add("example " + p.getExample());
 
         return j.toString();
+    }
+
+    private boolean isBeginnerLevel(String level) {
+        if (level == null) return false;
+        return level.equalsIgnoreCase("beginner")
+            || level.equalsIgnoreCase("początkujący");
+    }
+
+    private boolean shouldShowResponseForBeginner(String code, String level) {
+        if (!isBeginnerLevel(level)) {
+            return true;
+        }
+        return switch (code) {
+            case "200", "201", "204",
+                 "400", "401", "403", "404" -> true;
+            default -> false;
+        };
+    }
+
+    private static boolean isGenericBeginnerSummary(String s) {
+        if (s == null) return false;
+        String txt = s.trim().toLowerCase(Locale.ROOT);
+
+        while (!txt.isEmpty() && (txt.endsWith(".") || txt.endsWith(":"))) {
+            txt = txt.substring(0, txt.length() - 1).trim();
+        }
+        if (txt.isEmpty()) return false;
+
+        return txt.equals("utwórz nowy zasób")
+            || txt.equals("pobierz zasób")
+            || txt.equals("pobierz listę zasobów")
+            || txt.equals("pobierz zasób po identyfikatorze")
+            || txt.equals("usuń zasób");
+    }
+
+    private static String buildBeginnerFallbackDescription(String method, String path) {
+        if (path == null) return "";
+
+        String m = (method == null ? "" : method.trim().toUpperCase(Locale.ROOT));
+        String p = path.trim();
+
+        String[] parts = p.split("/");
+        String last = "";
+        boolean hasPathId = false;
+        for (int i = parts.length - 1; i >= 0; i--) {
+            String seg = parts[i].trim();
+            if (seg.isEmpty()) continue;
+            if (seg.startsWith("{") && seg.endsWith("}")) {
+                hasPathId = true;
+                continue;
+            }
+            last = seg;
+            break;
+        }
+
+        String domena;
+        switch (last) {
+            case "users":
+                domena = hasPathId ? "użytkownika" : "użytkowników";
+                break;
+            case "orders":
+                domena = hasPathId ? "zamówienia" : "zamówień";
+                break;
+            case "items":
+                domena = "pozycji w zamówieniu";
+                break;
+            case "hello":
+                domena = "wiadomości powitalnej";
+                break;
+            default:
+                domena = last.isEmpty() ? "danych" : last.replace('-', ' ');
+                break;
+        }
+
+        if (p.contains("/orders/") && p.contains("{orderId}") && p.endsWith("/items")) {
+            if ("POST".equals(m)) {
+                return "Dodaje nową pozycję do zamówienia o podanym identyfikatorze.";
+            }
+            if ("GET".equals(m)) {
+                return "Pobiera listę pozycji dla zamówienia o podanym identyfikatorze.";
+            }
+        }
+
+        if ("GET".equals(m) && hasPathId) {
+            return "Pobiera szczegóły " + domena + " na podstawie podanego identyfikatora.";
+        }
+        if ("GET".equals(m)) {
+            return "Pobiera listę " + domena + " z systemu.";
+        }
+        if ("POST".equals(m)) {
+            return "Tworzy nowy element w obszarze " + domena + " na podstawie danych z JSON.";
+        }
+        if ("PUT".equals(m) || "PATCH".equals(m)) {
+            if (hasPathId) {
+                return "Aktualizuje istniejący element w obszarze " + domena + " na podstawie podanego identyfikatora.";
+            }
+            return "Aktualizuje dane w obszarze " + domena + ".";
+        }
+        if ("DELETE".equals(m)) {
+            if (hasPathId) {
+                return "Usuwa element w obszarze " + domena + " na podstawie podanego identyfikatora.";
+            }
+            return "Usuwa element w obszarze " + domena + ".";
+        }
+
+        return "";
     }
 }

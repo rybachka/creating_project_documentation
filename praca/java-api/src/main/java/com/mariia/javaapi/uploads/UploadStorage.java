@@ -1,4 +1,3 @@
-// java-api/src/main/java/com/mariia/javaapi/uploads/UploadStorage.java
 package com.mariia.javaapi.uploads;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -11,10 +10,11 @@ import java.nio.file.Path;
 
 /**
  * Trzyma i rozwiązuje ścieżki do plików przesłanych projektów:
- *  - katalog projektu: /uploads/{id}
- *  - ZIP projektu:     /uploads/{id}.zip
- *  - oryginalna spec:  openapi.yaml / openapi.yml (jeśli istnieje)
- *  - wygenerowana spec: openapi.generated.yaml (gdy tworzymy ją z kodu)
+ *  - katalog projektu:   /uploads/{id}
+ *  - ZIP projektu:       /uploads/{id}.zip
+ *  - metadata nazwy:     /uploads/{id}.name  (oryginalna nazwa zipa, bez ścieżki)
+ *  - oryginalna spec:    openapi.yaml / openapi.yml (jeśli istnieje)
+ *  - wygenerowana spec:  openapi.generated.yaml (gdy tworzymy ją z kodu)
  */
 @Component
 public class UploadStorage {
@@ -41,6 +41,45 @@ public class UploadStorage {
     }
 
     /**
+     * Zwraca nazwę projektu do użycia w dokumentacji.
+     *
+     * Priorytet:
+     *  1) plik /uploads/{id}.name (pierwotna nazwa zipa zapisana przy uploadzie),
+     *  2) nazwa pliku ZIP (bez .zip), jeśli istnieje,
+     *  3) samo id (fallback awaryjny).
+     */
+    public String getProjectName(String id) {
+        // 1) metadata z uploadu
+        Path nameMeta = base.resolve(id + ".name");
+        if (Files.exists(nameMeta)) {
+            try {
+                String raw = Files.readString(nameMeta, StandardCharsets.UTF_8).trim();
+                if (!raw.isBlank()) {
+                    // jeśli ktoś zapisał pełną nazwę z .zip, utnij rozszerzenie
+                    if (raw.toLowerCase().endsWith(".zip") && raw.length() > 4) {
+                        raw = raw.substring(0, raw.length() - 4);
+                    }
+                    return raw;
+                }
+            } catch (IOException ignored) {
+                // w razie problemu lecimy dalej do fallbacków
+            }
+        }
+
+        // 2) z nazwy pliku ZIP (jeśli nie jest zrandomizowane)
+        Path zip = resolveZipPath(id);
+        if (Files.exists(zip)) {
+            String fileName = zip.getFileName().toString();
+            if (fileName.toLowerCase().endsWith(".zip") && fileName.length() > 4) {
+                return fileName.substring(0, fileName.length() - 4);
+            }
+        }
+
+        // 3) fallback
+        return id;
+    }
+
+    /**
      * Zwraca pełną ścieżkę do openapi.{yaml|yml} w projekcie.
      * Jeśli nie znajdzie pliku – rzuca IllegalStateException z czytelnym komunikatem.
      */
@@ -52,7 +91,7 @@ public class UploadStorage {
 
         // 1) spróbuj wykryć względną ścieżkę (np. sample-project/openapi.yaml)
         try {
-            String rel = SpecDetector.findOpenApiRelative(dir); // może rzucić IOException
+            String rel = SpecDetector.findOpenApiRelative(dir);
             if (rel != null && !rel.isBlank()) {
                 Path candidate = dir.resolve(rel).normalize();
                 if (Files.exists(candidate)) {
@@ -86,4 +125,29 @@ public class UploadStorage {
         Files.createDirectories(file.getParent());
         Files.writeString(file, content, StandardCharsets.UTF_8);
     }
+
+    public void saveOriginalProjectName(String id, String originalFilename) throws IOException {
+        if (originalFilename == null || originalFilename.isBlank()) {
+            return;
+        }
+
+        // tylko nazwa pliku (bez ścieżek typu C:\...)
+        String baseName = Path.of(originalFilename).getFileName().toString();
+
+        // utnij .zip, jeśli jest
+        String lower = baseName.toLowerCase();
+        if (lower.endsWith(".zip") && baseName.length() > 4) {
+            baseName = baseName.substring(0, baseName.length() - 4);
+        }
+
+        // nic sensownego? odpuść
+        if (baseName.isBlank()) {
+            return;
+        }
+
+        Path nameMeta = base.resolve(id + ".name");
+        Files.createDirectories(nameMeta.getParent());
+        Files.writeString(nameMeta, baseName, StandardCharsets.UTF_8);
+    }
+
 }
