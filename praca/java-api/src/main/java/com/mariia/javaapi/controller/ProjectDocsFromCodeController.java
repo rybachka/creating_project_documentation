@@ -41,7 +41,7 @@ public class ProjectDocsFromCodeController {
     @PostMapping(value = "/{id}/docs/from-code")
     public ResponseEntity<byte[]> fromCode(
             @PathVariable String id,
-            @RequestParam(defaultValue = "intermediate") String level
+            @RequestParam(defaultValue = "advanced") String level
     ) throws Exception {
 
         Path projectDir = storage.resolveProjectDir(id);
@@ -56,7 +56,7 @@ public class ProjectDocsFromCodeController {
 
         Files.createDirectories(projectDir);
 
-        String audience = normalizeAudience(level);
+        String audience = level; // beginner / advanced
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
 
@@ -65,11 +65,10 @@ public class ProjectDocsFromCodeController {
                 projectName,
                 audience,
                 aiYaml,
-                projectDir,
-                CodeToDocsService.DescribeMode.AI
+                projectDir
         );
 
-        String fileName = "openapi_" + audience + ".yaml";
+        String fileName = buildFileName(projectName, audience, ".yaml");
         return asAttachment(aiYaml, fileName, "text/yaml");
     }
 
@@ -80,7 +79,7 @@ public class ProjectDocsFromCodeController {
     @PostMapping(value = "/{id}/docs/pdf")
     public ResponseEntity<byte[]> pdfFrom(
             @PathVariable String id,
-            @RequestParam(defaultValue = "intermediate") String level
+            @RequestParam(defaultValue = "advanced") String level
     ) throws Exception {
 
         Path projectDir = storage.resolveProjectDir(id);
@@ -95,7 +94,7 @@ public class ProjectDocsFromCodeController {
 
         Files.createDirectories(projectDir);
 
-        String audience = normalizeAudience(level);
+        String audience = level;
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
         Path aiPdf  = projectDir.resolve("openapi_" + audience + ".pdf");
@@ -105,13 +104,12 @@ public class ProjectDocsFromCodeController {
                 projectName,
                 audience,
                 aiYaml,
-                projectDir,
-                CodeToDocsService.DescribeMode.AI
+                projectDir
         );
 
         pdfDocService.renderPdfFromYaml(aiYaml, aiPdf);
 
-        String fileName = "openapi_" + audience + ".pdf";
+        String fileName = buildFileName(projectName, audience, ".pdf");
         return asAttachment(aiPdf, fileName, MediaType.APPLICATION_PDF_VALUE);
     }
 
@@ -122,7 +120,7 @@ public class ProjectDocsFromCodeController {
     @GetMapping(value = "/{id}/docs/pdf", produces = MediaType.APPLICATION_PDF_VALUE)
     public ResponseEntity<byte[]> viewPdfInline(
             @PathVariable String id,
-            @RequestParam(defaultValue = "intermediate") String level
+            @RequestParam(defaultValue = "advanced") String level
     ) throws Exception {
 
         Path projectDir = storage.resolveProjectDir(id);
@@ -137,7 +135,7 @@ public class ProjectDocsFromCodeController {
 
         Files.createDirectories(projectDir);
 
-        String audience = normalizeAudience(level);
+        String audience = level;
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
         Path aiPdf  = projectDir.resolve("openapi_" + audience + ".pdf");
@@ -147,13 +145,12 @@ public class ProjectDocsFromCodeController {
                 projectName,
                 audience,
                 aiYaml,
-                projectDir,
-                CodeToDocsService.DescribeMode.AI
+                projectDir
         );
 
         pdfDocService.renderPdfFromYaml(aiYaml, aiPdf);
 
-        String fileName = "openapi_" + audience + ".pdf";
+        String fileName = buildFileName(projectName, audience, ".pdf");
         return asInline(aiPdf, fileName, MediaType.APPLICATION_PDF_VALUE);
     }
 
@@ -164,7 +161,7 @@ public class ProjectDocsFromCodeController {
     @GetMapping(value = "/{id}/docs/yaml", produces = "text/yaml")
     public ResponseEntity<byte[]> viewYamlInline(
             @PathVariable String id,
-            @RequestParam(defaultValue = "intermediate") String level
+            @RequestParam(defaultValue = "advanced") String level
     ) throws Exception {
 
         Path projectDir = storage.resolveProjectDir(id);
@@ -179,7 +176,7 @@ public class ProjectDocsFromCodeController {
 
         Files.createDirectories(projectDir);
 
-        String audience = normalizeAudience(level);
+        String audience = level;
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
 
@@ -188,18 +185,17 @@ public class ProjectDocsFromCodeController {
                 projectName,
                 audience,
                 aiYaml,
-                projectDir,
-                CodeToDocsService.DescribeMode.AI
+                projectDir
         );
 
-        String fileName = "openapi_" + audience + ".yaml";
+        String fileName = buildFileName(projectName, audience, ".yaml");
         return asInline(aiYaml, fileName, "text/yaml");
     }
 
     @GetMapping(value = "/{id}/docs/yaml/download")
     public ResponseEntity<byte[]> downloadYaml(
             @PathVariable String id,
-            @RequestParam(defaultValue = "intermediate") String level
+            @RequestParam(defaultValue = "advanced") String level
     ) throws Exception {
 
         Path projectDir = storage.resolveProjectDir(id);
@@ -214,7 +210,7 @@ public class ProjectDocsFromCodeController {
 
         Files.createDirectories(projectDir);
 
-        String audience = normalizeAudience(level);
+        String audience = level;
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
 
@@ -223,12 +219,39 @@ public class ProjectDocsFromCodeController {
                 projectName,
                 audience,
                 aiYaml,
-                projectDir,
-                CodeToDocsService.DescribeMode.AI
+                projectDir
         );
 
-        String fileName = "openapi_" + audience + ".yaml";
+        String fileName = buildFileName(projectName, audience, ".yaml");
         return asAttachment(aiYaml, fileName, "text/yaml");
+    }
+
+    // =========================================================
+    //  NLP INPUT PREVIEW (zawsze AI / ollama)
+    // =========================================================
+
+    @GetMapping(
+            value = "/{id}/docs/nlp-input",
+            produces = MediaType.APPLICATION_JSON_VALUE
+    )
+    public ResponseEntity<?> getNlpInputs(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "advanced") String level,
+            @RequestParam(required = false) String mode // akceptujemy, ale ignorujemy; zawsze AI/ollama
+    ) throws Exception {
+
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            return notFound("Project not found: " + id);
+        }
+
+        List<EndpointIR> endpoints = parser.parseProject(projectDir);
+        if (endpoints.isEmpty()) {
+            return badRequest("No endpoints found in source code.");
+        }
+
+        var inputs = code2docs.buildNlpInputs(endpoints, level);
+        return ResponseEntity.ok(inputs);
     }
 
     // =========================================================
@@ -236,29 +259,28 @@ public class ProjectDocsFromCodeController {
     // =========================================================
 
     private String resolveProjectName(String id) {
-        // TODO: zaimplementuj w UploadStorage realne mapowanie id -> bazowa nazwa zipa.
-        // Tymczasowo: jeśli masz taką metodę, użyj jej tutaj.
-        String fromStorage = storage.getProjectName(id); // dodaj tę metodę w UploadStorage
+        String fromStorage = storage.getProjectName(id);
         if (fromStorage != null && !fromStorage.isBlank()) {
             return fromStorage;
         }
-        return id; // fallback awaryjny
+        return id;
     }
-
-    private static String normalizeAudience(String s) {
-        String v = (s == null) ? "intermediate" : s.trim().toLowerCase(Locale.ROOT);
-        switch (v) {
-            case "short":
-            case "junior":
-            case "beginner":
-                return "beginner";
-            case "long":
-            case "senior":
-            case "advanced":
-                return "advanced";
-            default:
-                return "intermediate";
-        }
+    /**
+     * Buduje bezpieczną nazwę pliku:
+     * <nazwa_projektu>_<poziom><ext>
+     */
+    private static String buildFileName(String projectName, String audience, String ext) {
+        String base = (projectName == null || projectName.isBlank())
+                ? "openapi"
+                : projectName.trim();
+        String safeBase = base.replaceAll("[^a-zA-Z0-9._-]+", "_");
+        String suffix = (audience == null || audience.isBlank())
+                ? ""
+                : "_" + audience;
+        String extension = (ext == null || ext.isBlank())
+                ? ""
+                : (ext.startsWith(".") ? ext : "." + ext);
+        return safeBase + suffix + extension;
     }
 
     private static ResponseEntity<byte[]> notFound(String msg) {

@@ -18,15 +18,17 @@ import java.nio.file.Path;
 import java.util.*;
 
 /**
- * Generuje PDF z OpenAPI YAML, z różnicowaniem poziomów (beginner/intermediate/advanced).
- * - Beginner:
- *   - 1–2 zdania co robi endpoint, prosty scenariusz.
- *   - 1 prosty curl.
- *   - Tylko kluczowe statusy w tabelce odpowiedzi:
- *     200/201/204 oraz 400, 401, 403, 404.
- *   - Globalna sekcja z pełną macierzą błędów i słowniczkiem.
- *   - Podsumowanie aplikacji na końcu, oparte o realne endpointy i nazwę projektu (nazwa zipa).
- * - Wyższe poziomy widzą pełniejsze dane.
+ * Generuje PDF z OpenAPI YAML, z różnicowaniem poziomów (beginner / advanced).
+ *
+ * Poziom beginner:
+ * - 1–2 zdania co robi endpoint, prosty scenariusz.
+ * - 1 prosty curl.
+ * - Tylko kluczowe statusy w tabelce odpowiedzi: 200/201/204 + 400/401/403/404.
+ * - Globalna sekcja z pełną macierzą błędów i słowniczkiem.
+ * - Opcjonalne podsumowanie aplikacji (x-project-summary).
+ *
+ * Poziom advanced:
+ * - pełniejsze dane: opisy, wszystkie odpowiedzi, notatki implementacyjne, wiele przykładów.
  */
 @Service
 public class PdfDocService {
@@ -38,7 +40,7 @@ public class PdfDocService {
         }
 
         String html = buildHtml(api);
-        if (!html.isEmpty() && html.charAt(0) == '\uFEFF') {
+        if (!html.isEmpty() && html.charAt(0) == '\uFEFF') { // usuń BOM jeśli występuje
             html = html.substring(1);
         }
 
@@ -77,7 +79,6 @@ public class PdfDocService {
       .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10pt;background:#eef}
       .lvl-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10pt;margin-left:8px;border:1px solid #ddd}
       .lvl-beginner{background:#e9f8ec}
-      .lvl-intermediate{background:#eef4ff}
       .lvl-advanced{background:#fff2e6}
       .method{font-weight:700}
       .path{font-family: monospace}
@@ -101,18 +102,36 @@ public class PdfDocService {
         return (s == null) ? "" : s;
     }
 
+    /**
+     * Odczyt poziomu dokumentu:
+     * - info.extensions["x-user-level"] = "beginner" -> beginner
+     * - cokolwiek innego -> advanced (domyślnie).
+     */
     private static String getInfoLevel(OpenAPI api) {
         if (api.getInfo() != null && api.getInfo().getExtensions() != null) {
             Object v = api.getInfo().getExtensions().get("x-user-level");
-            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
+            if (v != null) {
+                String lvl = v.toString().trim().toLowerCase(Locale.ROOT);
+                if ("beginner".equals(lvl)) {
+                    return "beginner";
+                }
+            }
         }
-        return "intermediate";
+        return "advanced";
     }
 
+    /**
+     * Poziom operacji – z x-user-level, w przeciwnym wypadku fallback do poziomu dokumentu.
+     */
     private static String getOpLevel(Operation op, String fallback) {
         if (op != null && op.getExtensions() != null) {
             Object v = op.getExtensions().get("x-user-level");
-            if (v != null) return v.toString().trim().toLowerCase(Locale.ROOT);
+            if (v != null) {
+                String lvl = v.toString().trim().toLowerCase(Locale.ROOT);
+                if ("beginner".equals(lvl) || "advanced".equals(lvl)) {
+                    return lvl;
+                }
+            }
         }
         return fallback;
     }
@@ -151,7 +170,7 @@ public class PdfDocService {
         return Collections.emptyMap();
     }
 
-    /** Tekstowe podsumowanie projektu z info.extensions["x-project-summary"] (genera NLP). */
+    /** Tekstowe podsumowanie projektu z info.extensions["x-project-summary"]. */
     private static String getProjectSummary(OpenAPI api) {
         if (api != null && api.getInfo() != null && api.getInfo().getExtensions() != null) {
             Object v = api.getInfo().getExtensions().get("x-project-summary");
@@ -166,21 +185,21 @@ public class PdfDocService {
     }
 
     private static String levelLabelPl(String lvl) {
-        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
-            case "beginner":    return "Poziom: początkujący";
-            case "advanced":    return "Poziom: zaawansowany";
-            case "intermediate":
-            default:            return "Poziom: średniozaawansowany";
-        }
+        String v = (lvl == null ? "" : lvl).toLowerCase(Locale.ROOT);
+        return switch (v) {
+            case "beginner" -> "Poziom: początkujący";
+            case "advanced" -> "Poziom: zaawansowany";
+            default         -> "Poziom: zaawansowany";
+        };
     }
 
     private static String levelClass(String lvl) {
-        switch ((lvl == null ? "" : lvl).toLowerCase(Locale.ROOT)) {
-            case "beginner":    return "lvl-beginner";
-            case "advanced":    return "lvl-advanced";
-            case "intermediate":
-            default:            return "lvl-intermediate";
-        }
+        String v = (lvl == null ? "" : lvl).toLowerCase(Locale.ROOT);
+        return switch (v) {
+            case "beginner" -> "lvl-beginner";
+            case "advanced" -> "lvl-advanced";
+            default         -> "lvl-advanced";
+        };
     }
 
     private String buildHtml(OpenAPI api) {
@@ -245,7 +264,7 @@ public class PdfDocService {
         // Schematy
         renderComponents(sb, api.getComponents());
 
-        // Podsumowanie aplikacji na końcu (szczególnie dla beginner)
+        // Podsumowanie aplikacji na końcu (jeśli dostępne) – głównie dla beginner
         sb.append(renderAppSummaryIfNeeded(api));
 
         sb.append("</body></html>");
@@ -273,16 +292,19 @@ public class PdfDocService {
     }
 
     private void renderSecuritySchemes(StringBuilder sb, Components components) {
-        if (components == null || components.getSecuritySchemes() == null || components.getSecuritySchemes().isEmpty())
+        if (components == null
+                || components.getSecuritySchemes() == null
+                || components.getSecuritySchemes().isEmpty()) {
             return;
+        }
 
         sb.append("<div class='security'><strong>Security Schemes</strong>");
         sb.append("<table><thead><tr><th>Nazwa</th><th>Typ</th><th>Schemat</th><th>Format</th><th>Opis</th></tr></thead><tbody>");
         components.getSecuritySchemes().forEach((name, scheme) -> {
-            String type     = scheme.getType() != null ? scheme.getType().toString().toLowerCase(Locale.ROOT) : "";
-            String schemeStr= nz(scheme.getScheme());
-            String fmt      = nz(scheme.getBearerFormat());
-            String desc     = nz(scheme.getDescription());
+            String type      = scheme.getType() != null ? scheme.getType().toString().toLowerCase(Locale.ROOT) : "";
+            String schemeStr = nz(scheme.getScheme());
+            String fmt       = nz(scheme.getBearerFormat());
+            String desc      = nz(scheme.getDescription());
             sb.append("<tr>")
               .append("<td>").append(esc(name)).append("</td>")
               .append("<td>").append(esc(type)).append("</td>")
@@ -481,7 +503,7 @@ public class PdfDocService {
             }
         }
 
-        // Odpowiedzi – filtr dla beginner
+        // Odpowiedzi – filtr dla beginner (kluczowe statusy)
         if (op.getResponses() != null && !op.getResponses().isEmpty()) {
             sb.append("<div style='margin-top:8px'><strong>Odpowiedzi</strong>");
             sb.append("<table><thead><tr>")
@@ -529,7 +551,7 @@ public class PdfDocService {
             sb.append("</tbody></table></div>");
         }
 
-        // Notatki implementacyjne tylko dla nie-beginner
+        // Notatki implementacyjne tylko dla advanced
         if (!isBeginner
                 && op.getExtensions() != null
                 && op.getExtensions().get("x-impl-notes") instanceof List) {
@@ -633,8 +655,11 @@ public class PdfDocService {
 
             if (schema instanceof ArraySchema arr) {
                 Schema<?> items = arr.getItems();
-                String it = (items != null && items.get$ref() != null) ? items.get$ref()
-                        : (items != null && items.getType() != null) ? items.getType() : "";
+                String it = (items != null && items.get$ref() != null)
+                        ? items.get$ref()
+                        : (items != null && items.getType() != null)
+                            ? items.getType()
+                            : "";
                 if (!it.isEmpty()) {
                     sb.append("<div>Items: <code>").append(esc(it)).append("</code></div>");
                 }
@@ -655,48 +680,19 @@ public class PdfDocService {
         }
 
         String summaryFromExt = getProjectSummary(api);
-
-        // Jeśli model coś zwrócił → wstawiamy 1:1 (tylko escapowanie HTML + nowe linie)
         if (summaryFromExt != null && !summaryFromExt.isBlank()) {
             return "<section><h2>Podsumowanie aplikacji</h2><p>"
                     + esc(summaryFromExt).replace("\n", "<br />")
                     + "</p></section>";
         }
 
-        // Jeśli nie chcesz żadnego fallbacku – po prostu:
+        // brak fallbacku – jeśli nie ma x-project-summary, sekcja jest pomijana
         return "";
     }
 
-
-    private static List<String> splitIntoSentences(String text) {
-        String t = text.trim();
-        if (t.isEmpty()) return List.of();
-        String[] raw = t.split("(?<=[.!?])\\s+");
-        List<String> out = new ArrayList<>();
-        for (String s : raw) {
-            String ss = s.trim();
-            if (!ss.isEmpty()) out.add(ss);
-        }
-        return out;
-    }
-
-    private static String joinWithCommaAndAnd(List<String> items) {
-        if (items.isEmpty()) return "";
-        if (items.size() == 1) return items.get(0);
-        if (items.size() == 2) return items.get(0) + " oraz " + items.get(1);
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < items.size(); i++) {
-            if (i > 0) {
-                if (i == items.size() - 1) {
-                    sb.append(" oraz ");
-                } else {
-                    sb.append(", ");
-                }
-            }
-            sb.append(items.get(i));
-        }
-        return sb.toString();
-    }
+    // ========================================================================
+    //  JSON / SCHEMA HELPERS
+    // ========================================================================
 
     private String toPrettyJson(Object obj) {
         try {
@@ -805,7 +801,8 @@ public class PdfDocService {
                 String values = s.getEnum().stream()
                         .limit(6)
                         .map(String::valueOf)
-                        .reduce((a,b)->a+", "+b).orElse("");
+                        .reduce((a, b) -> a + ", " + b)
+                        .orElse("");
                 j.add("enum {" + values + (s.getEnum().size() > 6 ? ", …" : "") + "}");
             }
 
@@ -821,8 +818,8 @@ public class PdfDocService {
 
     private boolean isBeginnerLevel(String level) {
         if (level == null) return false;
-        return level.equalsIgnoreCase("beginner")
-            || level.equalsIgnoreCase("początkujący");
+        String v = level.trim().toLowerCase(Locale.ROOT);
+        return "beginner".equals(v) || "początkujący".equals(v);
     }
 
     private boolean shouldShowResponseForBeginner(String code, String level) {

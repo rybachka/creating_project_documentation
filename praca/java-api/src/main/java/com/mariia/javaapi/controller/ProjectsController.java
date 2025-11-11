@@ -3,7 +3,6 @@ package com.mariia.javaapi.controller;
 import com.mariia.javaapi.uploads.UploadResult;
 import com.mariia.javaapi.uploads.UploadStorage;
 import com.mariia.javaapi.uploads.ZipUtils;
-import com.mariia.javaapi.uploads.SpecDetector;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
@@ -38,7 +37,9 @@ public class ProjectsController {
             }
 
             String original = StringUtils.hasText(file.getOriginalFilename())
-                    ? file.getOriginalFilename() : "project.zip";
+                    ? file.getOriginalFilename()
+                    : "project.zip";
+
             if (!original.toLowerCase().endsWith(".zip")) {
                 res.status = "ERROR";
                 res.message = "Oczekiwany plik .zip.";
@@ -50,7 +51,7 @@ public class ProjectsController {
             Files.createDirectories(zipPath.getParent());
             Files.copy(file.getInputStream(), zipPath, StandardCopyOption.REPLACE_EXISTING);
 
-            // 🔴 TUTAJ DODAJ TO:
+            // Zapamiętaj oryginalną nazwę projektu (na potrzeby nazw plików wynikowych)
             storage.saveOriginalProjectName(id, original);
 
             // Rozpakuj do katalogu projektu
@@ -58,21 +59,12 @@ public class ProjectsController {
             Files.createDirectories(projectDir);
             ZipUtils.unzip(zipPath, projectDir);
 
-            // Spróbuj wykryć plik OpenAPI w projekcie
-            String specRel = null;
-            try {
-                specRel = SpecDetector.findOpenApiRelative(projectDir);
-            } catch (Exception scanErr) {
-                specRel = null;
-            }
-
+            // Od tej pory NIE szukamy automatycznie OpenAPI w projekcie
             res.zipPath = zipPath.toString();
             res.projectDir = projectDir.toString();
-            res.detectedSpec = specRel;
-            res.status = (specRel != null) ? "READY" : "PENDING";
-            res.message = (specRel != null)
-                    ? "Znaleziono specyfikację: " + specRel
-                    : "Nie wykryto pliku OpenAPI – można wygenerować dokumentację z kodu.";
+            res.detectedSpec = null;
+            res.status = "PENDING";
+            res.message = "Projekt wgrany. Możesz wygenerować dokumentację z kodu.";
 
             return ResponseEntity.ok(res);
 

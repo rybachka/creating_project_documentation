@@ -39,7 +39,7 @@ class EndpointSummaryIn(BaseModel):
 class ProjectSummaryIn(BaseModel):
     projectName: str
     language: str = "pl"
-    audience: str = "beginner"  # "beginner" | "intermediate" | "advanced"
+    audience: str = "beginner"  # "beginner" | "advanced"
     endpoints: List[EndpointSummaryIn]
 
 
@@ -119,7 +119,7 @@ ZWRÓĆ WYŁĄCZNIE POPRAWNY JSON wg schematu:
   "mediumDescription": "1–3 zdania, naturalny polski, bez metatekstu i placeholderów",
   "notes": ["0–5 krótkich punktów albo []"],
   "examples": {
-    "requests": ["curl ..."],              // 0–2 pozycji (dla beginner docelowo 1)
+    "requests": ["curl ..."],              // 0–2 pozycji
     "response": {
       "status": 200,
       "body": {}                           // dla DELETE/void: {"status": 204, "body": {}}
@@ -267,114 +267,14 @@ Na podstawie powyższego i IR poniżej wygeneruj WYŁĄCZNIE JSON:
 """
 
 
-def build_prompt_intermediate(payload: DescribeIn) -> str:
-    """
-    Prompt dla INTERMEDIATE — programista zna REST, ale nie zna Twojego API.
-    Ma dostać konkretny opis domenowy, sensowne statusy, przykłady z paginacją/filtrami
-    i krótkie techniczne uwagi. Bez glosariusza dla juniorów i bez przesadnych edge-case'ów.
-    """
-    method = (getattr(payload, "method", "") or "").upper()
-    path = getattr(payload, "path", "") or ""
-    raw_comment = (
-        getattr(payload, "rawComment", None)
-        or getattr(payload, "comment", None)
-        or ""
-    )
-
-    return f"""
-Piszesz dokumentację REST API po polsku dla programisty ŚREDNIOZAAWANSOWANEGO.
-
-Założenia ogólne:
-- Odbiorca zna HTTP, JSON, kody statusów i podstawy REST.
-- NIE zna domeny biznesowej ani szczegółów tego API.
-- Potrzebuje konkretnych informacji: co zwraca endpoint, jak używać parametrów, jak działa paginacja/sortowanie, jakie są typowe odpowiedzi.
-
-Twoja odpowiedź MUSI być WYŁĄCZNIE poprawnym JSON-em wg schematu (bez tekstu przed/po):
-
-{{
-  "mediumDescription": "…",
-  "notes": ["…"],
-  "examples": {{
-    "requests": ["curl ..."],
-    "response": {{
-      "status": 200,
-      "body": {{}}
-    }}
-  }}
-}}
-
-ZASADY DLA POZIOMU INTERMEDIATE:
-
-1. mediumDescription (1–3 zdania):
-   - Opisz domenowo CO robi operacja dla ścieżki "{path}" i metody "{method}".
-   - Uwzględnij kluczowe szczegóły:
-     - czy zwraca listę czy pojedynczy obiekt,
-     - czy wynik jest posortowany lub filtrowany,
-     - czy dotyczy "zalogowanego użytkownika" lub konkretnego zasobu (np. ID w ścieżce),
-     - jeśli z IR wynika paginacja (page/size/sort) – wspomnij, że wynik jest stronicowany.
-   - Bez ogólników typu "operacja na zasobie" i bez tłumaczenia podstaw REST.
-
-2. examples.requests (1–2 przykłady cURL):
-   - ZAWSZE podaj 1 poprawny przykład cURL dla TEGO endpointu.
-   - Jeśli z danych wynika paginacja / sortowanie / filtry (np. parametry query page, size, sort, q, status itp.),
-     dodaj DRUGI przykład cURL pokazujący te parametry w użyciu.
-   - Używaj metody {method} i ścieżki {path}.
-   - Jeśli endpoint wymaga autoryzacji (na podstawie danych o security / bearer / JWT),
-     dodaj nagłówek: Authorization: Bearer <token>.
-   - Dla żądań z body dodaj Content-Type: application/json i sensowny przykład JSON zgodny z wejściem.
-   - Żadnych losowych nagłówków technicznych; żadnych placeholderów typu "<string>" poza oczywistym <token>.
-
-3. examples.response:
-   - Jedna przykładowa odpowiedź "szczęśliwej ścieżki":
-     - GET → zazwyczaj 200,
-     - POST tworzący nowy zasób → 201,
-     - PUT/PATCH → 200 lub 204,
-     - DELETE lub typ zwrotny void → 204 i body = {{}}.
-   - Struktura body musi wynikać z przekazanego modelu odpowiedzi (returns / schema).
-     Jeśli brak informacji → użyj neutralnej, prostej struktury bez wymyślania pól biznesowych.
-
-4. notes (2–6 krótkich punktów, jeśli mają sens):
-   - Wymień typowe kody odpowiedzi dla tego endpointu w formie:
-     "200 – gdy operacja zakończy się poprawnie.",
-     "400 – niepoprawne dane wejściowe.",
-     "401 – brak ważnego tokenu dostępowego.",
-     "403 – użytkownik nie ma uprawnień.",
-     "404 – zasób o podanym identyfikatorze nie istnieje.",
-     "422 – walidacja domenowa nie powiodła się (np. zbyt długi tytuł)."
-   - Dodaj zwięzłe best practices:
-     - jak korzystać z paginacji (page/size/sort),
-     - jakie są istotne ograniczenia (np. limit wyników, wymagane pola),
-     - czy endpoint jest idempotentny (dla PUT/DELETE, jeśli wynika z kontekstu),
-     - ewentualne techniczne uwagi (np. filtry po statusie / dacie).
-   - Nie powtarzaj mediumDescription słowo w słowo.
-   - Nie tłumacz podstaw HTTP/REST – ten poziom już to zna.
-
-5. TWARDY LIMIT:
-   - Nie wymyślaj pól ani typów, których nie ma w danych wejściowych lub w przekazanych schematach.
-   - Nie dodawaj glosariusza dla juniorów (to jest tylko dla beginner).
-   - Nie rozpisuj skrajnych edge-case'ów i rozbudowanej polityki błędów 5xx (to domena poziomu advanced).
-   - Odpowiedź musi być czystym JSON-em, bez Markdowna, bez komentarzy, bez tekstu wokół.
-
-DANE ENDPOINTU (IR):
-- method: {method}
-- path: {path}
-- rawComment: {raw_comment}
-
-{_common_context(payload)}
-
-{SCHEMA_TEXT}
-"""
-
-
-
 def build_prompt_advanced(payload: DescribeIn) -> str:
     return f"""
 Piszesz dokumentację REST API po polsku dla zaawansowanego backend developera.
 
 CEL:
-- W mediumDescription opisz precyzyjnie strukturę danych, kody statusów, edge-case'y.
+- W mediumDescription opisz precyzyjnie cel operacji, strukturę danych i kluczowe kody statusów.
 - Szczegóły techniczne i błędy w 'notes'.
-- Dodaj 1 przykład cURL z sensownymi nagłówkami.
+- Dodaj sensowny przykład cURL z wymaganymi nagłówkami.
 
 ZASADY:
 - Zero zgadywania poza tym, co wynika z IR.
@@ -387,13 +287,12 @@ ZASADY:
 """
 
 
-def build_prompt(payload: DescribeIn, audience: str = "intermediate") -> str:
-    lvl = (audience or "intermediate").strip().lower()
-    if lvl in ("beginner", "short", "junior"):
-        return build_prompt_beginner(payload)
+def build_prompt(payload: DescribeIn, audience: str = "beginner") -> str:
+    lvl = (audience or "beginner").strip().lower()
     if lvl in ("advanced", "long", "senior"):
         return build_prompt_advanced(payload)
-    return build_prompt_intermediate(payload)
+    # domyślnie: beginner
+    return build_prompt_beginner(payload)
 
 
 # =========================
@@ -402,14 +301,44 @@ def build_prompt(payload: DescribeIn, audience: str = "intermediate") -> str:
 
 
 def build_project_summary_prompt(payload: ProjectSummaryIn) -> str:
+    audience = (payload.audience or "beginner").strip().lower()
     lines: List[str] = []
-    lines.append(
-        "Napisz rozbudowane, ale konkretne podsumowanie tego REST API dla początkującego programisty."
-    )
+
+    if audience == "advanced":
+        lines.append("Napisz techniczne podsumowanie tego REST API dla zaawansowanego backend developera.")
+        lines.append(f"Nazwa projektu: {payload.projectName}")
+        lines.append("Lista endpointów (skrótowo, tylko do analizy):")
+        for ep in (payload.endpoints or [])[:200]:
+            line = f"- {ep.method} {ep.path}"
+            detail = (ep.summary or ep.description or "").strip()
+            if detail:
+                line += f" :: {detail}"
+            lines.append(line)
+        lines.append(
+            """
+ZWRÓĆ WYŁĄCZNIE POPRAWNY JSON:
+{
+  "summary": "…"
+}
+
+ZASADY:
+- Język: polski.
+- 3–6 zdań.
+- Skup się na:
+  - głównych agregatach/zasobach i obszarach domenowych,
+  - modelu autoryzacji (np. bearer/JWT), jeśli wynika z endpointów,
+  - spójnym formacie błędów i kodach statusów,
+  - wsparciu dla paginacji i filtrowania, jeśli występują.
+- Nie wypisuj listy endpointów ani ścieżek 1:1.
+- Zero metakomentarzy.
+"""
+        )
+        return "\n".join(lines)
+
+    # BEGINNER (domyślnie)
+    lines.append("Napisz rozbudowane, ale proste podsumowanie tego REST API dla początkującego programisty.")
     lines.append(f"Nazwa projektu: {payload.projectName}")
-    lines.append(
-        "Lista endpointów (skrótowo, tylko do analizy – NIE cytuj ich dosłownie w podsumowaniu):"
-    )
+    lines.append("Lista endpointów (skrótowo, tylko do analizy – NIE cytuj ich dosłownie w podsumowaniu):")
     for ep in (payload.endpoints or [])[:200]:
         line = f"- {ep.method} {ep.path}"
         detail = (ep.summary or ep.description or "").strip()
@@ -426,19 +355,17 @@ ZWRÓĆ WYŁĄCZNIE POPRAWNY JSON:
 
 TWARDZE ZASADY:
 - Język: polski.
-- Forma: 2–3 zwarte akapity w jednym polu "summary" (użyj znaków nowej linii "\\n" tam, gdzie to naturalne).
+- Forma: 2–3 zwarte akapity w jednym polu "summary" (użyj "\\n" gdy naturalne).
 - Długość: orientacyjnie 900–1500 znaków.
-- Opisz sensownie CAŁE API, a nie pojedyncze endpointy.
-- Uwzględnij:
-  - jaki problem biznesowy rozwiązuje aplikacja / do czego służy API,
-  - główne grupy funkcjonalności (np. użytkownicy, zamówienia, konfiguracja, raporty),
-  - typowe operacje: pobieranie list, szczegółów, tworzenie, modyfikacja, usuwanie,
-  - jeśli z listy endpointów wynika logowanie / token / autoryzacja – krótko wspomnij o wymaganym uwierzytelnianiu,
-  - jeśli widać paginację / filtrowanie / standardowy format błędów – wspomnij o tym jednym zdaniem.
+- Opisz sensownie CAŁE API:
+  - do czego służy aplikacja,
+  - główne grupy funkcjonalności,
+  - typowe operacje (pobieranie list, szczegółów, tworzenie, modyfikacja, usuwanie),
+  - jeśli widać logowanie / token / autoryzację – krótko o tym wspomnij,
+  - jeśli widać paginację / filtrowanie / standardowy format błędów – wspomnij jednym zdaniem.
 - Nie wypisuj pełnych ścieżek ani metod HTTP.
-- Nie używaj list wypunktowanych ani metakomentarzy ("to podsumowanie", "na podstawie powyższych endpointów").
-- Żadnych placeholderów typu "TODO", "uzupełnij tutaj".
-- Styl prosty, produktowy, zrozumiały dla juniora.
+- Zero metakomentarzy.
+- Żadnych placeholderów typu "TODO".
 """
     )
     return "\n".join(lines)
@@ -537,7 +464,7 @@ def _validate_ai_doc(raw: Dict[str, Any], payload: DescribeIn) -> Optional[Descr
     Parsowanie odpowiedzi modelu:
     - mediumDescription: wymagany (z fallbacku jeśli brak),
     - notes: czyszczone,
-    - examples: przepuszczone 1:1 (żeby w OpenAPI/PDF było dokładnie to, co wygenerował model).
+    - examples: przepuszczone 1:1.
     """
     if not raw or not isinstance(raw, dict):
         return None
@@ -577,7 +504,7 @@ def _validate_ai_doc(raw: Dict[str, Any], payload: DescribeIn) -> Optional[Descr
 #   FASTAPI
 # =========================
 
-app = FastAPI(title="NLP Describe Service (Ollama)", version="2.5.0")
+app = FastAPI(title="NLP Describe Service (Ollama)", version="3.0.0")
 
 
 @app.get("/healthz")
@@ -606,7 +533,7 @@ async def describe(
     payload: DescribeIn,
     request: Request,
     mode: str = Query("ollama", pattern="^(plain|rule|ollama)$"),
-    audience: str = Query("intermediate", pattern="^(beginner|intermediate|advanced)$"),
+    audience: str = Query("beginner", pattern="^(beginner|advanced)$"),
     strict: bool = Query(True),
 ):
     if NLP_DEBUG:
@@ -674,10 +601,8 @@ async def project_summary(
 
     summary_text = ""
     if isinstance(raw, dict):
-        # tylko strip — żadnych zmian merytorycznych
         summary_text = str(raw.get("summary") or "").strip()
 
-    # Fallback tylko jeśli model kompletnie nic nie zwrócił sensownego
     if not summary_text:
         eps = payload.endpoints or []
         unique_paths = {f"{e.method} {e.path}" for e in eps}
@@ -693,6 +618,63 @@ async def project_summary(
             )
 
     return ProjectSummaryOut(summary=summary_text)
+
+async def call_ollama_raw(prompt: str) -> str:
+    """
+    Woła Ollamę i zwraca SUROWĄ odpowiedź (response field) bez wycinania JSON-u.
+    Używane wyłącznie do debug podglądu.
+    """
+    url = f"{OLLAMA_BASE_URL}/api/generate"
+    body = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+            "top_p": OLLAMA_TOP_P,
+            "top_k": OLLAMA_TOP_K,
+            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": OLLAMA_NUM_PREDICT,
+        },
+    }
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(url, json=body)
+        r.raise_for_status()
+        data = r.json()
+    # Ollama zwraca pole 'response' jako tekst
+    return (data.get("response") or "").strip()
+
+@app.post("/nlp/output-preview")
+async def nlp_output_preview(
+    payload: DescribeIn,
+    request: Request,
+    audience: str = Query("beginner", pattern="^(beginner|advanced)$"),
+    strict: bool = Query(True),
+):
+    """
+    Endpoint debugowy.
+    Zwraca dokładny prompt zbudowany dla danego endpointu + surową odpowiedź modelu.
+    NIC nie czyścimy, nie walidujemy, nie zmieniamy.
+    """
+    if NLP_DEBUG:
+        who = request.client.host if request.client else "?"
+        print(
+            f"[nlp-output-preview] from={who} "
+            f"symbol={getattr(payload, 'symbol', '?')} audience={audience}"
+        )
+
+    prompt = build_prompt(payload, audience=audience)
+    if strict:
+        prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
+
+    raw = await call_ollama_raw(prompt)
+
+    return {
+        "prompt": prompt,
+        "raw": raw,
+    }
+
 
 
 if __name__ == "__main__":

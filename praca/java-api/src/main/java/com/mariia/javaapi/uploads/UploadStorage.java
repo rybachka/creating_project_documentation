@@ -13,8 +13,7 @@ import java.nio.file.Path;
  *  - katalog projektu:   /uploads/{id}
  *  - ZIP projektu:       /uploads/{id}.zip
  *  - metadata nazwy:     /uploads/{id}.name  (oryginalna nazwa zipa, bez ścieżki)
- *  - oryginalna spec:    openapi.yaml / openapi.yml (jeśli istnieje)
- *  - wygenerowana spec:  openapi.generated.yaml (gdy tworzymy ją z kodu)
+ *  - wygenerowana spec:  /uploads/{id}/openapi.generated.yaml (gdy tworzymy ją z kodu)
  */
 @Component
 public class UploadStorage {
@@ -66,7 +65,7 @@ public class UploadStorage {
             }
         }
 
-        // 2) z nazwy pliku ZIP (jeśli nie jest zrandomizowane)
+        // 2) z nazwy pliku ZIP (jeśli istnieje)
         Path zip = resolveZipPath(id);
         if (Files.exists(zip)) {
             String fileName = zip.getFileName().toString();
@@ -77,40 +76,6 @@ public class UploadStorage {
 
         // 3) fallback
         return id;
-    }
-
-    /**
-     * Zwraca pełną ścieżkę do openapi.{yaml|yml} w projekcie.
-     * Jeśli nie znajdzie pliku – rzuca IllegalStateException z czytelnym komunikatem.
-     */
-    public Path resolveOpenApiYamlPath(String id) {
-        Path dir = resolveProjectDir(id);
-        if (!Files.exists(dir)) {
-            throw new IllegalStateException("Project not found: " + id);
-        }
-
-        // 1) spróbuj wykryć względną ścieżkę (np. sample-project/openapi.yaml)
-        try {
-            String rel = SpecDetector.findOpenApiRelative(dir);
-            if (rel != null && !rel.isBlank()) {
-                Path candidate = dir.resolve(rel).normalize();
-                if (Files.exists(candidate)) {
-                    return candidate;
-                }
-            }
-        } catch (IOException io) {
-            throw new IllegalStateException("Error scanning project " + id + " for OpenAPI file", io);
-        }
-
-        // 2) fallback – standardowe nazwy w katalogu głównym projektu
-        Path yml  = dir.resolve("openapi.yml");
-        Path yaml = dir.resolve("openapi.yaml");
-        if (Files.exists(yml))  return yml;
-        if (Files.exists(yaml)) return yaml;
-
-        throw new IllegalStateException(
-            "Spec file not found in project " + id + " (expected openapi.yml/.yaml or a detected spec)"
-        );
     }
 
     // --- pomocnicze, opcjonalne ---
@@ -126,6 +91,10 @@ public class UploadStorage {
         Files.writeString(file, content, StandardCharsets.UTF_8);
     }
 
+    /**
+     * Zapisuje oryginalną nazwę projektu (na podstawie nazwy przesłanego ZIP-a),
+     * żeby później użyć jej np. w nazwach wygenerowanych plików.
+     */
     public void saveOriginalProjectName(String id, String originalFilename) throws IOException {
         if (originalFilename == null || originalFilename.isBlank()) {
             return;
@@ -140,7 +109,6 @@ public class UploadStorage {
             baseName = baseName.substring(0, baseName.length() - 4);
         }
 
-        // nic sensownego? odpuść
         if (baseName.isBlank()) {
             return;
         }
@@ -149,5 +117,4 @@ public class UploadStorage {
         Files.createDirectories(nameMeta.getParent());
         Files.writeString(nameMeta, baseName, StandardCharsets.UTF_8);
     }
-
 }

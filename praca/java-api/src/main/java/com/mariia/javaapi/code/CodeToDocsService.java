@@ -31,8 +31,6 @@ import java.util.stream.Stream;
 @Service
 public class CodeToDocsService {
 
-    public enum DescribeMode { PLAIN, RULES, AI }
-
     private final WebClient nlp;
     private final Duration timeout = Duration.ofSeconds(90);
 
@@ -44,16 +42,22 @@ public class CodeToDocsService {
     // PUBLIC API
     // ========================================================================
 
+    /**
+     * Główny flow:
+     * - buduje OpenAPI,
+     * - dla każdego endpointu woła NLP /describe (mode=ollama),
+     * - z odpowiedzi AI uzupełnia opisy, przykłady itd.,
+     * - generuje YAML.
+     */
     public Path generateYamlFromCode(
             List<EndpointIR> eps,
             String projectName,
             String level,
             Path outFile,
-            Path projectRoot,
-            DescribeMode mode
+            Path projectRoot
     ) throws Exception {
 
-        System.out.println("[from-code] level=" + level + " mode=" + mode);
+        System.out.println("[from-code] level=" + level);
 
         OpenAPI api = new OpenAPI();
         Info info = new Info()
@@ -61,10 +65,9 @@ public class CodeToDocsService {
                 .version("1.0.0");
 
         Map<String, Object> infoExt = new LinkedHashMap<>();
-        String audience = normalizeAudience(level);
+        String audience = level; // tylko "beginner" albo "advanced"
         infoExt.put("x-user-level", audience);
-        // Nazwa zipa jako nazwa projektu do PDF (zamiast technicznego ID)
-        infoExt.put("x-project-name", projectName);
+        infoExt.put("x-project-name", projectName); // nazwa projektu do PDF
         info.setExtensions(infoExt);
 
         api.setInfo(info);
@@ -125,20 +128,10 @@ public class CodeToDocsService {
             opExt.put("x-user-level", audience);
             op.setExtensions(opExt);
 
-            // NLP /describe
-            Map<String, Object> nlpRes;
-            if (mode != DescribeMode.PLAIN) {
-                nlpRes = callNlp(buildNlpBody(ep), mode, level);
-            } else {
-                nlpRes = callNlp(buildPlainNlpBody(ep), DescribeMode.PLAIN, level);
-            }
+            // NLP /describe – zawsze AI (ollama)
+            Map<String, Object> nlpRes = callNlp(buildNlpBody(ep), level);
 
-            if (mode == DescribeMode.RULES) {
-                applyRuleDescriptions(op, ep, nlpRes, level);
-            } else if (mode == DescribeMode.AI) {
-                applyAiDescriptionsAndExamples(op, ep, nlpRes);
-            }
-
+            applyAiDescriptionsAndExamples(op, ep, nlpRes);
             applyParamsAndRequestBody(op, ep);
             ensureDefaultResponses(op, ep, nlpRes);
 
@@ -146,7 +139,7 @@ public class CodeToDocsService {
                 attachPageableToOperation(api, op, ep);
             }
 
-            // pełna macierz błędów (PDF przefiltruje dla beginner)
+            // pełna macierz błędów (PDF filtruje dla beginner)
             attachStandardErrors(op, isWriteMethod(ep.http));
 
             // request/response/examples fallback
@@ -170,8 +163,7 @@ public class CodeToDocsService {
         post.apply(api);
         sanitizeOpenApi(api);
 
-        // Podsumowanie projektu do PDF dla BEGINNER:
-        // zapisujemy w info.extensions["x-project-summary"]
+        // Podsumowanie projektu tylko dla BEGINNER
         if ("beginner".equals(audience)) {
             String projectSummary = generateBeginnerSummary(api, projectName, audience);
             if (projectSummary != null && !projectSummary.isBlank()) {
@@ -192,30 +184,20 @@ public class CodeToDocsService {
         return outFile;
     }
 
-    public Path generateYamlFromCode(
-            List<EndpointIR> eps,
-            String projectName,
-            String level,
-            Path outFile,
-            Path projectRoot
-    ) throws Exception {
-        return generateYamlFromCode(eps, projectName, level, outFile, projectRoot, DescribeMode.AI);
-    }
-
     // ========================================================================
     // NLP CALLS
     // ========================================================================
 
+    /**
+     * Woła serwis NLP:
+     *  - /describe?mode=ollama&audience=...&strict=true
+     *  - body = pełny IR endpointu.
+     */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> callNlp(Map<String, Object> body, DescribeMode mode, String level) {
+    private Map<String, Object> callNlp(Map<String, Object> body, String level) {
         try {
-            String modeParam = switch (mode) {
-                case PLAIN -> "plain";
-                case RULES -> "rule";
-                case AI    -> "ollama";
-            };
-            String audience = normalizeAudience(level);
-            String uri = "/describe?mode=" + modeParam + "&audience=" + audience + "&strict=true";
+            String audience = level;
+            String uri = "/describe?mode=ollama&audience=" + audience + "&strict=true";
             return nlp.post()
                     .uri(uri)
                     .contentType(MediaType.APPLICATION_JSON)
@@ -230,7 +212,7 @@ public class CodeToDocsService {
     }
 
     /**
-     * Generuje krótkie, spójne podsumowanie całego API dla początkujących za pomocą serwisu NLP.
+     * Generuje podsumowanie całego API dla początkujących za pomocą serwisu NLP.
      * Wynik trafia do x-project-summary i jest renderowany w PDF.
      */
     @SuppressWarnings("unchecked")
@@ -258,7 +240,7 @@ public class CodeToDocsService {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("projectName", projectName);
             body.put("language", "pl");
-            body.put("audience", normalizeAudience(level));
+            body.put("audience", level);
             body.put("endpoints", endpoints);
 
             Map<String, Object> res = nlp.post()
@@ -302,6 +284,10 @@ public class CodeToDocsService {
         target.add(m);
     }
 
+    // ========================================================================
+    // BUDOWANIE CIAŁA DLA NLP
+    // ========================================================================
+
     private Map<String, Object> buildNlpBody(EndpointIR ep) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("symbol", ep.operationId);
@@ -337,70 +323,18 @@ public class CodeToDocsService {
         return body;
     }
 
-    private Map<String, Object> buildPlainNlpBody(EndpointIR ep) {
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("symbol", ep.operationId);
-        body.put("kind", "endpoint");
-        body.put("signature", ep.http + " " + ep.path);
-        body.put("comment", "");
-        List<Map<String, Object>> nlpParams = new ArrayList<>();
-        for (ParamIR p : ep.params) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("name", p.name);
-            m.put("type", p.type);
-            m.put("description", p.description == null ? "" : p.description);
-            nlpParams.add(m);
-        }
-        body.put("params", nlpParams);
-        Map<String, Object> ret = new LinkedHashMap<>();
-        ret.put("type", ep.returns != null ? ep.returns.type : "void");
-        body.put("returns", ret);
-        return body;
-    }
-
-    private static String normalizeAudience(String level) {
-        String lv = level == null ? "" : level.trim().toLowerCase(Locale.ROOT);
-        return switch (lv) {
-            case "beginner", "short", "junior" -> "beginner";
-            case "advanced", "long", "senior"  -> "advanced";
-            default                            -> "intermediate";
-        };
-    }
-
     // ========================================================================
-    // OPISY ENDPOINTÓW
+    // OPISY ENDPOINTÓW (AI)
     // ========================================================================
-
-    private void applyRuleDescriptions(io.swagger.v3.oas.models.Operation op,
-                                       EndpointIR ep,
-                                       Map<String, Object> nlpRes,
-                                       String level) {
-        String shortD = sanitizeNlp(asStr(nlpRes.get("shortDescription")));
-        String medD   = sanitizeNlp(asStr(nlpRes.get("mediumDescription")));
-        String longD  = sanitizeNlp(asStr(nlpRes.get("longDescription")));
-
-        String summary = firstNonBlank(shortD, medD, longD, ep.description, ep.operationId);
-        if (summary != null && !summary.isBlank()) {
-            op.setSummary(trim(summary, 100));
-        }
-
-        String descr = pickByLevel(shortD, medD, longD, level);
-        if (descr == null) {
-            descr = firstNonBlank(longD, medD, shortD, ep.description);
-        }
-        if (descr != null && !descr.isBlank()) {
-            op.setDescription(descr);
-        }
-
-        if (ep.notes != null && !ep.notes.isEmpty()) {
-            op.addExtension("x-impl-notes", ep.notes);
-        }
-    }
 
     @SuppressWarnings("unchecked")
     private void applyAiDescriptionsAndExamples(io.swagger.v3.oas.models.Operation op,
                                                 EndpointIR ep,
                                                 Map<String, Object> nlpRes) {
+        if (nlpRes == null) {
+            return;
+        }
+
         // mediumDescription -> description + summary
         String medD = asStr(nlpRes.get("mediumDescription"));
         if (medD != null && !medD.isBlank()) {
@@ -460,7 +394,10 @@ public class CodeToDocsService {
             int status = 200;
             Object st = rm.get("status");
             if (st != null) {
-                try { status = Integer.parseInt(st.toString()); } catch (NumberFormatException ignore) {}
+                try {
+                    status = Integer.parseInt(st.toString());
+                } catch (NumberFormatException ignore) {
+                }
             }
             Object bodyEx = rm.get("body");
 
@@ -551,7 +488,7 @@ public class CodeToDocsService {
             rs.addApiResponse("204", new ApiResponse().description("No Content"));
         } else {
             ApiResponse ok = new ApiResponse();
-            String retDoc = asStr(nlpRes.get("returnDoc"));
+            String retDoc = asStr(nlpRes != null ? nlpRes.get("returnDoc") : null);
             ok.setDescription((retDoc != null && !retDoc.isBlank()) ? retDoc : "OK");
             ok.setContent(new Content().addMediaType(
                     MediaType.APPLICATION_JSON_VALUE,
@@ -595,7 +532,10 @@ public class CodeToDocsService {
         else if (op.getResponses().get("201") != null) pick = "201";
         else {
             for (String k : op.getResponses().keySet()) {
-                if (k != null && k.startsWith("2")) { pick = k; break; }
+                if (k != null && k.startsWith("2")) {
+                    pick = k;
+                    break;
+                }
             }
         }
         if (pick == null) return;
@@ -715,9 +655,12 @@ public class CodeToDocsService {
         String jdoc = nz(ep.javadoc).toLowerCase(Locale.ROOT);
 
         if (p.startsWith("/auth") || p.startsWith("/public")) return true;
-        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator"))) return true;
-        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh")) return true;
-        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh")) return true;
+        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator")))
+            return true;
+        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh"))
+            return true;
+        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh"))
+            return true;
         if (jdoc.contains("@public") || jdoc.contains("[public]")) return true;
 
         return false;
@@ -893,7 +836,9 @@ public class CodeToDocsService {
         return false;
     }
 
-    private void attachPageableToOperation(OpenAPI api, io.swagger.v3.oas.models.Operation op, EndpointIR ep) {
+    private void attachPageableToOperation(OpenAPI api,
+                                           io.swagger.v3.oas.models.Operation op,
+                                           EndpointIR ep) {
         if (op == null) return;
 
         List<Parameter> ps = (op.getParameters() == null)
@@ -969,11 +914,11 @@ public class CodeToDocsService {
     // ========================================================================
 
     private static final Set<String> PRIMITIVES = Set.of(
-            "byte","short","int","long","float","double","boolean","char"
+            "byte", "short", "int", "long", "float", "double", "boolean", "char"
     );
     private static final Set<String> BUILTINS = Set.of(
-            "String","Integer","Long","Float","Double","BigDecimal",
-            "Boolean","UUID","Object","Date","LocalDate","LocalDateTime","OffsetDateTime"
+            "String", "Integer", "Long", "Float", "Double", "BigDecimal",
+            "Boolean", "UUID", "Object", "Date", "LocalDate", "LocalDateTime", "OffsetDateTime"
     );
 
     private Schema<?> schemaForType(String typeName) {
@@ -1027,19 +972,19 @@ public class CodeToDocsService {
 
     private static Schema<?> primitiveToSchema(String p) {
         return switch (p) {
-            case "byte","short","int","long" -> new IntegerSchema();
-            case "float","double"            -> new NumberSchema();
-            case "boolean"                   -> new BooleanSchema();
-            case "char"                      -> new StringSchema();
-            default                          -> new ObjectSchema();
+            case "byte", "short", "int", "long" -> new IntegerSchema();
+            case "float", "double"              -> new NumberSchema();
+            case "boolean"                      -> new BooleanSchema();
+            case "char"                         -> new StringSchema();
+            default                             -> new ObjectSchema();
         };
     }
 
     private static Schema<?> builtinToSchema(String s) {
         return switch (s) {
             case "String"        -> new StringSchema();
-            case "Integer","Long"-> new IntegerSchema();
-            case "Float","Double","BigDecimal" -> new NumberSchema();
+            case "Integer", "Long" -> new IntegerSchema();
+            case "Float", "Double", "BigDecimal" -> new NumberSchema();
             case "Boolean"       -> new BooleanSchema();
             case "UUID"          -> new StringSchema().format("uuid");
             case "LocalDate"     -> new StringSchema().format("date");
@@ -1072,7 +1017,10 @@ public class CodeToDocsService {
             char c = inner.charAt(i);
             if (c == '<') depth++;
             else if (c == '>') depth--;
-            else if (c == ',' && depth == 0) { commaPos = i; break; }
+            else if (c == ',' && depth == 0) {
+                commaPos = i;
+                break;
+            }
         }
         if (commaPos < 0) return new String[]{"String", "Object"};
         String k = inner.substring(0, commaPos).trim();
@@ -1256,23 +1204,6 @@ public class CodeToDocsService {
         return t;
     }
 
-    private static String sanitizeNlp(String s) {
-        if (s == null) return null;
-        String t = s.trim();
-        if (t.isEmpty()) return null;
-        if (!t.endsWith(".")) t += ".";
-        return t;
-    }
-
-    private static String pickByLevel(String s, String m, String l, String level) {
-        String lv = level == null ? "" : level.trim().toLowerCase(Locale.ROOT);
-        return switch (lv) {
-            case "beginner", "short", "junior" -> firstNonBlank(s, m, l);
-            case "advanced", "long", "senior"  -> firstNonBlank(l, m, s);
-            default                            -> firstNonBlank(m, s, l);
-        };
-    }
-
     private static String firstNonBlank(String... xs) {
         if (xs == null) return null;
         for (String x : xs) {
@@ -1302,5 +1233,36 @@ public class CodeToDocsService {
         int idx = t.indexOf('.');
         if (idx < 0) return t;
         return t.substring(0, idx).trim();
+    }
+
+    // ========================================================================
+    // PUBLIC: PODGLĄD DANYCH WEJŚCIOWYCH DLA MODELU NLP
+    // ========================================================================
+
+    /**
+     * Zwraca dokładnie to, co wysyłamy do NLP dla pojedynczego endpointu,
+     * plus audience + mode (ollama) do podglądu w UI.
+     */
+    public Map<String, Object> buildNlpInputForEndpoint(EndpointIR ep,
+                                                        String level) {
+        Map<String, Object> body = buildNlpBody(ep);
+        body.put("audience", level);
+        body.put("mode", "ollama");
+        return body;
+    }
+
+    /**
+     * Zwraca listę wejść NLP dla wszystkich endpointów danego projektu.
+     */
+    public List<Map<String, Object>> buildNlpInputs(List<EndpointIR> endpoints,
+                                                    String level) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (endpoints == null) {
+            return out;
+        }
+        for (EndpointIR ep : endpoints) {
+            out.add(buildNlpInputForEndpoint(ep, level));
+        }
+        return out;
     }
 }
