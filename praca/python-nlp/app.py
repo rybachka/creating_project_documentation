@@ -2,18 +2,14 @@ import os
 import re
 import json
 from typing import Any, Dict, List, Optional
-
 import httpx
 from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, ValidationError
 
 from models import DescribeIn, DescribeOut, ParamIn
 
-# =========================
-#   KONFIGURACJA / ENV
-# =========================
 
-NLP_MODE = os.getenv("NLP_MODE", "ollama")  # plain | rule | ollama
+#   KONFIGURACJA / ENV
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.3"))
@@ -24,123 +20,17 @@ OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "256"))
 NLP_DEBUG = os.getenv("NLP_DEBUG", "false").lower() == "true"
 
-# =========================
-#   MODELE DLA PODSUMOWANIA PROJEKTU
-# =========================
 
-
-class EndpointSummaryIn(BaseModel):
-    method: str
-    path: str
-    summary: Optional[str] = ""
-    description: Optional[str] = ""
-
-
-class ProjectSummaryIn(BaseModel):
-    projectName: str
-    language: str = "pl"
-    audience: str = "beginner"  # "beginner" | "advanced"
-    endpoints: List[EndpointSummaryIn]
-
-
-class ProjectSummaryOut(BaseModel):
-    summary: str
-
-
-# =========================
 #   UTILS
-# =========================
-
-
 def _build_param_docs(params: List[ParamIn]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for p in params:
-        base = (getattr(p, "description", "") or "").strip()
-        if not base:
-            n = (getattr(p, "name", "") or "").lower()
-            if n in {"id", "user_id", "userid"}:
-                base = "Identyfikator zasobu."
-            elif n in {"page", "size", "limit"}:
-                base = "Parametr paginacji."
-            elif n in {"q", "query", "search"}:
-                base = "Fraza wyszukiwania."
-            else:
-                base = f"Parametr `{getattr(p, 'name', '')}`."
-        out.append({"name": getattr(p, "name", ""), "doc": base})
+        name = getattr(p, "name", "") or ""
+        desc = (getattr(p, "description", "") or "").strip()
+        out.append({"name": name, "doc": desc})
     return out
 
-
-def _type_to_words(t: Optional[str]) -> str:
-    if not t:
-        return "odpowiedź"
-    tl = t.lower()
-    if "string" in tl:
-        return "napis (string)"
-    if any(x in tl for x in ["int", "long", "integer"]):
-        return "liczba całkowita"
-    if any(x in tl for x in ["double", "float", "bigdec"]):
-        return "liczba"
-    if "boolean" in tl:
-        return "wartość logiczna (true/false)"
-    return f"obiekt `{t}`"
-
-
-def _safe_return_type(payload: DescribeIn) -> Optional[str]:
-    if not getattr(payload, "returns", None):
-        return None
-    rt = getattr(payload.returns, "type", None)
-    return rt or None
-
-
-def _rule_based(payload: DescribeIn) -> DescribeOut:
-    """
-    Deterministyczny fallback gdy AI nic sensownego nie zwróci.
-    """
-    base = (getattr(payload, "comment", "") or "").strip()
-    if not base:
-        ret = _type_to_words(_safe_return_type(payload))
-        base = f"Zwraca {ret}."
-    if not base.endswith("."):
-        base += "."
-    return DescribeOut(
-        mediumDescription=base,
-        paramDocs=_build_param_docs(getattr(payload, "params", []) or []),
-        returnDoc=(getattr(getattr(payload, "returns", None), "description", "") or "")
-    )
-
-
-# =========================
-#   SCHEMAT DLA MODELU (ENDPOINTY)
-# =========================
-
-SCHEMA_TEXT = """
-ZWRÓĆ WYŁĄCZNIE POPRAWNY JSON wg schematu:
-{
-  "mediumDescription": "1–3 zdania, naturalny polski, bez metatekstu i placeholderów",
-  "notes": ["0–5 krótkich punktów albo []"],
-  "examples": {
-    "requests": ["curl ..."],              // 0–2 pozycji
-    "response": {
-      "status": 200,
-      "body": {}                           // dla DELETE/void: {"status": 204, "body": {}}
-    }
-  }
-}
-
-TWARDZE ZASADY:
-- ŻADNYCH placeholderów typu „string (1–3 zdania…)”, „wpisz opis tutaj”.
-- Nie wymyślaj pól biznesowych ani typów spoza wejścia.
-- Jeśli operacja to DELETE lub typ zwrotny to void → response.status = 204, body = {}.
-- Dla GET zwykle response.status = 200, dla POST tworzącego zasób preferuj 201.
-- Odpowiedź musi być czystym JSON bez komentarzy, Markdown, tekstu przed ani po.
-"""
-
-
-# =========================
 #   PROMPTY (ENDPOINTY)
-# =========================
-
-
 def _common_context(payload: DescribeIn) -> str:
     lines: List[str] = []
     lines.append("DANE ENDPOINTU (IR):")
@@ -184,7 +74,6 @@ def _common_context(payload: DescribeIn) -> str:
         except Exception:
             pass
     return "\n".join(lines)
-
 
 def build_prompt_beginner(payload: DescribeIn) -> str:
     method = getattr(payload, "method", "") or ""
@@ -262,30 +151,70 @@ DANE TECHNICZNE ENDPOINTU:
 
 Na podstawie powyższego i IR poniżej wygeneruj WYŁĄCZNIE JSON:
 {_common_context(payload)}
-
-{SCHEMA_TEXT}
 """
 
-
 def build_prompt_advanced(payload: DescribeIn) -> str:
+    method = getattr(payload, "method", "") or ""
+    path = getattr(payload, "path", "") or ""
+    symbol = getattr(payload, "symbol", "") or ""
+    raw_comment = (
+        getattr(payload, "rawComment", None)
+        or getattr(payload, "comment", None)
+        or ""
+    )
+
     return f"""
 Piszesz dokumentację REST API po polsku dla zaawansowanego backend developera.
 
-CEL:
-- W mediumDescription opisz precyzyjnie cel operacji, strukturę danych i kluczowe kody statusów.
-- Szczegóły techniczne i błędy w 'notes'.
-- Dodaj sensowny przykład cURL z wymaganymi nagłówkami.
+Twoja odpowiedź MUSI być WYŁĄCZNIE poprawnym JSON-em (bez żadnego tekstu przed ani po) dokładnie wg schematu:
 
-ZASADY:
-- Zero zgadywania poza tym, co wynika z IR.
-- DELETE/void → response.status=204, body={{}}.
-- Tylko JSON zgodny ze schematem. Bez Markdown.
+{{
+  "mediumDescription": "…",
+  "notes": ["…"],
+  "examples": {{
+    "requests": ["curl ..."],
+    "response": {{
+      "status": 200,
+      "body": {{}}
+    }}
+  }}
+}}
 
+WYTYCZNE DLA POZIOMU ADVANCED:
+
+1) mediumDescription:
+   - 2–4 zdania, konkretnie i technicznie.
+   - Opisz precyzyjnie cel operacji, strukturę danych (we/wy) oraz kluczowe kody odpowiedzi.
+   - Jeśli z IR wynika autoryzacja (bearer/JWT), zasygnalizuj to, ale bez „wymyślania”.
+
+2) notes:
+   - 0–5 krótkich punktów technicznych (walidacje, edge-case’y, kluczowe błędy 4xx/5xx).
+   - Unikaj frazesów i ogólników.
+
+3) examples.requests:
+   - DOKŁADNIE 1 przykład cURL dla tego endpointu.
+   - Użyj metody {method} i ścieżki {path}.
+   - Dodaj wyłącznie niezbędne nagłówki (np. Authorization: Bearer, Content-Type przy body).
+   - Zero placeholderów w stylu "<string>".
+
+4) examples.response:
+   - Jedna „szczęśliwa ścieżka”:
+     - GET → 200; POST tworzący zasób → 201; DELETE/void → 204 i body = {{}}
+   - body ma odzwierciedlać strukturę wynikającą z IR (bez fantazji).
+
+5) Ogólne:
+   - Zero zgadywania pól/logiki spoza IR.
+   - Brak Markdown; tylko czysty JSON zgodny ze schematem.
+
+DANE TECHNICZNE ENDPOINTU:
+- method: {method}
+- path: {path}
+- symbol: {symbol}
+- rawComment: {raw_comment}
+
+Na podstawie powyższego i IR poniżej wygeneruj WYŁĄCZNIE JSON:
 {_common_context(payload)}
-
-{SCHEMA_TEXT}
 """
-
 
 def build_prompt(payload: DescribeIn, audience: str = "beginner") -> str:
     lvl = (audience or "beginner").strip().lower()
@@ -294,90 +223,8 @@ def build_prompt(payload: DescribeIn, audience: str = "beginner") -> str:
     # domyślnie: beginner
     return build_prompt_beginner(payload)
 
-
-# =========================
-#   PROMPT DLA PODSUMOWANIA PROJEKTU
-# =========================
-
-
-def build_project_summary_prompt(payload: ProjectSummaryIn) -> str:
-    audience = (payload.audience or "beginner").strip().lower()
-    lines: List[str] = []
-
-    if audience == "advanced":
-        lines.append("Napisz techniczne podsumowanie tego REST API dla zaawansowanego backend developera.")
-        lines.append(f"Nazwa projektu: {payload.projectName}")
-        lines.append("Lista endpointów (skrótowo, tylko do analizy):")
-        for ep in (payload.endpoints or [])[:200]:
-            line = f"- {ep.method} {ep.path}"
-            detail = (ep.summary or ep.description or "").strip()
-            if detail:
-                line += f" :: {detail}"
-            lines.append(line)
-        lines.append(
-            """
-ZWRÓĆ WYŁĄCZNIE POPRAWNY JSON:
-{
-  "summary": "…"
-}
-
-ZASADY:
-- Język: polski.
-- 3–6 zdań.
-- Skup się na:
-  - głównych agregatach/zasobach i obszarach domenowych,
-  - modelu autoryzacji (np. bearer/JWT), jeśli wynika z endpointów,
-  - spójnym formacie błędów i kodach statusów,
-  - wsparciu dla paginacji i filtrowania, jeśli występują.
-- Nie wypisuj listy endpointów ani ścieżek 1:1.
-- Zero metakomentarzy.
-"""
-        )
-        return "\n".join(lines)
-
-    # BEGINNER (domyślnie)
-    lines.append("Napisz rozbudowane, ale proste podsumowanie tego REST API dla początkującego programisty.")
-    lines.append(f"Nazwa projektu: {payload.projectName}")
-    lines.append("Lista endpointów (skrótowo, tylko do analizy – NIE cytuj ich dosłownie w podsumowaniu):")
-    for ep in (payload.endpoints or [])[:200]:
-        line = f"- {ep.method} {ep.path}"
-        detail = (ep.summary or ep.description or "").strip()
-        if detail:
-            line += f" :: {detail}"
-        lines.append(line)
-
-    lines.append(
-        """
-ZWRÓĆ WYŁĄCZNIE POPRAWNY JSON:
-{
-  "summary": "…"
-}
-
-TWARDZE ZASADY:
-- Język: polski.
-- Forma: 2–3 zwarte akapity w jednym polu "summary" (użyj "\\n" gdy naturalne).
-- Długość: orientacyjnie 900–1500 znaków.
-- Opisz sensownie CAŁE API:
-  - do czego służy aplikacja,
-  - główne grupy funkcjonalności,
-  - typowe operacje (pobieranie list, szczegółów, tworzenie, modyfikacja, usuwanie),
-  - jeśli widać logowanie / token / autoryzację – krótko o tym wspomnij,
-  - jeśli widać paginację / filtrowanie / standardowy format błędów – wspomnij jednym zdaniem.
-- Nie wypisuj pełnych ścieżek ani metod HTTP.
-- Zero metakomentarzy.
-- Żadnych placeholderów typu "TODO".
-"""
-    )
-    return "\n".join(lines)
-
-
-# =========================
 #   OLLAMA
-# =========================
-
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
 async def call_ollama(prompt: str) -> Dict[str, Any]:
     url = f"{OLLAMA_BASE_URL}/api/generate"
     body = {
@@ -395,13 +242,13 @@ async def call_ollama(prompt: str) -> Dict[str, Any]:
     }
     if NLP_DEBUG:
         print("[ollama:prompt]\n", prompt[:1200], "...\n")
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=600) as client:
         r = await client.post(url, json=body)
         r.raise_for_status()
         data = r.json()
     text = (data.get("response") or "").strip()
     if NLP_DEBUG:
-        print("[ollama:raw] head:", text[:200].replace("\n", " "), "...")
+        print("[ollama:raw] head:", text[:600].replace("\n", " "), "...")
     m = JSON_RE.search(text)
     if not m:
         return {}
@@ -410,12 +257,7 @@ async def call_ollama(prompt: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
-# =========================
 #   SANITY / POSTPROCESS
-# =========================
-
-
 def _sanitize_notes(notes: Any) -> List[str]:
     items = notes if isinstance(notes, list) else []
     out: List[str] = []
@@ -423,95 +265,37 @@ def _sanitize_notes(notes: Any) -> List[str]:
         s = ("" if n is None else str(n)).strip()
         if not s:
             continue
-        if len(s) > 240:
-            s = s[:240] + "…"
+        if len(s) > 400:
+            s = s[:400] + "…"
         out.append(s)
     return out
 
-
-def _fallback_medium_from_ir(payload: DescribeIn) -> str:
-    method = (getattr(payload, "method", "") or "").upper()
-    path = getattr(payload, "path", "") or ""
-    if not path:
-        return ""
-
-    if "/users" in path:
-        if "{id}" in path:
-            return "Pobiera dane użytkownika na podstawie jego identyfikatora."
-        if method == "POST":
-            return "Tworzy nowego użytkownika na podstawie danych z JSON."
-        return "Operacja na zasobie użytkowników."
-    if "/orders" in path:
-        if "{id}" in path and method == "GET":
-            return "Pobiera szczegóły zamówienia o podanym identyfikatorze."
-        if "{id}" in path and method == "DELETE":
-            return "Usuwa wskazane zamówienie z systemu."
-        return "Operacja na zasobie zamówień."
-
-    if method == "GET":
-        return f"Pobiera dane z endpointu {path}."
-    if method == "POST":
-        return f"Tworzy nowy zasób poprzez wywołanie {path} z danymi w JSON."
-    if method in ("PUT", "PATCH"):
-        return f"Aktualizuje zasób powiązany z {path}."
-    if method == "DELETE":
-        return f"Usuwa zasób powiązany z {path}."
-    return f"Operacja na endpointzie {path}."
-
-
 def _validate_ai_doc(raw: Dict[str, Any], payload: DescribeIn) -> Optional[DescribeOut]:
-    """
-    Parsowanie odpowiedzi modelu:
-    - mediumDescription: wymagany (z fallbacku jeśli brak),
-    - notes: czyszczone,
-    - examples: przepuszczone 1:1.
-    """
     if not raw or not isinstance(raw, dict):
         return None
 
-    try:
-        md = (
-            raw.get("mediumDescription")
-            or raw.get("description")
-            or raw.get("summary")
-            or ""
-        )
-        md = str(md).strip()
-        if not md:
-            md = _fallback_medium_from_ir(payload).strip()
-        if not md:
-            return None
+    md = str(raw.get("mediumDescription") or "").strip()
+    if not md:
+        return None  # żadnych fallbacków
 
-        notes = _sanitize_notes(raw.get("notes"))
+    notes = _sanitize_notes(raw.get("notes"))
+    ex_raw = raw.get("examples")
+    examples = ex_raw if isinstance(ex_raw, dict) else None
 
-        ex_raw = raw.get("examples")
-        examples = ex_raw if isinstance(ex_raw, dict) else None
+    return DescribeOut(
+        mediumDescription=md,
+        notes=notes or [],
+        examples=examples,
+        paramDocs=[],   # uzupełnimy w endpointzie (bez fallbacków treści)
+        returnDoc=""
+    )
 
-        return DescribeOut(
-            mediumDescription=md,
-            notes=notes or [],
-            examples=examples,
-            paramDocs=[],
-            returnDoc=""
-        )
-    except ValidationError as ve:
-        if NLP_DEBUG:
-            print("[ai-validate] error:", ve)
-        return None
-
-
-# =========================
 #   FASTAPI
-# =========================
-
 app = FastAPI(title="NLP Describe Service (Ollama)", version="3.0.0")
-
-
 @app.get("/healthz")
 def healthz():
     return {
         "status": "ok",
-        "mode": NLP_MODE,
         "ollama": {
             "base_url": OLLAMA_BASE_URL,
             "model": OLLAMA_MODEL,
@@ -527,21 +311,19 @@ def healthz():
         "debug": NLP_DEBUG,
     }
 
-
 @app.post("/describe", response_model=DescribeOut)
 async def describe(
     payload: DescribeIn,
     request: Request,
-    mode: str = Query("ollama", pattern="^(plain|rule|ollama)$"),
     audience: str = Query("beginner", pattern="^(beginner|advanced)$"),
 ):
     if NLP_DEBUG:
         who = request.client.host if request.client else "?"
         print(
-            f"[describe] from={who} mode={mode} "
+            f"[describe] from={who} "
             f"symbol={getattr(payload, 'symbol', '?')} audience={audience}"
         )
-    # ollama → zawsze z dopiskiem, że ma zwrócić czysty JSON wg schematu
+
     prompt = build_prompt(payload, audience=audience)
     prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
 
@@ -552,47 +334,12 @@ async def describe(
         doc.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
         return doc
 
-    # ostateczny fallback – zawsze coś zwróci
-    rb = _rule_based(payload)
-    rb.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
-    return rb
+    # jeśli model nic nie zwrócił – zwróć 502 lub 422 (inaczej FastAPI krzyknie 500 za brak return)
+    from fastapi import HTTPException
+    raise HTTPException(status_code=502, detail="Model nie zwrócił poprawnego JSON-u")
 
+    
 
-
-@app.post("/project-summary", response_model=ProjectSummaryOut)
-async def project_summary(
-    payload: ProjectSummaryIn,
-    request: Request,
-):
-    if NLP_DEBUG:
-        who = request.client.host if request.client else "?"
-        print(
-            f"[project-summary] from={who} "
-            f"project={payload.projectName} eps={len(payload.endpoints or [])}"
-        )
-
-    prompt = build_project_summary_prompt(payload)
-    raw = await call_ollama(prompt)
-
-    summary_text = ""
-    if isinstance(raw, dict):
-        summary_text = str(raw.get("summary") or "").strip()
-
-    if not summary_text:
-        eps = payload.endpoints or []
-        unique_paths = {f"{e.method} {e.path}" for e in eps}
-        if unique_paths:
-            summary_text = (
-                f"To API udostępnia zestaw endpointów do obsługi danych aplikacji "
-                f"{payload.projectName}. Pozwala pobierać, tworzyć, aktualizować "
-                f"i usuwać kluczowe zasoby domenowe w spójny i przewidywalny sposób."
-            )
-        else:
-            summary_text = (
-                f"To API udostępnia endpointy do obsługi danych aplikacji {payload.projectName}."
-            )
-
-    return ProjectSummaryOut(summary=summary_text)
 
 async def call_ollama_raw(prompt: str) -> str:
     """
@@ -647,8 +394,6 @@ async def nlp_output_preview(
         "prompt": prompt,
         "raw": raw,
     }
-
-
 
 
 if __name__ == "__main__":
