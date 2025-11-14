@@ -249,7 +249,6 @@ function UploadBox({
         tick = null;
       }
     };
-
     const paintLoading = () => {
       if (!newTab) return;
       newTab.document.open();
@@ -354,6 +353,61 @@ function UploadBox({
       parentStopTimer();
     }
   };
+
+
+  const showYamlWeb = async () => {
+    if (!res?.id) return;
+
+    const params = new URLSearchParams();
+    params.set("level", level as string);
+
+    // Backend zwróci text/yaml inline → otwieramy bezpośrednio w nowej karcie
+    const url = `/api/projects/${res.id}/docs/yaml?${params.toString()}`;
+    window.open(url, "_blank");
+  };
+
+  const downloadYamlFile = async () => {
+    if (!res?.id) return;
+
+    parentSetStatus("generuję YAML…");
+    parentStartTimer();
+
+    try {
+      const params = new URLSearchParams();
+      params.set("level", level as string);
+
+      const r = await fetch(
+        `/api/projects/${res.id}/docs/yaml/download?${params.toString()}`,
+        { method: "GET" }
+      );
+
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        parentSetStatus(`błąd generowania YAML: ${r.status}`);
+        alert(`Błąd generowania YAML: ${r.status} ${r.statusText}\n${text}`);
+        return;
+      }
+
+      const blob = await r.blob();
+      const filename = filenameFromCD(r, "openapi.yaml");
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      parentSetStatus("YAML pobrany ✓");
+    } catch (e) {
+      parentSetStatus(`błąd sieci podczas generowania YAML: ${String(e)}`);
+    } finally {
+      parentStopTimer();
+    }
+  };
+
 
   const loadNlpInput = async () => {
     if (!res?.id) return;
@@ -542,6 +596,13 @@ function UploadBox({
             </button>
             <button onClick={loadNlpInput} disabled={!res?.id}>
               Pobierz dane wejściowe dla modelu
+            </button>
+
+             <button onClick={showYamlWeb} disabled={!res?.id}>
+              Podgląd YAML
+            </button>
+            <button onClick={downloadYamlFile} disabled={!res?.id}>
+              Pobierz YAML
             </button>
           </div>
 

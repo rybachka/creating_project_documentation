@@ -534,7 +534,6 @@ async def describe(
     request: Request,
     mode: str = Query("ollama", pattern="^(plain|rule|ollama)$"),
     audience: str = Query("beginner", pattern="^(beginner|advanced)$"),
-    strict: bool = Query(True),
 ):
     if NLP_DEBUG:
         who = request.client.host if request.client else "?"
@@ -542,37 +541,12 @@ async def describe(
             f"[describe] from={who} mode={mode} "
             f"symbol={getattr(payload, 'symbol', '?')} audience={audience}"
         )
-
-    # plain → tylko paramDocs, bez AI
-    if mode == "plain":
-        return DescribeOut(
-            mediumDescription="",
-            paramDocs=_build_param_docs(getattr(payload, "params", []) or []),
-            returnDoc=""
-        )
-
-    # rule → deterministyczny opis bez LLM
-    if mode == "rule":
-        rb = _rule_based(payload)
-        rb.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
-        return rb
-
-    # ollama → próbujemy AI, w razie czego fallback na reguły
-
+    # ollama → zawsze z dopiskiem, że ma zwrócić czysty JSON wg schematu
     prompt = build_prompt(payload, audience=audience)
-    if strict:
-        prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
+    prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
 
     raw = await call_ollama(prompt)
     doc = _validate_ai_doc(raw, payload)
-
-    # jeśli strict parsing padł → jedno podejście bez dopisku strict
-    if not doc and strict:
-        if NLP_DEBUG:
-            print("[describe] strict parsing failed, retrying with non-strict prompt")
-        prompt2 = build_prompt(payload, audience=audience)
-        raw2 = await call_ollama(prompt2)
-        doc = _validate_ai_doc(raw2, payload)
 
     if doc:
         doc.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
@@ -582,6 +556,7 @@ async def describe(
     rb = _rule_based(payload)
     rb.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
     return rb
+
 
 
 @app.post("/project-summary", response_model=ProjectSummaryOut)
@@ -650,7 +625,6 @@ async def nlp_output_preview(
     payload: DescribeIn,
     request: Request,
     audience: str = Query("beginner", pattern="^(beginner|advanced)$"),
-    strict: bool = Query(True),
 ):
     """
     Endpoint debugowy.
@@ -665,8 +639,7 @@ async def nlp_output_preview(
         )
 
     prompt = build_prompt(payload, audience=audience)
-    if strict:
-        prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
+    prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
 
     raw = await call_ollama_raw(prompt)
 
@@ -674,6 +647,7 @@ async def nlp_output_preview(
         "prompt": prompt,
         "raw": raw,
     }
+
 
 
 
