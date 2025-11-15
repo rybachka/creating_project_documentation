@@ -11,6 +11,7 @@ import io.swagger.v3.oas.models.responses.ApiResponse;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.parser.OpenAPIV3Parser;
 import org.springframework.stereotype.Service;
+import io.swagger.v3.oas.models.security.SecurityScheme;
 
 import java.io.OutputStream;
 import java.nio.file.Files;
@@ -175,6 +176,8 @@ public class PdfDocService {
           .append("</div>");
         sb.append("</header>");
 
+        sb.append(renderSecurityOverviewSection(api));
+
         // Globalna macierz błędów
         renderGlobalErrorsSection(sb);
 
@@ -227,20 +230,60 @@ public class PdfDocService {
             return "";
         }
 
-        return """
-        <section>
-        <h2>Podstawowe pojęcia</h2>
-        <ul>
-            <li><b>Endpoint</b> – konkretny adres URL, pod który wysyłasz żądanie HTTP.</li>
-            <li><b>Metoda HTTP</b> (GET, POST, PUT, DELETE) – określa, czy pobierasz, tworzysz, zmieniasz lub usuwasz dane.</li>
-            <li><b>Token JWT</b> – „bilet” potwierdzający zalogowanie użytkownika.</li>
-            <li><b>Authorization: Bearer &lt;token&gt;</b> – nagłówek z tokenem wymagany przez większość chronionych endpointów.</li>
-            <li><b>Paginacja</b> – podział wyników na strony (page/size/sort), aby nie pobierać wszystkich danych naraz.</li>
-        </ul>
-        </section>
-        """;
-    }
+        boolean bearer = hasBearerAuth(api);
+        boolean basic  = hasBasicAuth(api);
+        boolean oauth2 = hasOAuth2(api);
 
+        StringBuilder sb = new StringBuilder();
+        sb.append("<section>")
+        .append("<h2>Podstawowe pojęcia</h2>")
+        .append("<ul>")
+        .append("<li><b>Endpoint</b> – konkretny adres URL, pod który wysyłasz żądanie HTTP.</li>")
+        .append("<li><b>Metoda HTTP</b> (GET, POST, PUT, DELETE) – określa, czy pobierasz, tworzysz, zmieniasz lub usuwasz dane.</li>");
+
+        if (bearer) {
+            sb.append("<li><b>Token JWT</b> – „bilet” potwierdzający zalogowanie użytkownika.</li>")
+            .append("<li><b>Authorization: Bearer &lt;token&gt;</b> – nagłówek z tokenem wymagany przez większość chronionych endpointów.</li>");
+        }
+        if (basic) {
+            sb.append("<li><b>HTTP Basic</b> – logowanie za pomocą loginu i hasła przesyłanych w nagłówku Authorization.</li>");
+        }
+        if (oauth2) {
+            sb.append("<li><b>OAuth2</b> – standard autoryzacji używany m.in. przez zewnętrznych dostawców tożsamości (np. Google, Keycloak).</li>");
+        }
+
+        sb.append("<li><b>Paginacja</b> – podział wyników na strony (page/size/sort), aby nie pobierać wszystkich danych naraz.</li>")
+        .append("</ul>")
+        .append("</section>");
+
+        return sb.toString();
+    }
+    private boolean hasBearerAuth(OpenAPI api) {
+        Components comps = api.getComponents();
+        if (comps == null || comps.getSecuritySchemes() == null) return false;
+        return comps.getSecuritySchemes().values().stream()
+                .anyMatch(s ->
+                        s != null &&
+                        s.getType() == SecurityScheme.Type.HTTP &&
+                        "bearer".equalsIgnoreCase(nz(s.getScheme()))
+                );
+    }
+    private boolean hasBasicAuth(OpenAPI api) {
+        Components comps = api.getComponents();
+        if (comps == null || comps.getSecuritySchemes() == null) return false;
+        return comps.getSecuritySchemes().values().stream()
+                .anyMatch(s ->
+                        s != null &&
+                        s.getType() == SecurityScheme.Type.HTTP &&
+                        "basic".equalsIgnoreCase(nz(s.getScheme()))
+                );
+    }
+    private boolean hasOAuth2(OpenAPI api) {
+        Components comps = api.getComponents();
+        if (comps == null || comps.getSecuritySchemes() == null) return false;
+        return comps.getSecuritySchemes().values().stream()
+                .anyMatch(s -> s != null && s.getType() == SecurityScheme.Type.OAUTH2);
+    }
     //  RENDER ENDPOINT / OPERATION
     private void renderOp(StringBuilder sb,
                           OpenAPI api,
@@ -440,41 +483,248 @@ public class PdfDocService {
         sb.append("</div>");
     }
 
-    //Wylicza etykietę security dla operacji: lokalne -> globalne -> public.
+    //Wylicza etykietę security dla operacji: lokalne -> globalne.
+    //Uwzględnia fakt, że security: [] na poziomie operacji oznacza PUBLIC.
     private String computeOperationSecurityLabel(OpenAPI api, Operation op) {
+        if (op == null || api == null) {
+            return "";
+        }
+
+        // 0. Najpierw honorujemy x-security z YAML
+        if (op.getExtensions() != null) {
+            Object xs = op.getExtensions().get("x-security");
+            if (xs != null) {
+                String v = xs.toString().trim().toLowerCase(Locale.ROOT);
+                if ("public".equals(v)) {
+                    // Wymuszenie, że to endpoint publiczny – ignorujemy globalne Bearer
+                    return "publiczny (brak uwierzytelniania)";
+                }
+                // "secured" po prostu przepuszczamy dalej, żeby policzyć konkretny schemat (Bearer / Basic / itd.)
+            }
+        }
+
         // 1. Per-operation security
         if (op.getSecurity() != null) {
-            // Pusta lista = "nic nie wiadomo" → nie pokazujemy
+            // jeśli parser jednak kiedyś zachowa [] – to nadal działa
             if (op.getSecurity().isEmpty()) {
-                return "";
+                return "publiczny (brak uwierzytelniania)";
             }
-            Set<String> names = new LinkedHashSet<>();
+
+            Set<String> schemeNames = new LinkedHashSet<>();
             for (SecurityRequirement r : op.getSecurity()) {
-                if (r != null) names.addAll(r.keySet());
+                if (r != null) {
+                    schemeNames.addAll(r.keySet());
+                }
             }
-            if (!names.isEmpty()) {
-                return String.join(", ", names);
+
+            if (!schemeNames.isEmpty()) {
+                return buildSecurityLabel(api, schemeNames);
             }
-            // coś jest, ale bez nazw – nie zgadujemy
-            return "";
+
+            return "zabezpieczony (wymaga uwierzytelniania)";
         }
 
-        // 2. Global security
+        // 2. Global security – fallback
         List<SecurityRequirement> global = api.getSecurity();
         if (global != null && !global.isEmpty()) {
-            Set<String> names = new LinkedHashSet<>();
+            Set<String> schemeNames = new LinkedHashSet<>();
             for (SecurityRequirement r : global) {
-                if (r != null) names.addAll(r.keySet());
+                if (r != null) {
+                    schemeNames.addAll(r.keySet());
+                }
             }
-            if (!names.isEmpty()) {
-                return String.join(", ", names);
+
+            if (!schemeNames.isEmpty()) {
+                return buildSecurityLabel(api, schemeNames);
             }
-            return "";
+
+            return "zabezpieczony (wymaga uwierzytelniania)";
         }
 
-        // 3. Brak jakichkolwiek informacji o security
+        // 3. Brak jakiegokolwiek security
         return "";
     }
+    // Mapuje nazwy schematów security na przyjazne etykiety na podstawie components.securitySchemes.
+    private String buildSecurityLabel(OpenAPI api, Set<String> names) {
+        Components comps = api.getComponents();
+        Map<String, SecurityScheme> schemes =
+                (comps != null) ? comps.getSecuritySchemes() : null;
+
+        List<String> labels = new ArrayList<>();
+
+        for (String name : names) {
+            SecurityScheme s = (schemes != null) ? schemes.get(name) : null;
+            if (s == null) {
+                // Nie znamy definicji – pokaż czystą nazwę z OpenAPI
+                labels.add(name);
+                continue;
+            }
+
+            SecurityScheme.Type type = s.getType();
+            if (type == null) {
+                labels.add(name);
+                continue;
+            }
+
+            switch (type) {
+                case HTTP -> {
+                    String scheme = nz(s.getScheme()).toLowerCase(Locale.ROOT);
+                    if ("bearer".equals(scheme)) {
+                        String fmt = nz(s.getBearerFormat());
+                        if (!fmt.isBlank()) {
+                            labels.add("Bearer " + fmt);
+                        } else {
+                            labels.add("Bearer token");
+                        }
+                    } else if ("basic".equals(scheme)) {
+                        labels.add("HTTP Basic");
+                    } else {
+                        labels.add("HTTP " + scheme);
+                    }
+                }
+                case APIKEY -> {
+                    String in = (s.getIn() != null) ? s.getIn().toString().toLowerCase(Locale.ROOT) : "";
+                    String n = nz(s.getName());
+                    if (!in.isBlank() || !n.isBlank()) {
+                        labels.add("API Key" + (n.isBlank() ? "" : " (" + in + " " + n + ")"));
+                    } else {
+                        labels.add("API Key");
+                    }
+                }
+                case OAUTH2 -> labels.add("OAuth2");
+                case OPENIDCONNECT -> labels.add("OpenID Connect");
+                default -> labels.add(name);
+            }
+        }
+
+        return String.join(", ", labels);
+    }
+    // Sekcja podsumowująca security na początku PDF
+    private String renderSecurityOverviewSection(OpenAPI api) {
+        Components comps = api.getComponents();
+        Map<String, SecurityScheme> schemes =
+                (comps != null) ? comps.getSecuritySchemes() : null;
+
+        boolean hasSchemes = schemes != null && !schemes.isEmpty();
+        List<SecurityRequirement> global = api.getSecurity();
+        boolean hasGlobalSecurity = global != null && !global.isEmpty();
+
+        // Sprawdź, czy mamy jakieś endpointy oznaczone jako publiczne
+        boolean hasPublicEndpoints = false;
+        if (api.getPaths() != null) {
+            outer:
+            for (var entry : api.getPaths().entrySet()) {
+                PathItem pi = entry.getValue();
+                if (pi == null) continue;
+                for (Operation op : Arrays.asList(
+                        pi.getGet(), pi.getPost(), pi.getPut(), pi.getPatch(), pi.getDelete()
+                )) {
+                    if (op == null) continue;
+                    // x-security: public
+                    if (op.getExtensions() != null) {
+                        Object xs = op.getExtensions().get("x-security");
+                        if (xs != null && "public".equalsIgnoreCase(xs.toString().trim())) {
+                            hasPublicEndpoints = true;
+                            break outer;
+                        }
+                    }
+                    // security: [] – parser może to zjeść, ale jeśli nie, też uwzględniamy
+                    if (op.getSecurity() != null && op.getSecurity().isEmpty()) {
+                        hasPublicEndpoints = true;
+                        break outer;
+                    }
+                }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("<section class='security'>")
+          .append("<strong>Podsumowanie bezpieczeństwa (security)</strong>");
+
+        if (!hasSchemes && !hasGlobalSecurity) {
+            sb.append("<div>W tym projekcie <b>nie wykryto zdefiniowanych mechanizmów uwierzytelniania</b> w OpenAPI.</div>")
+              .append("<div>W praktyce oznacza to, że wszystkie endpointy są domyślnie publiczne, ")
+              .append("chyba że w kodzie lub w rozszerzeniach (np. <code>x-security</code>) wskazano inaczej.</div>");
+            sb.append("</section>");
+            return sb.toString();
+        }
+
+        if (hasSchemes) {
+            sb.append("<div>W tym projekcie wykryto następujące mechanizmy uwierzytelniania:</div>")
+              .append("<ul>");
+
+            for (Map.Entry<String, SecurityScheme> e : schemes.entrySet()) {
+                String name = e.getKey();
+                SecurityScheme s = e.getValue();
+                if (s == null) continue;
+
+                SecurityScheme.Type type = s.getType();
+                String label;
+
+                if (type == SecurityScheme.Type.HTTP) {
+                    String scheme = nz(s.getScheme()).toLowerCase(Locale.ROOT);
+                    if ("bearer".equals(scheme)) {
+                        String fmt = nz(s.getBearerFormat());
+                        if (!fmt.isBlank()) {
+                            label = "Bearer " + fmt + " (nagłówek <code>Authorization: Bearer &lt;token&gt;</code>)";
+                        } else {
+                            label = "Bearer token (nagłówek <code>Authorization: Bearer &lt;token&gt;</code>)";
+                        }
+                    } else if ("basic".equals(scheme)) {
+                        label = "HTTP Basic (login i hasło w nagłówku <code>Authorization</code>)";
+                    } else {
+                        label = "HTTP " + scheme;
+                    }
+                } else if (type == SecurityScheme.Type.APIKEY) {
+                    String in = (s.getIn() != null) ? s.getIn().toString().toLowerCase(Locale.ROOT) : "";
+                    String n = nz(s.getName());
+                    if (!in.isBlank() || !n.isBlank()) {
+                        label = "API Key (" + in + (n.isBlank() ? "" : ", nazwa: <code>" + esc(n) + "</code>") + ")";
+                    } else {
+                        label = "API Key";
+                    }
+                } else if (type == SecurityScheme.Type.OAUTH2) {
+                    label = "OAuth2 (zewnętrzny dostawca tożsamości, np. Keycloak / Google)";
+                } else if (type == SecurityScheme.Type.OPENIDCONNECT) {
+                    label = "OpenID Connect";
+                } else {
+                    label = name;
+                }
+
+                sb.append("<li>")
+                  .append("<code>").append(esc(name)).append("</code>: ")
+                  .append(label)
+                  .append("</li>");
+            }
+
+            sb.append("</ul>");
+        } else {
+            sb.append("<div>W projekcie nie zdefiniowano konkretnych schematów security w sekcji <code>components.securitySchemes</code>, ")
+              .append("ale istnieje globalna konfiguracja <code>security</code> w OpenAPI.</div>");
+        }
+
+        if (hasGlobalSecurity) {
+            sb.append("<div style='margin-top:4px'>")
+              .append("Globalna sekcja <code>security</code> jest ustawiona – oznacza to, że ")
+              .append("<b>wszystkie endpointy domyślnie wymagają uwierzytelniania</b>, ")
+              .append("chyba że dany endpoint nadpisze to przez <code>security: []</code> ")
+              .append("lub <code>x-security: public</code>.</div>");
+        } else {
+            sb.append("<div style='margin-top:4px'>")
+              .append("Globalna sekcja <code>security</code> nie jest ustawiona – ")
+              .append("wymóg logowania musi być definiowany osobno na poziomie poszczególnych operacji (endpointów).</div>");
+        }
+
+        if (hasPublicEndpoints) {
+            sb.append("<div style='margin-top:4px'>Wykryto również endpointy oznaczone jako publiczne ")
+              .append("(np. z <code>x-security: public</code> lub <code>security: []</code>) – ")
+              .append("w PDF zobaczysz przy nich etykietę „publiczny (brak uwierzytelniania)”.</div>");
+        }
+
+        sb.append("</section>");
+        return sb.toString();
+    }
+
 
     //  COMPONENTS / SCHEMAS
     private void renderComponents(StringBuilder sb, Components components) {

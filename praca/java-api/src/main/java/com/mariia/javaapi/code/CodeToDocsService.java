@@ -2,6 +2,7 @@ package com.mariia.javaapi.code;
 
 import com.mariia.javaapi.code.ir.EndpointIR;
 import com.mariia.javaapi.code.ir.ParamIR;
+import com.mariia.javaapi.code.JavaSecurityParser;
 import io.swagger.v3.core.util.Yaml;
 import io.swagger.v3.oas.models.Components;
 import io.swagger.v3.oas.models.OpenAPI;
@@ -20,6 +21,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.util.AntPathMatcher;
 
 import java.math.BigDecimal;
 import java.nio.file.*;
@@ -34,6 +36,7 @@ public class CodeToDocsService {
 
     private final WebClient nlp;
     private final Duration timeout = Duration.ofSeconds(600);
+    private static final AntPathMatcher PATH_MATCHER = new AntPathMatcher();
 
     public CodeToDocsService(@Qualifier("nlpClient") WebClient nlp) {
         this.nlp = nlp;
@@ -109,6 +112,14 @@ public class CodeToDocsService {
             os.setRequired(new ArrayList<>(req));
         }
 
+        JavaSecurityParser securityParser = new JavaSecurityParser();
+        JavaSecurityParser.SecurityModel securityModel = null;
+        try {
+            securityModel = securityParser.parseSecurity(projectPath);
+        } catch (Exception e) {
+            System.err.println("[SEC] Błąd parsowania security: " + e.getMessage());
+        }
+        applySecurityFromModel(api, securityModel);
         // Endpointy
         for (EndpointIR ep : eps) {
 
@@ -121,21 +132,20 @@ public class CodeToDocsService {
             io.swagger.v3.oas.models.Operation op = new io.swagger.v3.oas.models.Operation();
             op.setOperationId(ep.operationId);
 
-            // SECURITY per operacja
-            // Map<String, Object> opExt = new LinkedHashMap<>();
-            // if (isPublicEndpoint(ep)) {
-            //     op.setSecurity(Collections.emptyList());
-            //     opExt.put("x-security", "public");
-            // } else {
-            //     opExt.put("x-security", "bearerAuth");
-            // }
-            // opExt.put("x-user-level", audience);
-            // op.setExtensions(opExt);
-
-            // Extensions per operation – only user level, no guessed security
             Map<String, Object> opExt = new LinkedHashMap<>();
-            opExt.put("x-user-level", audience);
-            op.setExtensions(opExt);
+
+            boolean isPublic = isPublicEndpoint(ep, securityModel);
+            if (isPublic) {
+                  // endpoint naprawdę jest publiczny wg Spring Security
+                 op.setSecurity(Collections.emptyList());
+                 opExt.put("x-security", "public");
+             } else {
+                 opExt.put("x-security", "secured");
+                 // autoryzacja jest z globalnego api.getSecurity()
+            }
+
+                opExt.put("x-user-level", audience);
+                op.setExtensions(opExt);
 
 
             // NLP /describe – zawsze AI (ollama)
@@ -144,6 +154,7 @@ public class CodeToDocsService {
             applyParamsAndRequestBody(op, ep);//"Parametry"
             applyAiDescriptionsAndExamples(op, ep, nlpRes);
             ensureDefaultResponses(op, ep, nlpRes);////status 200/201 w tabeli opis-ok 
+            
             //attachStandardErrors(op, isWriteMethod(ep.http));//wszystkie odpowiedzi errors od 400 do 404
 
             // request/response/examples fallback
@@ -1027,53 +1038,73 @@ public class CodeToDocsService {
     }
 
 //----------------BEDZIE ZMIENIANE--------------------
-    //SECURITY SCHEMA
-    //definiuje jak wygląda bearer auth (komponent)
-    private void ensureBearerAuth(OpenAPI api) {
+    private void applySecurityFromModel(OpenAPI api,
+                                        JavaSecurityParser.SecurityModel model) {
+        if (model == null) return;
+
         Components comps = api.getComponents();
         if (comps.getSecuritySchemes() == null) {
             comps.setSecuritySchemes(new LinkedHashMap<>());
         }
-        if (!comps.getSecuritySchemes().containsKey("bearerAuth")) {
+
+        List<SecurityRequirement> global = new ArrayList<>();
+
+        JavaSecurityParser.AuthMechanism mech = model.authMechanism();
+        if (mech == JavaSecurityParser.AuthMechanism.BEARER_JWT) {
             SecurityScheme bearer = new SecurityScheme()
                     .type(SecurityScheme.Type.HTTP)
                     .scheme("bearer")
                     .bearerFormat("JWT")
                     .description("JWT bearer token. Nagłówek: Authorization: Bearer <token>.");
             comps.addSecuritySchemes("bearerAuth", bearer);
+            global.add(new SecurityRequirement().addList("bearerAuth", Collections.emptyList()));
+        } else if (mech == JavaSecurityParser.AuthMechanism.BASIC) {
+            SecurityScheme basic = new SecurityScheme()
+                    .type(SecurityScheme.Type.HTTP)
+                    .scheme("basic")
+                    .description("HTTP Basic authentication.");
+            comps.addSecuritySchemes("basicAuth", basic);
+            global.add(new SecurityRequirement().addList("basicAuth", Collections.emptyList()));
+        } else if (mech == JavaSecurityParser.AuthMechanism.SESSION) {
+            // Możesz tu dodać np. cookieAuth, jeśli chcesz.
         }
-    }
-    //mówi: całe API wymaga bearerAuth
-    private void applyGlobalSecurity(OpenAPI api) {
-        List<SecurityRequirement> sec = api.getSecurity();
-        if (sec == null) sec = new ArrayList<>();
-        boolean hasBearer = sec.stream().anyMatch(sr -> sr != null && sr.containsKey("bearerAuth"));
-        if (!hasBearer) {
-            sec.add(new SecurityRequirement().addList("bearerAuth", Collections.emptyList()));
-        }
-        api.setSecurity(sec);
+
+        api.setSecurity(global.isEmpty() ? null : global);
     }
 
-    //to heurystyka. Ona nie wie naprawdę, co robi Spring Security, tylko zgaduje po nazwach, ścieżkach i opisach.
-    private boolean isPublicEndpoint(EndpointIR ep) {
-        if (ep == null) return false;
-        String p = nz(ep.path).toLowerCase(Locale.ROOT);
-        String h = nz(ep.http).toUpperCase(Locale.ROOT);
-        String opId = nz(ep.operationId).toLowerCase(Locale.ROOT);
-        String desc = nz(ep.description).toLowerCase(Locale.ROOT);
-        String jdoc = nz(ep.javadoc).toLowerCase(Locale.ROOT);
+    private boolean isPublicEndpoint(EndpointIR ep,
+                                    JavaSecurityParser.SecurityModel model) {
+        if (model == null || model.rules() == null) return false;
 
-        if (p.startsWith("/auth") || p.startsWith("/public")) return true;
-        if (h.equals("GET") && (p.startsWith("/docs") || p.startsWith("/health") || p.startsWith("/actuator")))
-            return true;
-        if (opId.contains("login") || opId.contains("register") || opId.contains("token") || opId.contains("refresh"))
-            return true;
-        if (desc.contains("login") || desc.contains("register") || desc.contains("token") || desc.contains("refresh"))
-            return true;
-        if (jdoc.contains("@public") || jdoc.contains("[public]")) return true;
+        String method = nz(String.valueOf(ep.http)).toUpperCase(Locale.ROOT);
+        String path   = nz(ep.path);
+
+        // Najpierw reguły z dopasowaną metodą i wzorcem
+        for (JavaSecurityParser.SecurityRule r : model.rules()) {
+            if (!"permitAll".equals(r.ruleType())) continue;
+
+            if (r.httpMethod() != null
+                    && !r.httpMethod().equalsIgnoreCase(method)) {
+                continue;
+            }
+            if (PATH_MATCHER.match(r.pattern(), path)) {
+                return true;
+            }
+        }
+
+        // Potem reguły bez metody (tylko wzorzec)
+        for (JavaSecurityParser.SecurityRule r : model.rules()) {
+            if (!"permitAll".equals(r.ruleType())) continue;
+            if (r.httpMethod() != null) continue;
+
+            if (PATH_MATCHER.match(r.pattern(), path)) {
+                return true;
+            }
+        }
 
         return false;
     }
+
 
     // API ERROR
     private void ensureApiErrorComponent(OpenAPI api) {
