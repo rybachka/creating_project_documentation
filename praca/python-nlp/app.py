@@ -85,73 +85,92 @@ def build_prompt_beginner(payload: DescribeIn) -> str:
         or ""
     )
 
+    returns_dict = None
+    if getattr(payload, "returns", None):
+        try:
+            returns_dict = payload.returns.dict()
+        except Exception:
+            returns_dict = None
+
+    success_status = _guess_success_status(method, returns_dict)
+
     return f"""
-Jesteś asystentem, który pisze dokumentację REST API dla JUNIORA.
+You are an assistant that writes REST API documentation for a **junior developer**.
 
-Użytkownik widzi jeden endpoint na raz.
+The user sees exactly one endpoint at a time.
 
-Twoja odpowiedź MUSI być WYŁĄCZNIE poprawnym JSON-em (bez żadnego tekstu przed ani po) dokładnie wg schematu:
+Your reply MUST be **ONLY** valid JSON (no additional text before or after), and it MUST strictly follow this schema:
 
 {{
-  "mediumDescription": "…",
-  "notes": ["…"],
+  "mediumDescription": "...",
+  "notes": ["..."],
   "examples": {{
     "requests": ["curl ..."],
     "response": {{
-      "status": 200,
+      "status": {success_status},
       "body": {{}}
     }}
   }}
 }}
 
-ZASADY DLA POZIOMU BEGINNER:
+GUIDELINES FOR THE BEGINNER LEVEL:
 
-1. mediumDescription:
-   - 1–2 zdania po polsku.
-   - Wyjaśnij CO robi endpoint i w JAKIM prostym scenariuszu biznesowym go używamy.
-   - Użyj nazw ze ścieżki/metody, np. "/api/orders/{{id}}" → "Pobiera szczegóły zamówienia o podanym ID."
-   - Zero pustych formułek typu "Pobiera zasób", "Zwraca obiekt".
+1. mediumDescription
+   - 1–2 sentences in **Polish**.
+   - Explain WHAT this endpoint does and in which simple business scenario it is used.
+   - Use names from the method and path. For example:
+     - GET /api/orders/{{id}} → "Pobiera szczegóły zamówienia o podanym ID."
+   - Avoid empty phrases like "Pobiera zasób" or "Zwraca obiekt". Be concrete.
 
-2. Autoryzacja:
-   - Jeśli z danych wynika, że endpoint wymaga logowania → w mediumDescription wspomnij o nagłówku:
-     "Wymaga nagłówka Authorization: Bearer <token>."
-   - Jeśli wygląda na publiczny (np. login/rejestracja/health/docs) → NIE pisz o bearer.
+2. Authorization
+   - The input IR does **not** contain any information about authentication or security.
+   - You MUST NOT mention Authorization headers, tokens, JWT, login, sessions, roles, or permissions.
+   - Simply skip the topic of security in this level.
 
-3. notes:
-   - 0–3 krótkie punkty.
-   - Jeśli pasuje, użyj ich do prostego wyjaśnienia kluczowych kodów odpowiedzi:
-     - 200 lub 201 – gdy wszystko poszło OK,
-     - 400 – gdy dane wejściowe są niepoprawne,
-     - 401 lub 403 – gdy brakuje uprawnień lub tokenu,
-     - 404 – gdy zasób nie istnieje.
-   - Pisz po ludzku, bez żargonu.
+3. notes
+   - 0–3 short bullet points (still plain strings in JSON).
+   - Use them to briefly mention typical outcomes and basic error codes if helpful, for example:
+     - {success_status} – when the operation completes successfully,
+     - 400 – when the input data is invalid,
+     - 404 – when the resource with the given ID does not exist.
+   - Keep it simple and user-friendly, avoid heavy technical jargon.
+   - Do NOT mention 401 or 403, because we do not have security information.
 
-4. examples.requests:
-   - DOKŁADNIE 1 prosty przykład curl dla TEGO endpointu.
-   - Użyj metody {method} i ścieżki {path}.
-   - Pokaż tylko to, co potrzebne: URL, ewentualnie Authorization Bearer i Content-Type przy body.
-   - Żadnych dziwnych nagłówków technicznych, brak placeholderów typu "<string>".
+4. examples.requests
+   - Provide **exactly one** simple curl example for **this** endpoint.
+   - You MUST use exactly:
+     - HTTP method: {method}
+     - Path: {path}
+   - Always use the base URL placeholder: "{{{{BASE_URL}}}}". For example:
+     - `curl -X {method} "{{{{BASE_URL}}}}{path}" ...`
+   - You MUST NOT use any other domains or paths (even if you see them in notes or implNotes).
+   - If the endpoint has a request body (requestBody or a parameter with in="body"):
+     - add the header `Content-Type: application/json`,
+     - include a very simple JSON body consistent with the IR.
+   - Do NOT add Authorization or any other technical headers.
 
-5. examples.response:
-   - Jedna przykładowa odpowiedź "szczęśliwej ścieżki":
-     - Dla GET zwykle status 200,
-     - Dla POST tworzących zasób zwykle 201,
-     - Dla DELETE lub gdy typ zwrotny to void → 204 i body = {{}}.
-   - body ma pokazywać strukturę na podstawie danych wejściowych, bez fantazji.
+5. examples.response
+   - Provide one example of a **happy-path** response.
+   - The `status` field MUST be exactly `{success_status}` for this endpoint.
+   - If the endpoint does not return a body (void type), set `body` to `{{}}`.
+   - If the IR suggests an object or a list, show a small, simple JSON example that matches the structure, but do not invent extra fields beyond what is implied by the IR.
 
-6. Ogólne:
-   - Nie dodawaj pól ani logiki spoza wejścia.
-   - Żadnego Markdowna. Tylko JSON.
+6. General rules
+   - Do NOT invent paths, fields, or parameters that are not present in the input IR.
+   - If you don’t know the exact structure of the response, you may say in Polish that the details are defined in the corresponding backend model (e.g. "Szczegółowa struktura odpowiedzi jest zdefiniowana w modelu po stronie backendu").
+   - Do NOT use Markdown.
+   - Output must be **only** the JSON object.
 
-DANE TECHNICZNE ENDPOINTU:
+TECHNICAL ENDPOINT DATA:
 - method: {method}
 - path: {path}
 - symbol: {symbol}
 - rawComment: {raw_comment}
 
-Na podstawie powyższego i IR poniżej wygeneruj WYŁĄCZNIE JSON:
+ENDPOINT IR (source data):
 {_common_context(payload)}
 """
+
 
 def build_prompt_advanced(payload: DescribeIn) -> str:
     method = getattr(payload, "method", "") or ""
@@ -163,58 +182,85 @@ def build_prompt_advanced(payload: DescribeIn) -> str:
         or ""
     )
 
-    return f"""
-Piszesz dokumentację REST API po polsku dla zaawansowanego backend developera.
+    returns_dict = None
+    if getattr(payload, "returns", None):
+        try:
+            returns_dict = payload.returns.dict()
+        except Exception:
+            returns_dict = None
 
-Twoja odpowiedź MUSI być WYŁĄCZNIE poprawnym JSON-em (bez żadnego tekstu przed ani po) dokładnie wg schematu:
+    success_status = _guess_success_status(method, returns_dict)
+
+    return f"""
+You write REST API documentation in **Polish** for an **advanced backend developer**.
+
+Your reply MUST be **ONLY** valid JSON (no additional text before or after) and MUST strictly follow this schema:
 
 {{
-  "mediumDescription": "…",
-  "notes": ["…"],
+  "mediumDescription": "...",
+  "notes": ["..."],
   "examples": {{
     "requests": ["curl ..."],
     "response": {{
-      "status": 200,
+      "status": {success_status},
       "body": {{}}
     }}
   }}
 }}
 
-WYTYCZNE DLA POZIOMU ADVANCED:
+GUIDELINES FOR THE ADVANCED LEVEL:
 
-1) mediumDescription:
-   - 2–4 zdania, konkretnie i technicznie.
-   - Opisz precyzyjnie cel operacji, strukturę danych (we/wy) oraz kluczowe kody odpowiedzi.
-   - Jeśli z IR wynika autoryzacja (bearer/JWT), zasygnalizuj to, ale bez „wymyślania”.
+1) mediumDescription
+   - 2–4 sentences, concise and technical, written in Polish.
+   - Precisely describe the purpose of the operation:
+     - which data it accepts (body/query/path),
+     - which data it returns, according to the IR (`returns`),
+     - what is the main success status code (here: {success_status}).
+   - Do NOT describe authentication mechanisms, because the IR does not contain security information.
 
-2) notes:
-   - 0–5 krótkich punktów technicznych (walidacje, edge-case’y, kluczowe błędy 4xx/5xx).
-   - Unikaj frazesów i ogólników.
+2) notes
+   - 0–5 short technical bullet points (still plain strings in JSON).
+   - Focus on:
+     - validation rules that can be reasonably inferred from parameter names/types,
+     - edge cases (missing resource, conflicts, invalid input),
+     - typical error codes such as: 400, 404, 409, 422, 500.
+   - Do NOT use 401 or 403, because we have no security data in the IR.
+   - Do not invent very detailed business rules that are not supported by the IR.
 
-3) examples.requests:
-   - DOKŁADNIE 1 przykład cURL dla tego endpointu.
-   - Użyj metody {method} i ścieżki {path}.
-   - Dodaj wyłącznie niezbędne nagłówki (np. Authorization: Bearer, Content-Type przy body).
-   - Zero placeholderów w stylu "<string>".
+3) examples.requests
+   - Provide **exactly one** curl example for this endpoint.
+   - You MUST use exactly:
+     - HTTP method: {method}
+     - Path: {path}
+   - Always use the base URL placeholder: "{{{{BASE_URL}}}}", e.g.:
+     - `curl -X {method} "{{{{BASE_URL}}}}{path}" ...`
+   - You MUST NOT use any other domain or path, even if it appears in notes, implNotes or comments.
+   - If there is a request body (requestBody or in="body" parameter):
+     - add `Content-Type: application/json`,
+     - construct a minimal JSON object that reflects the structure implied by the IR (if no field names are available, use generic placeholders like "field1", "field2").
 
-4) examples.response:
-   - Jedna „szczęśliwa ścieżka”:
-     - GET → 200; POST tworzący zasób → 201; DELETE/void → 204 i body = {{}}
-   - body ma odzwierciedlać strukturę wynikającą z IR (bez fantazji).
+4) examples.response
+   - Provide a single **happy-path** example.
+   - The `status` field MUST be exactly `{success_status}`.
+   - If the return type is void or there is no meaningful body, set `body` to `{{}}`.
+   - If the return type suggests an object or list, show a small, representative JSON example that matches the IR, without adding imaginary properties.
 
-5) Ogólne:
-   - Zero zgadywania pól/logiki spoza IR.
-   - Brak Markdown; tylko czysty JSON zgodny ze schematem.
+5) General rules
+   - Do NOT guess or invent new fields, paths, parameters, or nested structures beyond what is indicated in the IR.
+   - If the IR is incomplete, you may mention in Polish that the detailed structure is defined in the backend type referenced in `returns` (for example: "Szczegółowa struktura odpowiedzi jest zdefiniowana w typie X po stronie backendu").
+   - Do NOT use Markdown.
+   - Output must be exactly one JSON object following the schema above.
 
-DANE TECHNICZNE ENDPOINTU:
+TECHNICAL ENDPOINT DATA:
 - method: {method}
 - path: {path}
 - symbol: {symbol}
 - rawComment: {raw_comment}
 
-Na podstawie powyższego i IR poniżej wygeneruj WYŁĄCZNIE JSON:
+ENDPOINT IR (source data):
 {_common_context(payload)}
 """
+
 
 def build_prompt(payload: DescribeIn, audience: str = "beginner") -> str:
     lvl = (audience or "beginner").strip().lower()
@@ -290,6 +336,26 @@ def _validate_ai_doc(raw: Dict[str, Any], payload: DescribeIn) -> Optional[Descr
         returnDoc=""
     )
 
+def _guess_success_status(method: str, returns: Optional[Dict[str, Any]]) -> int:
+    method = (method or "").upper()
+    returns_type = (returns or {}).get("type") if isinstance(returns, dict) else None
+    returns_void = bool((returns or {}).get("void") if isinstance(returns, dict) else False)
+
+    # bardzo prosta heurystyka, możesz dopracować pod swój DescribeOut
+    if method == "GET":
+        return 200
+    if method == "POST":
+        # jeśli nic nie zwraca → 201 lub 204, ja bym na start dał 201
+        if returns_void or returns_type in (None, "", "void"):
+            return 201
+        return 200
+    if method in ("DELETE", "PATCH"):
+        if returns_void or returns_type in (None, "", "void"):
+            return 204
+        return 200
+    # fallback
+    return 200
+
 #   FASTAPI
 app = FastAPI(title="NLP Describe Service (Ollama)", version="3.0.0")
 @app.get("/healthz")
@@ -337,9 +403,6 @@ async def describe(
     # jeśli model nic nie zwrócił – zwróć 502 lub 422 (inaczej FastAPI krzyknie 500 za brak return)
     from fastapi import HTTPException
     raise HTTPException(status_code=502, detail="Model nie zwrócił poprawnego JSON-u")
-
-    
-
 
 async def call_ollama_raw(prompt: str) -> str:
     """

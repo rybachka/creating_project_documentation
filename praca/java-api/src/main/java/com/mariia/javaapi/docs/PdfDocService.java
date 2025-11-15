@@ -442,29 +442,39 @@ public class PdfDocService {
 
     //Wylicza etykietę security dla operacji: lokalne -> globalne -> public.
     private String computeOperationSecurityLabel(OpenAPI api, Operation op) {
+        // 1. Per-operation security
         if (op.getSecurity() != null) {
-            if (op.getSecurity().isEmpty()) return "Public (no auth)";
+            // Pusta lista = "nic nie wiadomo" → nie pokazujemy
+            if (op.getSecurity().isEmpty()) {
+                return "";
+            }
             Set<String> names = new LinkedHashSet<>();
             for (SecurityRequirement r : op.getSecurity()) {
                 if (r != null) names.addAll(r.keySet());
             }
-            if (!names.isEmpty()) return String.join(", ", names);
-            return "Custom";
+            if (!names.isEmpty()) {
+                return String.join(", ", names);
+            }
+            // coś jest, ale bez nazw – nie zgadujemy
+            return "";
         }
 
+        // 2. Global security
         List<SecurityRequirement> global = api.getSecurity();
         if (global != null && !global.isEmpty()) {
             Set<String> names = new LinkedHashSet<>();
             for (SecurityRequirement r : global) {
                 if (r != null) names.addAll(r.keySet());
             }
-            if (!names.isEmpty()) return String.join(", ", names);
-            return "Custom";
+            if (!names.isEmpty()) {
+                return String.join(", ", names);
+            }
+            return "";
         }
 
-        return "Public (no auth)";
+        // 3. Brak jakichkolwiek informacji o security
+        return "";
     }
-
 
     //  COMPONENTS / SCHEMAS
     private void renderComponents(StringBuilder sb, Components components) {
@@ -516,8 +526,6 @@ public class PdfDocService {
 
         sb.append("</div>");
     }
-
-
     //  JSON / SCHEMA HELPERS
     private String toPrettyJson(Object obj) {
         try {
@@ -528,7 +536,6 @@ public class PdfDocService {
             return String.valueOf(obj);
         }
     }
-
     //Zwięzła etykieta schema
     //generuje krótką etykietę typu: preferuje $ref, 
     //obsługuje array<…>, ma specjalny skrót dla PageResponse<T>, łączy allOf jako A + B, a na końcu zwraca type lub pustkę.
@@ -563,7 +570,7 @@ public class PdfDocService {
         }
         return "";
     }
-
+    //Metoda znajduje typ elementu stron w PageResponse patrząc na pole content (tablica) w jednej z części allOf.
     private static Schema<?> extractPageItemSchema(ComposedSchema cs) {
         for (Schema<?> part : cs.getAllOf()) {
             if (part instanceof ObjectSchema obj && obj.getProperties() != null) {
@@ -579,10 +586,7 @@ public class PdfDocService {
         return null;
     }
 
-    // ========================================================================
     //  UTILS
-    // ========================================================================
-
     private static String paramConstraints(Parameter p) {
         if (p == null) return "";
         Schema<?> s = p.getSchema();

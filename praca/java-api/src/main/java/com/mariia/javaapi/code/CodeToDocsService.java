@@ -122,15 +122,21 @@ public class CodeToDocsService {
             op.setOperationId(ep.operationId);
 
             // SECURITY per operacja
+            // Map<String, Object> opExt = new LinkedHashMap<>();
+            // if (isPublicEndpoint(ep)) {
+            //     op.setSecurity(Collections.emptyList());
+            //     opExt.put("x-security", "public");
+            // } else {
+            //     opExt.put("x-security", "bearerAuth");
+            // }
+            // opExt.put("x-user-level", audience);
+            // op.setExtensions(opExt);
+
+            // Extensions per operation – only user level, no guessed security
             Map<String, Object> opExt = new LinkedHashMap<>();
-            if (isPublicEndpoint(ep)) {
-                op.setSecurity(Collections.emptyList());
-                opExt.put("x-security", "public");
-            } else {
-                opExt.put("x-security", "bearerAuth");
-            }
             opExt.put("x-user-level", audience);
             op.setExtensions(opExt);
+
 
             // NLP /describe – zawsze AI (ollama)
             Map<String, Object> nlpRes = callNlp(buildNlpBody(ep), level);
@@ -541,7 +547,7 @@ public class CodeToDocsService {
         if (op.getExtensions() != null) {
             Object ex = op.getExtensions().get("x-request-examples");
             if (ex instanceof List<?> list && !list.isEmpty()) {
-                return; // AI już coś dał
+                return; // AI already provided examples
             }
         }
 
@@ -553,9 +559,6 @@ public class CodeToDocsService {
         sb.append("curl -X ").append(method).append(" \"").append(url).append("\"");
 
         boolean hasBody = op.getRequestBody() != null;
-        if (!isPublicEndpoint(ep)) {
-            sb.append(" \\\n  -H \"Authorization: Bearer <token>\"");
-        }
         if (hasBody) {
             sb.append(" \\\n  -H \"Content-Type: application/json\"");
             Object bodyEx = null;
@@ -583,6 +586,7 @@ public class CodeToDocsService {
         ext.put("x-request-examples", curls);
         op.setExtensions(ext);
     }
+
     //do zbudowania zwięzłego body w cURL w ensureCurlExample
     private String jsonMin(Object o) {
         if (o == null) return "null";
