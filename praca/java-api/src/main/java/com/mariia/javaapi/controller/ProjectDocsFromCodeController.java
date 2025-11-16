@@ -3,6 +3,7 @@ package com.mariia.javaapi.controller;
 import com.mariia.javaapi.code.CodeToDocsService;
 import com.mariia.javaapi.code.JavaSpringParser;
 import com.mariia.javaapi.code.ir.EndpointIR;
+import com.mariia.javaapi.docs.EditableDocsService;
 import com.mariia.javaapi.docs.PdfDocService;
 import com.mariia.javaapi.uploads.UploadStorage;
 import org.springframework.http.HttpHeaders;
@@ -10,10 +11,10 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Locale;
 
 @RestController
 @RequestMapping("/api/projects")
@@ -23,19 +24,22 @@ public class ProjectDocsFromCodeController {
     private final CodeToDocsService code2docs;
     private final JavaSpringParser parser = new JavaSpringParser();
     private final PdfDocService pdfDocService;
+    private final EditableDocsService editableDocsService;
 
     public ProjectDocsFromCodeController(
             UploadStorage storage,
             CodeToDocsService code2docs,
-            PdfDocService pdfDocService
+            PdfDocService pdfDocService,
+            EditableDocsService editableDocsService
     ) {
         this.storage = storage;
         this.code2docs = code2docs;
         this.pdfDocService = pdfDocService;
+        this.editableDocsService = editableDocsService;
     }
 
     // =========================================================
-    //  YAML z kodu (AI)
+    //  YAML z kodu (AI) – download
     // =========================================================
 
     @PostMapping(value = "/{id}/docs/from-code")
@@ -73,7 +77,7 @@ public class ProjectDocsFromCodeController {
     }
 
     // =========================================================
-    //  PDF (download)
+    //  PDF (download – z kodu)
     // =========================================================
 
     @PostMapping(value = "/{id}/docs/pdf")
@@ -114,7 +118,7 @@ public class ProjectDocsFromCodeController {
     }
 
     // =========================================================
-    //  PDF (inline preview)
+    //  PDF (inline preview – z kodu)
     // =========================================================
 
     @GetMapping(value = "/{id}/docs/pdf", produces = MediaType.APPLICATION_PDF_VALUE)
@@ -227,7 +231,93 @@ public class ProjectDocsFromCodeController {
     }
 
     // =========================================================
-    //  NLP INPUT PREVIEW (zawsze AI / ollama)
+    //  Wersja do edycji (tekst YAML)
+    // =========================================================
+
+    @GetMapping(
+            value = "/{id}/docs/editable",
+            produces = MediaType.TEXT_PLAIN_VALUE
+    )
+    public ResponseEntity<String> generateEditableHtml(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "advanced") String level
+    ) throws Exception {
+
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            // tutaj zwracamy ResponseEntity<String>, NIE używamy helperów byte[]
+            return ResponseEntity.status(404)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body("Project not found: " + id);
+        }
+
+        List<EndpointIR> endpoints = parser.parseProject(projectDir);
+        if (endpoints.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body("No endpoints found in source code.");
+        }
+
+        Files.createDirectories(projectDir);
+
+        String audience = level;
+        String projectName = resolveProjectName(id);
+        Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
+
+        code2docs.generateYamlFromCode(
+                endpoints,
+                projectName,
+                audience,
+                aiYaml,
+                projectDir
+        );
+
+        String yaml = Files.readString(aiYaml);
+
+        return ResponseEntity
+                .ok()
+                .contentType(MediaType.TEXT_PLAIN)
+                .body(yaml);
+    }
+
+    // =========================================================
+    //  PDF z edytowanego YAML
+    // =========================================================
+
+    @PostMapping(
+            value = "/{id}/docs/edited/pdf",
+            consumes = MediaType.TEXT_PLAIN_VALUE
+    )
+    public ResponseEntity<byte[]> generatePdfFromEditedHtml(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "advanced") String level,
+            @RequestBody String editedYaml
+    ) throws Exception {
+
+        Path projectDir = storage.resolveProjectDir(id);
+        if (!Files.exists(projectDir)) {
+            return notFound("Project not found: " + id);
+        }
+
+        Files.createDirectories(projectDir);
+
+        String audience = level;
+        String projectName = resolveProjectName(id);
+
+        // zapisujemy edytowany YAML
+        Path aiYamlEdited = projectDir.resolve("openapi_" + audience + "_edited.yaml");
+        Files.writeString(aiYamlEdited, editedYaml);
+
+        // generujemy PDF z tego YAML
+        Path aiPdfEdited = projectDir.resolve("openapi_" + audience + "_edited.pdf");
+        pdfDocService.renderPdfFromYaml(aiYamlEdited, aiPdfEdited);
+
+        String fileName = buildFileName(projectName, audience, "_edited.pdf");
+        return asAttachment(aiPdfEdited, fileName, MediaType.APPLICATION_PDF_VALUE);
+    }
+
+    // =========================================================
+    //  NLP INPUT PREVIEW (AI / ollama)
     // =========================================================
 
     @GetMapping(
@@ -237,7 +327,7 @@ public class ProjectDocsFromCodeController {
     public ResponseEntity<?> getNlpInputs(
             @PathVariable String id,
             @RequestParam(defaultValue = "advanced") String level,
-            @RequestParam(required = false) String mode // akceptujemy, ale ignorujemy; zawsze AI/ollama
+            @RequestParam(required = false) String mode
     ) throws Exception {
 
         Path projectDir = storage.resolveProjectDir(id);
@@ -265,6 +355,7 @@ public class ProjectDocsFromCodeController {
         }
         return id;
     }
+
     /**
      * Buduje bezpieczną nazwę pliku:
      * <nazwa_projektu>_<poziom><ext>
@@ -286,13 +377,13 @@ public class ProjectDocsFromCodeController {
     private static ResponseEntity<byte[]> notFound(String msg) {
         return ResponseEntity.status(404)
                 .contentType(MediaType.TEXT_PLAIN)
-                .body(msg.getBytes());
+                .body(msg.getBytes(StandardCharsets.UTF_8));
     }
 
     private static ResponseEntity<byte[]> badRequest(String msg) {
         return ResponseEntity.badRequest()
                 .contentType(MediaType.TEXT_PLAIN)
-                .body(msg.getBytes());
+                .body(msg.getBytes(StandardCharsets.UTF_8));
     }
 
     private static ResponseEntity<byte[]> asAttachment(Path path, String filename, String contentType) throws Exception {

@@ -133,7 +133,6 @@ export default function App() {
 }
 
 /** ————————————————— Upload + akcje + podgląd danych wejściowych/wyjściowych ————————————————— */
-
 function UploadBox({
   parentSetStatus,
   parentStartTimer,
@@ -153,9 +152,13 @@ function UploadBox({
   const [nlpInput, setNlpInput] = React.useState<NlpInputEntry[] | null>(null);
   const [selectedOutput, setSelectedOutput] =
     React.useState<NlpOutputPreview | null>(null);
-  const [loadingOutputFor, setLoadingOutputFor] = React.useState<string | null>(
-    null
-  );
+  const [loadingOutputFor, setLoadingOutputFor] =
+    React.useState<string | null>(null);
+
+  // 🔹 NOWE STANY DO EDYCJI (YAML, nie HTML)
+  const [editableYaml, setEditableYaml] = React.useState<string | null>(null);
+  const [editedYaml, setEditedYaml] = React.useState<string>("");
+  const [yamlBusy, setYamlBusy] = React.useState(false);
 
   const onUpload = async () => {
     if (!file) return;
@@ -176,6 +179,11 @@ function UploadBox({
       setRes(j);
       setNlpInput(null);
       setSelectedOutput(null);
+
+      // przy nowym projekcie czyścimy stan edycji
+      setEditableYaml(null);
+      setEditedYaml("");
+
       parentSetStatus(
         "PENDING — Projekt wgrany. Możesz wygenerować dokumentację z kodu."
       );
@@ -354,14 +362,12 @@ function UploadBox({
     }
   };
 
-
   const showYamlWeb = async () => {
     if (!res?.id) return;
 
     const params = new URLSearchParams();
     params.set("level", level as string);
 
-    // Backend zwróci text/yaml inline → otwieramy bezpośrednio w nowej karcie
     const url = `/api/projects/${res.id}/docs/yaml?${params.toString()}`;
     window.open(url, "_blank");
   };
@@ -408,7 +414,6 @@ function UploadBox({
     }
   };
 
-
   const loadNlpInput = async () => {
     if (!res?.id) return;
 
@@ -453,18 +458,14 @@ function UploadBox({
     }
   };
 
-  /**
-   * Ładuje dane wyjściowe dla konkretnego endpointu:
-   * - front wysyła cały DescribeIn (NlpInputEntry) do naszego Java NlpProxyController,
-   * - Java robi POST do /nlp/output-preview w Pythonie,
-   * - zwracamy 1:1 { prompt, raw } i pokazujemy bez zmian.
-   */
   const loadNlpOutput = async (entry: NlpInputEntry) => {
     if (!entry) return;
 
     const key =
       entry.symbol ||
-      `${entry.method || entry.http || ""} ${entry.path || entry.pathTemplate || entry.signature || ""}`;
+      `${entry.method || entry.http || ""} ${
+        entry.path || entry.pathTemplate || entry.signature || ""
+      }`;
 
     setLoadingOutputFor(key);
     parentSetStatus("pobieram dane wyjściowe od modelu…");
@@ -503,6 +504,98 @@ function UploadBox({
       );
     } finally {
       setLoadingOutputFor(null);
+      parentStopTimer();
+    }
+  };
+
+  // 🔹 pobieramy YAML do edycji
+  const generateEditableYaml = async () => {
+    if (!res?.id) return;
+
+    parentSetStatus("generuję YAML do edycji…");
+    parentStartTimer();
+    setYamlBusy(true);
+
+    try {
+      const params = new URLSearchParams();
+      params.set("level", level as string);
+
+      const r = await fetch(
+        `/api/projects/${res.id}/docs/editable?${params.toString()}`,
+        { method: "GET" }
+      );
+
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        parentSetStatus(`błąd generowania YAML (do edycji): ${r.status}`);
+        alert(
+          `Błąd generowania YAMLa do edycji: ${r.status} ${r.statusText}\n${text}`
+        );
+        return;
+      }
+
+      const text = await r.text();
+      setEditableYaml(text);
+      setEditedYaml(text);
+
+      parentSetStatus("YAML do edycji załadowany ✓");
+    } catch (e) {
+      parentSetStatus(`błąd sieci: ${String(e)}`);
+    } finally {
+      setYamlBusy(false);
+      parentStopTimer();
+    }
+  };
+
+  // 🔹 pobieramy PDF z edytowanego YAML
+  const downloadEditedPdf = async () => {
+    if (!res?.id || !editedYaml) return;
+
+    parentSetStatus("generuję PDF z edytowanego YAML…");
+    parentStartTimer();
+
+    try {
+      const params = new URLSearchParams();
+      params.set("level", level as string);
+
+      const r = await fetch(
+        `/api/projects/${res.id}/docs/edited/pdf?${params.toString()}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+          },
+          body: editedYaml,
+        }
+      );
+
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        parentSetStatus(`błąd generowania PDF (edycja): ${r.status}`);
+        alert(
+          `Błąd generowania edytowanego PDF: ${r.status} ${r.statusText}\n${text}`
+        );
+        return;
+      }
+
+      const blob = await r.blob();
+      const filename = filenameFromCD(r, "openapi_edited.pdf");
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      parentSetStatus("Edytowany PDF pobrany ✓");
+    } catch (e) {
+      parentSetStatus(
+        `błąd sieci podczas generowania edytowanego PDF: ${String(e)}`
+      );
+    } finally {
       parentStopTimer();
     }
   };
@@ -598,11 +691,16 @@ function UploadBox({
               Pobierz dane wejściowe dla modelu
             </button>
 
-             <button onClick={showYamlWeb} disabled={!res?.id}>
+            <button onClick={showYamlWeb} disabled={!res?.id}>
               Podgląd YAML
             </button>
             <button onClick={downloadYamlFile} disabled={!res?.id}>
               Pobierz YAML
+            </button>
+
+            {/* 🔹 NOWY PRZYCISK "Generuj (do edycji)" */}
+            <button onClick={generateEditableYaml} disabled={!res?.id || yamlBusy}>
+              {yamlBusy ? "Generuję…" : "Generuj (do edycji)"}
             </button>
           </div>
 
@@ -803,11 +901,73 @@ function UploadBox({
               )}
             </>
           )}
+
+          {/* 🔹 SEKCJA EDYCJI YAML + PODGLĄD */}
+          {editableYaml !== null && (
+            <div style={{ marginTop: 24 }}>
+              <h4>Edytuj YAML przed pobraniem PDF</h4>
+              <p style={{ fontSize: 12, color: "#555" }}>
+                Po lewej możesz dowolnie zmieniać YAML. Po zmianach
+                kliknij „Pobierz PDF z tej wersji”.
+              </p>
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 12,
+                  alignItems: "stretch",
+                }}
+              >
+                <textarea
+                  value={editedYaml}
+                  onChange={(e) => setEditedYaml(e.target.value)}
+                  style={{
+                    width: "100%",
+                    height: 400,
+                    fontFamily: "monospace",
+                    fontSize: 12,
+                    borderRadius: 4,
+                    border: "1px solid #ddd",
+                    padding: 8,
+                    boxSizing: "border-box",
+                  }}
+                />
+                <pre
+                  style={{
+                    width: "100%",
+                    height: 400,
+                    borderRadius: 4,
+                    border: "1px solid #ddd",
+                    padding: 8,
+                    margin: 0,
+                    boxSizing: "border-box",
+                    background: "#fafafa",
+                    overflow: "auto",
+                    fontFamily: "monospace",
+                    fontSize: 12,
+                  }}
+                >
+                  {editedYaml}
+                </pre>
+              </div>
+
+              <button
+                style={{ marginTop: 8 }}
+                onClick={downloadEditedPdf}
+                disabled={!editedYaml}
+              >
+                Pobierz PDF z tej wersji
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
+
+
 
 const th: React.CSSProperties = {
   borderBottom: "1px solid #ddd",
