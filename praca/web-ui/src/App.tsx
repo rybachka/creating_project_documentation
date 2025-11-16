@@ -1,4 +1,5 @@
 import React, { useRef, useState } from "react";
+import EditableDocsPanel from "./EditableDocsPanel";
 
 type Level = "beginner" | "advanced";
 type LevelWithAll = Level | "all";
@@ -27,7 +28,6 @@ type ReturnsIn = {
 };
 
 type NlpInputEntry = {
-  // IR / DescribeIn
   symbol?: string;
   kind?: string;
   signature?: string;
@@ -46,11 +46,9 @@ type NlpInputEntry = {
   returns?: ReturnsIn;
   requestBody?: any;
 
-  // meta (co dokładamy wokół wywołania)
   audience?: string;
   mode?: string;
 
-  // cokolwiek innego z backendu
   [key: string]: any;
 };
 
@@ -60,18 +58,16 @@ type NlpOutputPreview = {
   raw: string;
 };
 
-/**
- * Główny ekran:
- * - Pasek statusu / timer
- * - Upload ZIP
- * - Przyciski: Pobierz PDF / Pokaż dokumentację / Pobierz dane wejściowe i wyjściowe dla modelu
- */
 export default function App() {
   const [status, setStatus] = useState<string>("gotowa.");
   const [elapsed, setElapsed] = useState<string>("0.0s");
 
   const tickRef = useRef<number | null>(null);
   const t0Ref = useRef<number>(0);
+
+  // YAML do edycji + poziom odbiorcy
+  const [editableYaml, setEditableYaml] = useState<string | null>(null);
+  const [audience, setAudience] = useState<LevelWithAll>("beginner");
 
   const startTimer = () => {
     t0Ref.current = performance.now();
@@ -102,7 +98,6 @@ export default function App() {
       <section style={{ marginTop: 24 }}>
         <h2>Test NLP (Ollama / LLM)</h2>
 
-        {/* Pasek statusu */}
         <div
           style={{
             padding: ".6rem",
@@ -126,21 +121,47 @@ export default function App() {
           parentSetStatus={setStatus}
           parentStartTimer={startTimer}
           parentStopTimer={stopTimer}
+          onEditableYamlLoaded={setEditableYaml}
+          onAudienceChange={setAudience}
+          editableYaml={editableYaml}
         />
       </section>
+
+      {editableYaml && (
+        <section style={{ marginTop: 32 }}>
+          <h2>Edytuj dokumentację (tryb formularz per endpoint)</h2>
+          <p style={{ fontSize: 13, color: "#555", marginBottom: 8 }}>
+            Wybierz endpoint z lewej, a po prawej edytuj opisy, odpowiedzi,
+            przykłady i notatki. Reszta dokumentu OpenAPI (info, servers,
+            components…) zostaje zachowana automatycznie.
+          </p>
+          <EditableDocsPanel
+            yaml={editableYaml}
+            onYamlChange={setEditableYaml}
+            isAdvanced={audience === "advanced"}
+          />
+        </section>
+      )}
     </div>
   );
 }
 
-/** ————————————————— Upload + akcje + podgląd danych wejściowych/wyjściowych ————————————————— */
+/** ————————————————— Upload + akcje + NLP preview ————————————————— */
+
 function UploadBox({
   parentSetStatus,
   parentStartTimer,
   parentStopTimer,
+  onEditableYamlLoaded,
+  onAudienceChange,
+  editableYaml,
 }: {
   parentSetStatus: (s: string) => void;
   parentStartTimer: () => void;
   parentStopTimer: () => void;
+  onEditableYamlLoaded: (yaml: string) => void;
+  onAudienceChange: (level: LevelWithAll) => void;
+  editableYaml: string | null;
 }) {
   const [file, setFile] = React.useState<File | null>(null);
   const [res, setRes] = React.useState<UploadResult | null>(null);
@@ -152,13 +173,15 @@ function UploadBox({
   const [nlpInput, setNlpInput] = React.useState<NlpInputEntry[] | null>(null);
   const [selectedOutput, setSelectedOutput] =
     React.useState<NlpOutputPreview | null>(null);
-  const [loadingOutputFor, setLoadingOutputFor] =
-    React.useState<string | null>(null);
+  const [loadingOutputFor, setLoadingOutputFor] = React.useState<string | null>(
+    null
+  );
+  const [htmlBusy, setHtmlBusy] = React.useState(false);
 
-  // 🔹 NOWE STANY DO EDYCJI (YAML, nie HTML)
-  const [editableYaml, setEditableYaml] = React.useState<string | null>(null);
-  const [editedYaml, setEditedYaml] = React.useState<string>("");
-  const [yamlBusy, setYamlBusy] = React.useState(false);
+  React.useEffect(() => {
+    onAudienceChange(level);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const onUpload = async () => {
     if (!file) return;
@@ -180,9 +203,8 @@ function UploadBox({
       setNlpInput(null);
       setSelectedOutput(null);
 
-      // przy nowym projekcie czyścimy stan edycji
-      setEditableYaml(null);
-      setEditedYaml("");
+      // po nowym uploadzie czyścimy YAML do edycji
+      onEditableYamlLoaded("");
 
       parentSetStatus(
         "PENDING — Projekt wgrany. Możesz wygenerować dokumentację z kodu."
@@ -508,13 +530,13 @@ function UploadBox({
     }
   };
 
-  // 🔹 pobieramy YAML do edycji
+  // pobranie pełnego YAML do edycji (cały dokument)
   const generateEditableYaml = async () => {
     if (!res?.id) return;
 
     parentSetStatus("generuję YAML do edycji…");
     parentStartTimer();
-    setYamlBusy(true);
+    setHtmlBusy(true);
 
     try {
       const params = new URLSearchParams();
@@ -527,31 +549,30 @@ function UploadBox({
 
       if (!r.ok) {
         const text = await r.text().catch(() => "");
-        parentSetStatus(`błąd generowania YAML (do edycji): ${r.status}`);
-        alert(
-          `Błąd generowania YAMLa do edycji: ${r.status} ${r.statusText}\n${text}`
-        );
+        parentSetStatus(`błąd generowania YAML: ${r.status}`);
+        alert(`Błąd generowania YAML: ${r.status} ${r.statusText}\n${text}`);
         return;
       }
 
       const text = await r.text();
-      setEditableYaml(text);
-      setEditedYaml(text);
-
+      onEditableYamlLoaded(text);
       parentSetStatus("YAML do edycji załadowany ✓");
     } catch (e) {
       parentSetStatus(`błąd sieci: ${String(e)}`);
     } finally {
-      setYamlBusy(false);
       parentStopTimer();
+      setHtmlBusy(false);
     }
   };
 
-  // 🔹 pobieramy PDF z edytowanego YAML
+  // 🔹 PDF z edytowanego YAML
   const downloadEditedPdf = async () => {
-    if (!res?.id || !editedYaml) return;
+    if (!res?.id || !editableYaml) {
+      alert("Brak edytowanej dokumentacji YAML.");
+      return;
+    }
 
-    parentSetStatus("generuję PDF z edytowanego YAML…");
+    parentSetStatus("generuję PDF z edytowanej dokumentacji…");
     parentStartTimer();
 
     try {
@@ -565,13 +586,13 @@ function UploadBox({
           headers: {
             "Content-Type": "text/plain; charset=utf-8",
           },
-          body: editedYaml,
+          body: editableYaml,
         }
       );
 
       if (!r.ok) {
         const text = await r.text().catch(() => "");
-        parentSetStatus(`błąd generowania PDF (edycja): ${r.status}`);
+        parentSetStatus(`błąd generowania edytowanego PDF: ${r.status}`);
         alert(
           `Błąd generowania edytowanego PDF: ${r.status} ${r.statusText}\n${text}`
         );
@@ -666,7 +687,11 @@ function UploadBox({
             Poziom odbiorcy:&nbsp;
             <select
               value={level}
-              onChange={(e) => setLevel(e.target.value as LevelWithAll)}
+              onChange={(e) => {
+                const newLevel = e.target.value as LevelWithAll;
+                setLevel(newLevel);
+                onAudienceChange(newLevel);
+              }}
             >
               <option value="beginner">beginner</option>
               <option value="advanced">advanced</option>
@@ -698,9 +723,18 @@ function UploadBox({
               Pobierz YAML
             </button>
 
-            {/* 🔹 NOWY PRZYCISK "Generuj (do edycji)" */}
-            <button onClick={generateEditableYaml} disabled={!res?.id || yamlBusy}>
-              {yamlBusy ? "Generuję…" : "Generuj (do edycji)"}
+            <button
+              onClick={generateEditableYaml}
+              disabled={!res?.id || htmlBusy}
+            >
+              {htmlBusy ? "Generuję…" : "Generuj (do edycji)"}
+            </button>
+
+            <button
+              onClick={downloadEditedPdf}
+              disabled={!res?.id || !editableYaml}
+            >
+              Pobierz edytowany PDF
             </button>
           </div>
 
@@ -901,73 +935,11 @@ function UploadBox({
               )}
             </>
           )}
-
-          {/* 🔹 SEKCJA EDYCJI YAML + PODGLĄD */}
-          {editableYaml !== null && (
-            <div style={{ marginTop: 24 }}>
-              <h4>Edytuj YAML przed pobraniem PDF</h4>
-              <p style={{ fontSize: 12, color: "#555" }}>
-                Po lewej możesz dowolnie zmieniać YAML. Po zmianach
-                kliknij „Pobierz PDF z tej wersji”.
-              </p>
-
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr 1fr",
-                  gap: 12,
-                  alignItems: "stretch",
-                }}
-              >
-                <textarea
-                  value={editedYaml}
-                  onChange={(e) => setEditedYaml(e.target.value)}
-                  style={{
-                    width: "100%",
-                    height: 400,
-                    fontFamily: "monospace",
-                    fontSize: 12,
-                    borderRadius: 4,
-                    border: "1px solid #ddd",
-                    padding: 8,
-                    boxSizing: "border-box",
-                  }}
-                />
-                <pre
-                  style={{
-                    width: "100%",
-                    height: 400,
-                    borderRadius: 4,
-                    border: "1px solid #ddd",
-                    padding: 8,
-                    margin: 0,
-                    boxSizing: "border-box",
-                    background: "#fafafa",
-                    overflow: "auto",
-                    fontFamily: "monospace",
-                    fontSize: 12,
-                  }}
-                >
-                  {editedYaml}
-                </pre>
-              </div>
-
-              <button
-                style={{ marginTop: 8 }}
-                onClick={downloadEditedPdf}
-                disabled={!editedYaml}
-              >
-                Pobierz PDF z tej wersji
-              </button>
-            </div>
-          )}
         </div>
       )}
     </div>
   );
 }
-
-
 
 const th: React.CSSProperties = {
   borderBottom: "1px solid #ddd",
