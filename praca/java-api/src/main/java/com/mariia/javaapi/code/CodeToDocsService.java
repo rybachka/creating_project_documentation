@@ -82,9 +82,6 @@ public class CodeToDocsService {
         if (comps.getSecuritySchemes() == null) comps.setSecuritySchemes(new LinkedHashMap<>());
 
         //ensureApiErrorComponent(api);//на кінці
-        //następne metody będą zmieniani 
-        //ensureBearerAuth(api); //security schemes
-        //applyGlobalSecurity(api); //на початку
 
         // DTOs
         Path projectPath = projectRoot;
@@ -249,19 +246,34 @@ public class CodeToDocsService {
         if (nlpRes == null) {
             return;
         }
-        // mediumDescription -> description + summary
+
+        // 1) summary z NLP (krótkie)
+        String aiSummary = asStr(nlpRes.get("summary"));
+        if (aiSummary != null && !aiSummary.isBlank()) {
+            String trimmed = trim(aiSummary.trim(), 200); // krótszy niż description
+            if (op.getSummary() == null || op.getSummary().isBlank()) {
+                op.setSummary(trimmed);
+            }
+        }
+
+        // 2) mediumDescription z NLP (dłuższe, bardziej szczegółowe)
         String medD = asStr(nlpRes.get("mediumDescription"));
         if (medD != null && !medD.isBlank()) {
             String trimmed = medD.trim();
             if (op.getDescription() == null || op.getDescription().isBlank()) {
                 op.setDescription(trimmed);
             }
-            String fs = firstSentenceOf(trimmed);
-            if (!fs.isBlank() && (op.getSummary() == null || op.getSummary().isBlank())) {
-                op.setSummary(trim(fs, 400));
-            }
+
+            // // Fallback: jeśli summary nadal puste, wyciągnij pierwsze zdanie z mediumDescription
+            // if ((op.getSummary() == null || op.getSummary().isBlank())) {
+            //     String fs = firstSentenceOf(trimmed);
+            //     if (!fs.isBlank()) {
+            //         op.setSummary(trim(fs, 200));
+            //     }
+            // }
         }
-        // notes -> x-impl-notes
+
+        // 3) notes -> x-impl-notes (to zostaje jak było)
         Object notesObj = nlpRes.get("notes");
         if (notesObj instanceof List<?>) {
             boolean alreadyHas = op.getExtensions()!=null && op.getExtensions().containsKey("x-impl-notes");
@@ -277,6 +289,7 @@ public class CodeToDocsService {
                 }
             }
         }
+        
         // examples
         Object examplesObj = nlpRes.get("examples");
         if (!(examplesObj instanceof Map<?, ?> exMap)) {
@@ -938,35 +951,6 @@ public class CodeToDocsService {
     }
 
     // SANITY / UTILS
-    private void sanitizeOpenApi(OpenAPI api) {
-        if (api == null || api.getPaths() == null) return;
-
-        api.getPaths().forEach((path, pi) -> {
-            if (pi == null) return;
-            for (io.swagger.v3.oas.models.Operation op : Arrays.asList(
-                    pi.getGet(), pi.getPost(), pi.getPut(), pi.getPatch(), pi.getDelete()
-            )) {
-                if (op == null || op.getResponses() == null) continue;
-
-                ApiResponses rs = op.getResponses();
-                ApiResponse r204 = rs.get("204");
-                if (r204 != null) {
-                    r204.setContent(null);
-                    if (r204.getDescription() == null || r204.getDescription().isBlank()) {
-                        r204.setDescription("No Content");
-                    }
-                }
-
-                String m = methodOf(pi, op);
-                if ("DELETE".equalsIgnoreCase(m)) {
-                    if (rs.get("204") == null) {
-                        rs.addApiResponse("204", new ApiResponse().description("No Content"));
-                    }
-                    rs.keySet().removeIf(k -> k.startsWith("2") && !"204".equals(k));
-                }
-            }
-        });
-    }
 
     private static String methodOf(PathItem pi, io.swagger.v3.oas.models.Operation op) {
         if (pi == null || op == null) return null;

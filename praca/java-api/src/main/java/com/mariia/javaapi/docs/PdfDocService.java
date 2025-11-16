@@ -41,10 +41,10 @@ public class PdfDocService {
             b.useFont(() -> {
                 var is = PdfDocService.class.getResourceAsStream("/fonts/times.ttf");
                 if (is == null) {
-                    throw new IllegalStateException("Brak czcionki w classpath: /fonts/times.ttf");
+                    throw new IllegalStateException("Brak czcionki w classpath: /fonts/DejaVuSerif.ttf");
                 }
                 return is;
-            }, "TimesCustom");
+            }, "DejaVuSerif");
 
             b.withHtmlContent(html, "file:/");
             b.toStream(os);
@@ -56,7 +56,7 @@ public class PdfDocService {
     //  HTML / CSS / helpers
     private static final String CSS = """
       @page { size: A4; margin: 24mm; }
-      body{font-family: 'TimesCustom', serif; margin:0; color:#111; font-size:12pt;}
+      body{font-family: 'DejaVuSerif', serif; margin:0; color:#111; font-size:12pt;}
       header{margin-bottom:16px}
       h1{font-size:22pt;margin:0 0 4px}
       .muted{color:#666; font-size:10pt;}
@@ -428,17 +428,36 @@ public class PdfDocService {
                         }
                     }
                 }
+                //budujemy HTML z ewentualnym komentarzem ---
+                String schemaHtml = "";
+                if (!schemaTxt.isEmpty()) {
+                    schemaHtml = "<code>" + esc(schemaTxt) + "</code>";
+                    if ("#/components/schemas/?".equals(schemaTxt)) {
+                        schemaHtml += "<div class='muted'>"
+                                + "Typ odpowiedzi nie został jednoznacznie określony podczas generowania OpenAPI "
+                                + "(użyto symbolicznego placeholdera <code>?</code>)."
+                                + "</div>";
+                    }
+                }
+
+                String exampleHtml = "";
+                if (!exTxt.isEmpty()) {
+                    exampleHtml = "<pre><code>" + esc(exTxt) + "</code></pre>";
+                    if ("{}".equals(exTxt.trim())) {
+                        exampleHtml += "<div class='muted'>"
+                                + "Endpoint nie zwraca treści albo szczegółowa struktura odpowiedzi "
+                                + "nie była dostępna w modelu IR podczas generowania dokumentacji."
+                                + "</div>";
+                    }
+                }
 
                 sb.append("<tr>")
-                  .append("<td>").append(esc(code)).append("</td>")
-                  .append("<td>").append(esc(nz(resp.getDescription()))).append("</td>")
-                  .append("<td>")
-                  .append(schemaTxt.isEmpty() ? "" : "<code>" + esc(schemaTxt) + "</code>")
-                  .append("</td>")
-                  .append("<td>")
-                  .append(exTxt.isEmpty() ? "" : "<pre><code>" + esc(exTxt) + "</code></pre>")
-                  .append("</td>")
-                  .append("</tr>");
+                .append("<td>").append(esc(code)).append("</td>")
+                .append("<td>").append(esc(nz(resp.getDescription()))).append("</td>")
+                .append("<td>").append(schemaHtml).append("</td>")
+                .append("<td>").append(exampleHtml).append("</td>")
+                .append("</tr>");
+
             }
 
             sb.append("</tbody></table></div>");
@@ -466,14 +485,17 @@ public class PdfDocService {
             @SuppressWarnings("unchecked")
             List<Object> reqs = (List<Object>) op.getExtensions().get("x-request-examples");
             if (!reqs.isEmpty()) {
+                boolean secured = isOperationSecured(api, op);
+
                 sb.append("<div class='examples'><strong>Przykłady wywołań</strong>");
                 int limit = isBeginner ? 1 : reqs.size();
                 for (int i = 0; i < limit; i++) {
                     String curl = Objects.toString(reqs.get(i), "");
                     if (!curl.isBlank()) {
+                        String adjusted = injectAuthHeaderIfNeeded(curl, secured);
                         sb.append("<pre><code>")
-                          .append(esc(curl))
-                          .append("</code></pre>");
+                        .append(esc(adjusted))
+                        .append("</code></pre>");
                     }
                 }
                 sb.append("</div>");
@@ -724,6 +746,70 @@ public class PdfDocService {
         sb.append("</section>");
         return sb.toString();
     }
+
+    //NAGLOWEK DLA CURL BARIER TOKEN    
+    private boolean isOperationSecured(OpenAPI api, Operation op) {
+        if (api == null || op == null) {
+            return false;
+        }
+        // 1) x-security: public → traktujemy jako publiczny
+        if (op.getExtensions() != null) {
+            Object xs = op.getExtensions().get("x-security");
+            if (xs != null && "public".equalsIgnoreCase(xs.toString().trim())) {
+                return false;
+            }
+        }
+        // 2) per-operation security
+        if (op.getSecurity() != null) {
+            // security: [] → jawnie publiczny
+            if (op.getSecurity().isEmpty()) {
+                return false;
+            }
+            // niepusta lista z jakimikolwiek schematami → secured
+            for (SecurityRequirement r : op.getSecurity()) {
+                if (r != null && !r.isEmpty()) {
+                    return true;
+                }
+            }
+        }
+        // 3) global security – fallback
+        List<SecurityRequirement> global = api.getSecurity();
+        if (global != null && !global.isEmpty()) {
+            for (SecurityRequirement r : global) {
+                if (r != null && !r.isEmpty()) {
+                    return true;
+                }
+            }
+        }
+        // 4) brak info o security w OpenAPI → traktujemy jako publiczny
+        return false;
+    }
+    private String injectAuthHeaderIfNeeded(String curl, boolean secured) {
+        if (!secured) {
+            return curl; // publiczny endpoint → nic nie ruszamy
+        }
+        if (curl == null || curl.isBlank()) {
+            return curl;
+        }
+
+        // Jeżeli model już dodał Authorization – nie dotykamy
+        String lower = curl.toLowerCase(Locale.ROOT);
+        if (lower.contains("authorization:")) {
+            return curl;
+        }
+
+        // Najprościej: dokładamy header na końcu komendy
+        // Z łamaniem linii, żeby w PDF wyglądało ok.
+        if (curl.contains("\n")) {
+            // już jest w formacie wieloliniowym
+            return curl + "\n  -H \"Authorization: Bearer <token>\"";
+        } else {
+            // jednowierszowy curl
+            return curl + " \\\n  -H \"Authorization: Bearer <token>\"";
+        }
+    }
+
+
 
 
     //  COMPONENTS / SCHEMAS

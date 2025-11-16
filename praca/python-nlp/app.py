@@ -3,10 +3,12 @@ import re
 import json
 from typing import Any, Dict, List, Optional
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, HTTPException
+
 from pydantic import BaseModel, ValidationError
 
 from models import DescribeIn, DescribeOut, ParamIn
+
 
 
 #   KONFIGURACJA / ENV
@@ -102,6 +104,7 @@ The user sees exactly one endpoint at a time.
 Your reply MUST be **ONLY** valid JSON (no additional text before or after), and it MUST strictly follow this schema:
 
 {{
+  "summary": "...",
   "mediumDescription": "...",
   "notes": ["..."],
   "examples": {{
@@ -113,21 +116,44 @@ Your reply MUST be **ONLY** valid JSON (no additional text before or after), and
   }}
 }}
 
+ABSOLUTE CONSTRAINTS FOR METHOD AND PATH (CRITICAL):
+
+- You MUST treat the following values as the single source of truth:
+  - HTTP method: "{method}"
+  - Path: "{path}"
+- In the curl example you generate:
+  - The HTTP method MUST be exactly "{method}".
+  - The URL MUST be exactly "{{{{BASE_URL}}}}{path}".
+- You MUST copy the value of `path` **1:1**, without any changes:
+  - do NOT add or remove segments,
+  - do NOT pluralize (no "/api/chats" if path is "{path}"),
+  - do NOT shorten (no "/api/profile" if path is "{path}"),
+  - do NOT add trailing or leading slashes.
+- The substring "{{{{BASE_URL}}}}{path}" MUST appear exactly once in the curl example.
+- You MUST NOT use any other path than the one given in `path`, even if it seems more natural.
+
 GUIDELINES FOR THE BEGINNER LEVEL:
 
-1. mediumDescription
-   - 1–2 sentences in **Polish**.
+1. summary
+   - 1 short sentence in **Polish** (max ~80 characters).
+   - Very simple, human-friendly description of what this endpoint does.
+   - Use verbs like "Pobiera", "Tworzy", "Aktualizuje", "Usuwa".
+   - Do NOT copy `mediumDescription` – it MUST be shorter and more high-level.
+
+2. mediumDescription
+   - 2–3 sentences in **Polish**.
    - Explain WHAT this endpoint does and in which simple business scenario it is used.
    - Use names from the method and path. For example:
      - GET /api/orders/{{id}} → "Pobiera szczegóły zamówienia o podanym ID."
    - Avoid empty phrases like "Pobiera zasób" or "Zwraca obiekt". Be concrete.
+   - `mediumDescription` MUST add more detail than `summary` and MUST NOT be identical to it.
 
-2. Authorization
+3. Authorization
    - The input IR does **not** contain any information about authentication or security.
    - You MUST NOT mention Authorization headers, tokens, JWT, login, sessions, roles, or permissions.
    - Simply skip the topic of security in this level.
 
-3. notes
+4. notes
    - 0–3 short bullet points (still plain strings in JSON).
    - Use them to briefly mention typical outcomes and basic error codes if helpful, for example:
      - {success_status} – when the operation completes successfully,
@@ -136,26 +162,27 @@ GUIDELINES FOR THE BEGINNER LEVEL:
    - Keep it simple and user-friendly, avoid heavy technical jargon.
    - Do NOT mention 401 or 403, because we do not have security information.
 
-4. examples.requests
+5. examples.requests
    - Provide **exactly one** simple curl example for **this** endpoint.
    - You MUST use exactly:
      - HTTP method: {method}
      - Path: {path}
-   - Always use the base URL placeholder: "{{{{BASE_URL}}}}". For example:
+   - The first line MUST follow this pattern (with no changes in the path):
      - `curl -X {method} "{{{{BASE_URL}}}}{path}" ...`
    - You MUST NOT use any other domains or paths (even if you see them in notes or implNotes).
+   - You MUST NOT change the path in any way (no extra segments, no plural forms, no renamed paths).
    - If the endpoint has a request body (requestBody or a parameter with in="body"):
      - add the header `Content-Type: application/json`,
      - include a very simple JSON body consistent with the IR.
    - Do NOT add Authorization or any other technical headers.
 
-5. examples.response
+6. examples.response
    - Provide one example of a **happy-path** response.
    - The `status` field MUST be exactly `{success_status}` for this endpoint.
    - If the endpoint does not return a body (void type), set `body` to `{{}}`.
    - If the IR suggests an object or a list, show a small, simple JSON example that matches the structure, but do not invent extra fields beyond what is implied by the IR.
 
-6. General rules
+7. General rules
    - Do NOT invent paths, fields, or parameters that are not present in the input IR.
    - If you don’t know the exact structure of the response, you may say in Polish that the details are defined in the corresponding backend model (e.g. "Szczegółowa struktura odpowiedzi jest zdefiniowana w modelu po stronie backendu").
    - Do NOT use Markdown.
@@ -197,6 +224,7 @@ You write REST API documentation in **Polish** for an **advanced backend develop
 Your reply MUST be **ONLY** valid JSON (no additional text before or after) and MUST strictly follow this schema:
 
 {{
+  "summary": "...",
   "mediumDescription": "...",
   "notes": ["..."],
   "examples": {{
@@ -208,17 +236,40 @@ Your reply MUST be **ONLY** valid JSON (no additional text before or after) and 
   }}
 }}
 
+ABSOLUTE CONSTRAINTS FOR METHOD AND PATH (CRITICAL):
+
+- You MUST treat the following values as canonical:
+  - HTTP method: "{method}"
+  - Path: "{path}"
+- In the curl example:
+  - The HTTP method MUST be exactly "{method}".
+  - The URL MUST be exactly "{{{{BASE_URL}}}}{path}".
+- You MUST copy `path` **verbatim** (1:1):
+  - no pluralization (no "/api/chats" if path is "{path}"),
+  - no shortening (no "/api/profile" if path is "{path}"),
+  - no additional or removed segments,
+  - no rewriting or renaming of the path.
+- The substring "{{{{BASE_URL}}}}{path}" MUST appear exactly once in the curl example.
+- You MUST NOT use any other path or URL for this endpoint.
+
 GUIDELINES FOR THE ADVANCED LEVEL:
 
-1) mediumDescription
+1) summary
+   - 1 concise sentence in Polish.
+   - High-level technical description (np. "Usuwa obserwację profilu wskazanego użytkownika.").
+   - Should be suitable as an OpenAPI `summary` line.
+   - MUST NOT be identical to `mediumDescription`.
+
+2) mediumDescription
    - 2–4 sentences, concise and technical, written in Polish.
    - Precisely describe the purpose of the operation:
      - which data it accepts (body/query/path),
      - which data it returns, according to the IR (`returns`),
      - what is the main success status code (here: {success_status}).
-   - Do NOT describe authentication mechanisms, because the IR does not contain security information.
+   - May mention typical usage patterns or important behaviour.
+   - MUST provide more detail than `summary` and be meaningfully different.
 
-2) notes
+3) notes
    - 0–5 short technical bullet points (still plain strings in JSON).
    - Focus on:
      - validation rules that can be reasonably inferred from parameter names/types,
@@ -227,25 +278,26 @@ GUIDELINES FOR THE ADVANCED LEVEL:
    - Do NOT use 401 or 403, because we have no security data in the IR.
    - Do not invent very detailed business rules that are not supported by the IR.
 
-3) examples.requests
+4) examples.requests
    - Provide **exactly one** curl example for this endpoint.
    - You MUST use exactly:
      - HTTP method: {method}
      - Path: {path}
-   - Always use the base URL placeholder: "{{{{BASE_URL}}}}", e.g.:
+   - The first line MUST follow this pattern (with no modifications of the path):
      - `curl -X {method} "{{{{BASE_URL}}}}{path}" ...`
    - You MUST NOT use any other domain or path, even if it appears in notes, implNotes or comments.
+   - You MUST NOT modify the path string in any way (no extra segments, no plural forms, no aliases).
    - If there is a request body (requestBody or in="body" parameter):
      - add `Content-Type: application/json`,
      - construct a minimal JSON object that reflects the structure implied by the IR (if no field names are available, use generic placeholders like "field1", "field2").
 
-4) examples.response
+5) examples.response
    - Provide a single **happy-path** example.
    - The `status` field MUST be exactly `{success_status}`.
    - If the return type is void or there is no meaningful body, set `body` to `{{}}`.
    - If the return type suggests an object or list, show a small, representative JSON example that matches the IR, without adding imaginary properties.
 
-5) General rules
+6) General rules
    - Do NOT guess or invent new fields, paths, parameters, or nested structures beyond what is indicated in the IR.
    - If the IR is incomplete, you may mention in Polish that the detailed structure is defined in the backend type referenced in `returns` (for example: "Szczegółowa struktura odpowiedzi jest zdefiniowana w typie X po stronie backendu").
    - Do NOT use Markdown.
@@ -268,9 +320,8 @@ def build_prompt(payload: DescribeIn, audience: str = "beginner") -> str:
         return build_prompt_advanced(payload)
     # domyślnie: beginner
     return build_prompt_beginner(payload)
-
-#   OLLAMA
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
 async def call_ollama(prompt: str) -> Dict[str, Any]:
     url = f"{OLLAMA_BASE_URL}/api/generate"
     body = {
@@ -286,22 +337,79 @@ async def call_ollama(prompt: str) -> Dict[str, Any]:
             "num_predict": OLLAMA_NUM_PREDICT,
         },
     }
+
     if NLP_DEBUG:
         print("[ollama:prompt]\n", prompt[:1200], "...\n")
-    async with httpx.AsyncClient(timeout=600) as client:
-        r = await client.post(url, json=body)
-        r.raise_for_status()
-        data = r.json()
+
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            r = await client.post(url, json=body)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPError as e:
+        msg = f"Ollama HTTP error: {e}"
+        print("[ollama:error]", msg)
+        # 502 trafi prosto do logów java-api jako „Bad Gateway”
+        raise HTTPException(status_code=502, detail=msg)
+    except Exception as e:
+        print("[ollama:error] Unexpected error when calling Ollama:", repr(e))
+        raise HTTPException(status_code=502, detail="Unexpected error from NLP")
+
     text = (data.get("response") or "").strip()
+
     if NLP_DEBUG:
         print("[ollama:raw] head:", text[:600].replace("\n", " "), "...")
+
     m = JSON_RE.search(text)
     if not m:
-        return {}
+        print("[ollama:error] No JSON object found in model response")
+        raise HTTPException(status_code=502, detail="Model response did not contain JSON")
+
     try:
         return json.loads(m.group(0))
-    except Exception:
-        return {}
+    except Exception as e:
+        print("[ollama:error] Failed to parse JSON from model:", repr(e))
+        raise HTTPException(status_code=502, detail="Failed to parse JSON from model")
+
+async def call_ollama_raw(prompt: str) -> str:
+    url = f"{OLLAMA_BASE_URL}/api/generate"
+    body = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+            "top_p": OLLAMA_TOP_P,
+            "top_k": OLLAMA_TOP_K,
+            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": OLLAMA_NUM_PREDICT,
+        },
+    }
+
+    if NLP_DEBUG:
+        print("[ollama_raw:prompt]\n", prompt[:1200], "...\n")
+
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            r = await client.post(url, json=body)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPError as e:
+        msg = f"Ollama HTTP error: {e}"
+        print("[ollama_raw:error]", msg)
+        raise HTTPException(status_code=502, detail=msg)
+    except Exception as e:
+        print("[ollama_raw:error] Unexpected error when calling Ollama:", repr(e))
+        raise HTTPException(status_code=502, detail="Unexpected error from NLP")
+
+    text = (data.get("response") or "").strip()
+
+    if NLP_DEBUG:
+        print("[ollama_raw:raw] head:", text[:600].replace("\n", " "), "...")
+
+    return text
+
 
 #   SANITY / POSTPROCESS
 def _sanitize_notes(notes: Any) -> List[str]:
@@ -320,21 +428,29 @@ def _validate_ai_doc(raw: Dict[str, Any], payload: DescribeIn) -> Optional[Descr
     if not raw or not isinstance(raw, dict):
         return None
 
+    # krótkie podsumowanie – może być puste
+    summary = str(raw.get("summary") or "").strip()
+
     md = str(raw.get("mediumDescription") or "").strip()
     if not md:
-        return None  # żadnych fallbacków
+        # jeśli model NIE zwrócił mediumDescription – traktujemy to jako błąd
+        return None
 
     notes = _sanitize_notes(raw.get("notes"))
     ex_raw = raw.get("examples")
     examples = ex_raw if isinstance(ex_raw, dict) else None
 
     return DescribeOut(
+        summary=summary or "",
+        shortDescription=summary or "",   # dla kompatybilności
         mediumDescription=md,
+        longDescription=md,               # jeśli chcesz mieć coś w longDescription
         notes=notes or [],
         examples=examples,
-        paramDocs=[],   # uzupełnimy w endpointzie (bez fallbacków treści)
+        paramDocs=[],   # uzupełnimy w endpointzie
         returnDoc=""
     )
+
 
 def _guess_success_status(method: str, returns: Optional[Dict[str, Any]]) -> int:
     method = (method or "").upper()
@@ -383,52 +499,35 @@ async def describe(
     request: Request,
     audience: str = Query("beginner", pattern="^(beginner|advanced)$"),
 ):
+    symbol = getattr(payload, "symbol", "?")
+    who = request.client.host if request.client else "?"
+
     if NLP_DEBUG:
-        who = request.client.host if request.client else "?"
-        print(
-            f"[describe] from={who} "
-            f"symbol={getattr(payload, 'symbol', '?')} audience={audience}"
-        )
+        print(f"[describe] from={who} symbol={symbol} audience={audience}")
 
     prompt = build_prompt(payload, audience=audience)
     prompt += "\nPAMIĘTAJ: Zwróć wyłącznie poprawny JSON zgodny ze schematem i zasadami powyżej.\n"
 
-    raw = await call_ollama(prompt)
-    doc = _validate_ai_doc(raw, payload)
+    try:
+        raw = await call_ollama(prompt)
+    except HTTPException as e:
+        # przechwycamy i logujemy przyczynę 502/5xx na poziomie /describe
+        print(f"[describe:error] symbol={symbol} status={e.status_code} detail={e.detail}")
+        raise
+    except Exception as e:
+        # na wszelki wypadek, gdyby coś jeszcze poszło nie tak
+        print(f"[describe:error] symbol={symbol} unexpected:", repr(e))
+        raise HTTPException(status_code=502, detail="Unexpected error in describe")
 
+    doc = _validate_ai_doc(raw, payload)
     if doc:
         doc.paramDocs = _build_param_docs(getattr(payload, "params", []) or [])
+        if NLP_DEBUG:
+            print(f"[describe] ok symbol={symbol}")
         return doc
 
-    # jeśli model nic nie zwrócił – zwróć 502 lub 422 (inaczej FastAPI krzyknie 500 za brak return)
-    from fastapi import HTTPException
+    print(f"[describe:error] symbol={symbol} model returned invalid JSON structure")
     raise HTTPException(status_code=502, detail="Model nie zwrócił poprawnego JSON-u")
-
-async def call_ollama_raw(prompt: str) -> str:
-    """
-    Woła Ollamę i zwraca SUROWĄ odpowiedź (response field) bez wycinania JSON-u.
-    Używane wyłącznie do debug podglądu.
-    """
-    url = f"{OLLAMA_BASE_URL}/api/generate"
-    body = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": OLLAMA_TEMPERATURE,
-            "top_p": OLLAMA_TOP_P,
-            "top_k": OLLAMA_TOP_K,
-            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
-            "num_ctx": OLLAMA_NUM_CTX,
-            "num_predict": OLLAMA_NUM_PREDICT,
-        },
-    }
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(url, json=body)
-        r.raise_for_status()
-        data = r.json()
-    # Ollama zwraca pole 'response' jako tekst
-    return (data.get("response") or "").strip()
 
 @app.post("/nlp/output-preview")
 async def nlp_output_preview(

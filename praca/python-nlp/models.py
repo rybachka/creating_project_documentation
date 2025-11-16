@@ -20,6 +20,14 @@ class ReturnDoc(BaseModel):
 class DescribeIn(BaseModel):
     symbol: str
     kind: Literal["endpoint","function","method","dto"] = "endpoint"
+
+    operationId: Optional[str] = None
+    method: Optional[str] = None
+    path: Optional[str] = None
+    rawComment: Optional[str] = None
+    requestBody: Optional[dict] = None
+    implNotes: Optional[List[str]] = None
+    
     signature: Optional[str] = None
     comment: Optional[str] = None
     http: Optional[str] = None
@@ -47,10 +55,13 @@ class Examples(BaseModel):
     response: ExampleResp
 
 class DescribeOut(BaseModel):
+    summary: Optional[str] = ""
     shortDescription: Optional[str] = ""
     mediumDescription: Optional[str] = ""
     longDescription: Optional[str] = ""
+
     paramDocs: List[ParamDoc] = []
     returnDoc: Optional[str] = ""
     notes: Optional[List[str]] = None
     examples: Optional[Dict] = None
+
