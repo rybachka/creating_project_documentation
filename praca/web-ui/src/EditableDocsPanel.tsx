@@ -1,3 +1,4 @@
+// src/EditableDocsPanel.tsx
 import React from "react";
 import yaml from "js-yaml";
 
@@ -128,7 +129,6 @@ const EditableDocsPanel: React.FC<EditableDocsPanelProps> = ({
               .map((n) => String(n))
               .join("\n");
           } else if (isAdvanced) {
-            // dla advanced, jeśli nic nie ma – wstawiamy placeholder
             notesText = "";
           }
 
@@ -154,7 +154,6 @@ const EditableDocsPanel: React.FC<EditableDocsPanelProps> = ({
     setEndpoints(eps);
 
     setFieldsByKey((prev) => {
-      // jeśli poprzednie pola istnieją, nie nadpisujemy ich bez potrzeby
       const merged: Record<string, EndpointFields> = {};
       eps.forEach((e) => {
         const existing = prev[e.key];
@@ -163,7 +162,6 @@ const EditableDocsPanel: React.FC<EditableDocsPanelProps> = ({
       return merged;
     });
 
-    // nie ruszamy zaznaczenia, jeśli nadal istnieje
     if (!selectedKey || !eps.some((e) => e.key === selectedKey)) {
       setSelectedKey(eps[0]?.key ?? null);
     }
@@ -236,7 +234,6 @@ const EditableDocsPanel: React.FC<EditableDocsPanelProps> = ({
 
     const trimmedExample = fields.response200Example.trim();
     if (trimmedExample) {
-      // spróbuj sparsować jako JSON, jak nie – zwykły tekst
       try {
         content[firstCtKey].example = JSON.parse(trimmedExample);
       } catch {
@@ -267,252 +264,416 @@ const EditableDocsPanel: React.FC<EditableDocsPanelProps> = ({
     return (
       <div
         style={{
-          marginTop: 16,
-          padding: 12,
-          borderRadius: 8,
-          border: "1px solid #eee",
-          background: "#fafafa",
+          marginTop: 24,
+          display: "flex",
+          justifyContent: "center",
         }}
       >
-        Brak endpointów w dokumencie.
+        <div
+          style={{
+            maxWidth: 720,
+            width: "100%",
+            background: "white",
+            borderRadius: 24,
+            padding: "20px 24px",
+            border: "1px solid #e5e7eb",
+            boxShadow: "0 18px 45px rgba(15, 23, 42, 0.06)",
+            fontSize: 14,
+            color: "#4b5563",
+            textAlign: "center",
+          }}
+        >
+          Brak endpointów w dokumencie YAML.
+          <br />
+          Upewnij się, że wygenerowana dokumentacja zawiera sekcję{" "}
+          <code>paths</code>.
+        </div>
       </div>
     );
   }
 
+  // ❤️ sam wygląd listy i formularza – w stylu obecnych kart
   return (
     <div
       style={{
-        marginTop: 16,
-        display: "grid",
-        gridTemplateColumns: "260px 1fr",
-        gap: 16,
-        alignItems: "flex-start",
+        marginTop: 24,
+        display: "flex",
+        justifyContent: "center",
       }}
     >
-      {/* Lista endpointów */}
       <div
         style={{
-          border: "1px solid #eee",
-          borderRadius: 8,
-          padding: 8,
-          maxHeight: 520,
-          overflowY: "auto",
+          width: "100%",
+          maxWidth: 960,
+          background: "white",
+          borderRadius: 24,
+          border: "1px solid #e5e7eb",
+          boxShadow: "0 18px 45px rgba(15, 23, 42, 0.08)",
+          padding: "24px 24px 28px",
         }}
       >
+        {/* nagłówek panelu */}
         <div
           style={{
-            fontSize: 13,
-            fontWeight: 600,
-            marginBottom: 6,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "baseline",
+            marginBottom: 16,
+            gap: 12,
           }}
         >
-          Endpointy
-        </div>
-        {endpoints.map((e) => (
-          <button
-            key={e.key}
-            type="button"
-            onClick={() => setSelectedKey(e.key)}
-            style={{
-              display: "block",
-              width: "100%",
-              textAlign: "left",
-              padding: "6px 8px",
-              marginBottom: 4,
-              borderRadius: 6,
-              border:
-                e.key === selectedKey
-                  ? "1px solid #6366f1"
-                  : "1px solid transparent",
-              background:
-                e.key === selectedKey ? "#eef2ff" : "transparent",
-              cursor: "pointer",
-              fontSize: 12,
-            }}
-          >
-            <div style={{ fontWeight: 600 }}>
-              {e.method.toUpperCase()} {e.path}
-            </div>
-            {e.summary && (
-              <div style={{ fontSize: 11, color: "#555" }}>
-                {e.summary}
-              </div>
-            )}
-          </button>
-        ))}
-      </div>
-
-      {/* Formularz edycji */}
-      <div
-        style={{
-          border: "1px solid #eee",
-          borderRadius: 8,
-          padding: 12,
-        }}
-      >
-        <div
-          style={{
-            fontSize: 13,
-            fontWeight: 600,
-            marginBottom: 4,
-          }}
-        >
-          Edycja treści endpointu:&nbsp;
-          <span style={{ fontWeight: 400 }}>
-            {selectedKey}
-          </span>
-        </div>
-        <p style={{ fontSize: 11, color: "#666", marginTop: 0 }}>
-          Zmieniasz tylko części opisowe (summary, description, opis i
-          przykład odpowiedzi 200, notatki). Reszta definicji OpenAPI
-          pozostaje bez zmian.
-        </p>
-
-        {/* Summary */}
-        <div style={{ marginTop: 10 }}>
-          <label
-            style={{ display: "block", fontSize: 12, fontWeight: 600 }}
-          >
-            Summary (krótkie zdanie)
-          </label>
-          <input
-            type="text"
-            value={selectedFields.summary}
-            onChange={(e) =>
-              handleFieldsChange({ summary: e.target.value })
-            }
-            style={{
-              width: "100%",
-              padding: "6px 8px",
-              borderRadius: 6,
-              border: "1px solid #ddd",
-              fontSize: 12,
-              marginTop: 2,
-            }}
-          />
-        </div>
-
-        {/* Description */}
-        <div style={{ marginTop: 10 }}>
-          <label
-            style={{ display: "block", fontSize: 12, fontWeight: 600 }}
-          >
-            Description (pełny opis endpointu)
-          </label>
-          <textarea
-            value={selectedFields.description}
-            onChange={(e) =>
-              handleFieldsChange({ description: e.target.value })
-            }
-            rows={5}
-            style={{
-              width: "100%",
-              padding: 8,
-              borderRadius: 6,
-              border: "1px solid #ddd",
-              fontSize: 12,
-              marginTop: 2,
-              resize: "vertical",
-            }}
-          />
-        </div>
-
-        {/* Response 200 description */}
-        <div style={{ marginTop: 10 }}>
-          <label
-            style={{ display: "block", fontSize: 12, fontWeight: 600 }}
-          >
-            Response 200 – opis
-          </label>
-          <input
-            type="text"
-            value={selectedFields.response200Description}
-            onChange={(e) =>
-              handleFieldsChange({
-                response200Description: e.target.value,
-              })
-            }
-            style={{
-              width: "100%",
-              padding: "6px 8px",
-              borderRadius: 6,
-              border: "1px solid #ddd",
-              fontSize: 12,
-              marginTop: 2,
-            }}
-          />
-        </div>
-
-        {/* Response 200 example */}
-        <div style={{ marginTop: 10 }}>
-          <label
-            style={{ display: "block", fontSize: 12, fontWeight: 600 }}
-          >
-            Response 200 – przykład (JSON lub tekst)
-          </label>
-          <textarea
-            value={selectedFields.response200Example}
-            onChange={(e) =>
-              handleFieldsChange({
-                response200Example: e.target.value,
-              })
-            }
-            rows={6}
-            style={{
-              width: "100%",
-              padding: 8,
-              borderRadius: 6,
-              border: "1px solid #ddd",
-              fontSize: 12,
-              marginTop: 2,
-              fontFamily: "monospace",
-              resize: "vertical",
-            }}
-          />
-        </div>
-
-        {/* Notes – tylko advanced */}
-        {isAdvanced && (
-          <div style={{ marginTop: 12 }}>
-            <label
-              style={{ display: "block", fontSize: 12, fontWeight: 600 }}
-            >
-              Notatki (notes) – advanced
-            </label>
-            <textarea
-              value={
-                selectedFields.notesText ||
-                "" // bez domyślnego placeholdera w wartości, żeby nie psuć YAML
-              }
-              placeholder={initialNotesPlaceholder}
-              onChange={(e) =>
-                handleFieldsChange({ notesText: e.target.value })
-              }
-              rows={6}
+          <div>
+            <h3
               style={{
-                width: "100%",
-                padding: 8,
-                borderRadius: 6,
-                border: "1px solid #ddd",
-                fontSize: 12,
-                marginTop: 2,
-                fontFamily: "monospace",
-                background: "#f9fafb",
-                resize: "vertical",
+                margin: 0,
+                fontSize: 18,
+                fontWeight: 600,
+                color: "#111827",
               }}
-            />
+            >
+              Edycja treści endpointów
+            </h3>
             <p
               style={{
-                fontSize: 10,
-                color: "#777",
-                marginTop: 4,
+                margin: "4px 0 0",
+                fontSize: 12,
+                color: "#6b7280",
               }}
             >
-              Te notatki są zapisywane w YAML jako tablica <code>x-impl-notes</code>{" "}
-              i będą widoczne w PDF dla poziomu <b>advanced</b>.
+              Zmieniasz tylko pola opisowe. Definicje ścieżek, parametrów i
+              schematów danych pozostają bez zmian.
             </p>
           </div>
-        )}
+
+          <div
+            style={{
+              padding: "4px 10px",
+              borderRadius: 999,
+              background: "#eef2ff",
+              color: "#4f46e5",
+              fontSize: 12,
+              fontWeight: 500,
+              whiteSpace: "nowrap",
+            }}
+          >
+            YAML aktualizuje się na bieżąco
+          </div>
+        </div>
+
+        {/* layout: lista endpointów + formularz */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "280px 1fr",
+            gap: 20,
+            alignItems: "flex-start",
+          }}
+        >
+          {/* Lista endpointów */}
+          <div
+            style={{
+              borderRadius: 18,
+              border: "1px solid #e5e7eb",
+              background: "#f9fafb",
+              padding: "10px 10px 12px",
+              maxHeight: 520,
+              overflowY: "auto",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 13,
+                fontWeight: 600,
+                marginBottom: 4,
+                color: "#111827",
+              }}
+            >
+              Endpointy
+            </div>
+            <p
+              style={{
+                margin: "0 0 8px",
+                fontSize: 11,
+                color: "#6b7280",
+              }}
+            >
+              Wybierz endpoint z listy, aby edytować jego opis.
+            </p>
+
+            {endpoints.map((e) => {
+              const isActive = e.key === selectedKey;
+
+              // małe kolorowe „badge” dla metody
+              const methodColor =
+                e.method === "get"
+                  ? "#047857"
+                  : e.method === "post"
+                  ? "#1d4ed8"
+                  : e.method === "put"
+                  ? "#92400e"
+                  : e.method === "delete"
+                  ? "#b91c1c"
+                  : "#4b5563";
+
+              const methodBg = methodColor + "1A"; // lekkie tło
+
+              return (
+                <button
+                  key={e.key}
+                  type="button"
+                  onClick={() => setSelectedKey(e.key)}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    textAlign: "left",
+                    padding: "8px 9px",
+                    marginBottom: 4,
+                    borderRadius: 10,
+                    border: isActive
+                      ? "1px solid #4f46e5"
+                      : "1px solid transparent",
+                    background: isActive ? "#eef2ff" : "transparent",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      marginBottom: 2,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        textTransform: "uppercase",
+                        padding: "2px 6px",
+                        borderRadius: 999,
+                        background: methodBg,
+                        color: methodColor,
+                      }}
+                    >
+                      {e.method.toUpperCase()}
+                    </span>
+                    <span
+                      style={{
+                        fontFamily: "monospace",
+                        fontSize: 11,
+                        color: "#111827",
+                      }}
+                    >
+                      {e.path}
+                    </span>
+                  </div>
+                  {e.summary && (
+                    <div
+                      style={{
+                        fontSize: 11,
+                        color: "#4b5563",
+                        lineHeight: 1.3,
+                      }}
+                    >
+                      {e.summary}
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Formularz edycji */}
+          <div
+            style={{
+              borderRadius: 18,
+              border: "1px solid #e5e7eb",
+              padding: "14px 14px 16px",
+              background: "#ffffff",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 13,
+                fontWeight: 600,
+                marginBottom: 4,
+                color: "#111827",
+              }}
+            >
+              Edycja endpointu:{" "}
+              <span
+                style={{
+                  fontWeight: 500,
+                  fontFamily: "monospace",
+                  fontSize: 12,
+                  color: "#4b5563",
+                }}
+              >
+                {selectedKey}
+              </span>
+            </div>
+            <p
+              style={{
+                fontSize: 11,
+                color: "#6b7280",
+                marginTop: 0,
+                marginBottom: 10,
+              }}
+            >
+              Uzupełnij pola opisowe. Zmiany zostaną zapisane w YAML i
+              wykorzystane przy kolejnym renderowaniu PDF.
+            </p>
+
+            {/* Summary */}
+            <div style={{ marginTop: 8 }}>
+              <label
+                style={{ display: "block", fontSize: 12, fontWeight: 600 }}
+              >
+                Summary (krótkie zdanie)
+              </label>
+              <input
+                type="text"
+                value={selectedFields.summary}
+                onChange={(e) =>
+                  handleFieldsChange({ summary: e.target.value })
+                }
+                style={{
+                  width: "100%",
+                  padding: "7px 9px",
+                  borderRadius: 10,
+                  border: "1px solid #e5e7eb",
+                  fontSize: 12,
+                  marginTop: 3,
+                }}
+              />
+            </div>
+
+            {/* Description */}
+            <div style={{ marginTop: 10 }}>
+              <label
+                style={{ display: "block", fontSize: 12, fontWeight: 600 }}
+              >
+                Description (pełny opis endpointu)
+              </label>
+              <textarea
+                value={selectedFields.description}
+                onChange={(e) =>
+                  handleFieldsChange({ description: e.target.value })
+                }
+                rows={5}
+                style={{
+                  width: "100%",
+                  padding: 9,
+                  borderRadius: 10,
+                  border: "1px solid #e5e7eb",
+                  fontSize: 12,
+                  marginTop: 3,
+                  resize: "vertical",
+                }}
+              />
+            </div>
+
+            {/* Response 200 description */}
+            <div style={{ marginTop: 10 }}>
+              <label
+                style={{ display: "block", fontSize: 12, fontWeight: 600 }}
+              >
+                Response 200 – opis
+              </label>
+              <input
+                type="text"
+                value={selectedFields.response200Description}
+                onChange={(e) =>
+                  handleFieldsChange({
+                    response200Description: e.target.value,
+                  })
+                }
+                style={{
+                  width: "100%",
+                  padding: "7px 9px",
+                  borderRadius: 10,
+                  border: "1px solid #e5e7eb",
+                  fontSize: 12,
+                  marginTop: 3,
+                }}
+              />
+            </div>
+
+            {/* Response 200 example */}
+            <div style={{ marginTop: 10 }}>
+              <label
+                style={{ display: "block", fontSize: 12, fontWeight: 600 }}
+              >
+                Response 200 – przykład (JSON lub tekst)
+              </label>
+              <textarea
+                value={selectedFields.response200Example}
+                onChange={(e) =>
+                  handleFieldsChange({
+                    response200Example: e.target.value,
+                  })
+                }
+                rows={6}
+                style={{
+                  width: "100%",
+                  padding: 9,
+                  borderRadius: 10,
+                  border: "1px solid #e5e7eb",
+                  fontSize: 12,
+                  marginTop: 3,
+                  fontFamily: "monospace",
+                  resize: "vertical",
+                }}
+              />
+            </div>
+
+            {/* Notes – tylko advanced */}
+            {isAdvanced && (
+              <div style={{ marginTop: 12 }}>
+                <label
+                  style={{
+                    display: "block",
+                    fontSize: 12,
+                    fontWeight: 600,
+                  }}
+                >
+                  Notatki (notes) – advanced
+                </label>
+                <textarea
+                  value={selectedFields.notesText || ""}
+                  placeholder={initialNotesPlaceholder}
+                  onChange={(e) =>
+                    handleFieldsChange({ notesText: e.target.value })
+                  }
+                  rows={6}
+                  style={{
+                    width: "100%",
+                    padding: 9,
+                    borderRadius: 10,
+                    border: "1px solid #e5e7eb",
+                    fontSize: 12,
+                    marginTop: 3,
+                    fontFamily: "monospace",
+                    background: "#f9fafb",
+                    resize: "vertical",
+                  }}
+                />
+                <p
+                  style={{
+                    fontSize: 10,
+                    color: "#6b7280",
+                    marginTop: 4,
+                  }}
+                >
+                  Notatki trafiają do YAML jako tablica{" "}
+                  <code>x-impl-notes</code> i będą widoczne w PDF dla
+                  poziomu <b>advanced</b>.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );

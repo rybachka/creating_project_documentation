@@ -10,6 +10,7 @@ import { StatusBar } from "./components/StatusBar";
 import { LevelPanel, Level } from "./components/LevelPanel";
 import { StatusGenerate } from "./components/StatusGenerate";
 import { DocsActionsPanel } from "./components/DocsActionsPanel";
+import EditableDocsPanel from "./EditableDocsPanel";
 
 const App: React.FC = () => {
   // wspólny timer (upload + generowanie)
@@ -27,6 +28,9 @@ const App: React.FC = () => {
 
   // stan paska postępu (0–100)
   const [progress, setProgress] = useState(0);
+
+  // stan edycji YAML
+  const [editableYaml, setEditableYaml] = useState<string | null>(null);
 
   const tickRef = useRef<number | null>(null);
   const t0Ref = useRef<number>(0);
@@ -64,9 +68,9 @@ const App: React.FC = () => {
     progressRef.current = window.setInterval(() => {
       setProgress((prev) => {
         if (prev >= 90) return 90; // czekamy na backend – max 90%
-        return prev + 1;           // +2% co 200 ms
+        return prev + 0.5;         // wolniejsze wypełnianie
       });
-    }, 200);
+    }, 400);
   };
 
   const stopProgress = (success: boolean) => {
@@ -92,6 +96,7 @@ const App: React.FC = () => {
 
     setDocsReady(false);
     setPdfUrl(null);
+    setEditableYaml(null); // reset edytora
     setStatus("Trwa generowanie dokumentacji…");
     setElapsed("0.0s");
     setIsGenerating(true);
@@ -119,7 +124,6 @@ const App: React.FC = () => {
 
       const blob = await res.blob();
 
-      // sprzątanie starego URL-a, jeśli był
       if (pdfUrl) {
         URL.revokeObjectURL(pdfUrl);
       }
@@ -147,7 +151,6 @@ const App: React.FC = () => {
     if (!pdfUrl) return;
     const link = document.createElement("a");
     link.href = pdfUrl;
-    // prosta nazwa pliku po stronie frontu
     link.download = `${projectLabel}_${level}.pdf`;
     document.body.appendChild(link);
     link.click();
@@ -159,9 +162,82 @@ const App: React.FC = () => {
     window.open(pdfUrl, "_blank");
   };
 
-  const handleEditPdf = () => {
-    // tutaj później podepniemy widok edycji (EditableDocsPanel / YAML)
-    console.log("TODO: tryb edycji PDF / YAML dla projektu", projectLabel);
+  // 1) wczytanie YAML do edycji
+  const handleEditPdf = async () => {
+  if (!uploadResult) return;
+
+  // UX: to już nie „generowanie”, tylko otwieranie do edycji
+  setStatus("Otwieram dokumentację w trybie edycji…");
+
+  try {
+    const url = `/api/projects/${uploadResult.id}/docs/editable?level=${level}`;
+    const res = await fetch(url, { method: "GET" });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(
+        "Błąd wczytywania YAML do edycji:",
+        res.status,
+        res.statusText,
+        text
+      );
+      setStatus("Błąd wczytywania dokumentacji do edycji.");
+      return;
+    }
+
+    const text = await res.text();
+    setEditableYaml(text);
+    setStatus("Dokumentacja otwarta w trybie edycji.");
+  } catch (err) {
+    console.error("Błąd sieci podczas wczytywania YAML:", err);
+    setStatus("Błąd sieci podczas wczytywania dokumentacji.");
+  }
+  };
+  // 2) wygenerowanie PDF z edytowanego YAML
+  const handleDownloadEditedPdf = async () => {
+    if (!uploadResult || !editableYaml) return;
+
+    setStatus("Generuję PDF z edytowanej dokumentacji…");
+    setElapsed("0.0s");
+    startTimer();
+
+    try {
+      const url = `/api/projects/${uploadResult.id}/docs/edited/pdf?level=${level}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+        },
+        body: editableYaml,
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(
+          "Błąd generowania edytowanego PDF:",
+          res.status,
+          res.statusText,
+          text
+        );
+        setStatus("Błąd generowania edytowanego PDF.");
+        return;
+      }
+
+      const blob = await res.blob();
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${projectLabel}_${level}_edited.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setStatus("Edytowany PDF wygenerowany i pobrany.");
+    } catch (err) {
+      console.error("Błąd sieci przy generowaniu edytowanego PDF:", err);
+      setStatus("Błąd sieci przy generowaniu edytowanego PDF.");
+    } finally {
+      stopTimer();
+    }
   };
 
   return (
@@ -202,7 +278,7 @@ const App: React.FC = () => {
           </section>
         )}
 
-        {/* Pasek statusu – tylko dla uploadu, NIE podczas generowania */}
+        {/* Pasek statusu – tylko dla uploadu, NIE podczas generowania PDF */}
         <StatusBar
           status={status}
           elapsed={elapsed}
@@ -231,14 +307,67 @@ const App: React.FC = () => {
         )}
 
         {/* 4. Po zakończeniu generowania – panel z akcjami PDF */}
-        {projectUploaded && docsReady && !isGenerating && (
+        {projectUploaded && docsReady && !isGenerating && !editableYaml &&(
           <DocsActionsPanel
             projectLabel={projectLabel}
             level={level}
             onDownloadPdf={handleDownloadPdf}
             onPreviewPdf={handlePreviewPdf}
-            onEditPdf={handleEditPdf}
+            onEditPdf={handleEditPdf}   // << TU podpinasz przycisk "Edytować PDF"
           />
+        )}
+
+        {/* 5. Sekcja edycji dokumentacji (YAML → PDF) */}
+        {projectUploaded && editableYaml && (
+          <section style={{ marginTop: 32 }}>
+            <h2
+              style={{
+                fontSize: 18,
+                fontWeight: 600,
+                marginBottom: 8,
+                color: "#111827",
+              }}
+            >
+              Edytuj dokumentację przed wygenerowaniem PDF
+            </h2>
+            <p
+              style={{
+                fontSize: 13,
+                color: "#6b7280",
+                marginTop: 0,
+                marginBottom: 12,
+              }}
+            >
+              Zmieniasz treść opisu endpointów w YAML. Na podstawie tej
+              wersji możesz pobrać nowy, edytowany PDF.
+            </p>
+
+            <EditableDocsPanel
+              yaml={editableYaml}
+              onYamlChange={setEditableYaml}
+              isAdvanced={level === "advanced"}
+            />
+
+            <div style={{ marginTop: 16, textAlign: "right" }}>
+              <button
+                type="button"
+                onClick={handleDownloadEditedPdf}
+                style={{
+                  padding: "10px 20px",
+                  borderRadius: 999,
+                  border: "none",
+                  background: "#4f46e5",
+                  color: "white",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  boxShadow: "0 10px 24px rgba(79, 70, 229, 0.35)",
+                }}
+              >
+                Pobrać edytowany PDF
+              </button>
+            </div>
+          </section>
         )}
       </main>
     </div>

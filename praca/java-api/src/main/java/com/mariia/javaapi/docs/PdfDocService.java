@@ -831,16 +831,16 @@ public class PdfDocService {
             if (schema instanceof ObjectSchema obj) {
                 Map<String, Schema> props = obj.getProperties();
                 if (props != null && !props.isEmpty()) {
-                    sb.append("<table><thead><tr><th>Pole</th><th>Typ</th><th>Opis</th></tr></thead><tbody>");
+                    sb.append("<table><thead><tr><th>Pole</th><th>Typ</th></tr></thead><tbody>");
                     props.forEach((propName, propSchema) -> {
                         String t = propSchema.get$ref() != null
                                 ? propSchema.get$ref()
                                 : (propSchema.getType() != null ? propSchema.getType() : "");
-                        String desc = propSchema.getDescription() != null ? propSchema.getDescription() : "";
+                        //String desc = propSchema.getDescription() != null ? propSchema.getDescription() : "";
                         sb.append("<tr>")
                           .append("<td>").append(esc(propName)).append("</td>")
                           .append("<td>").append(t.isEmpty() ? "" : "<code>"+esc(t)+"</code>").append("</td>")
-                          .append("<td>").append(esc(desc)).append("</td>")
+                         // .append("<td>").append(esc(desc)).append("</td>")
                           .append("</tr>");
                     });
                     sb.append("</tbody></table>");

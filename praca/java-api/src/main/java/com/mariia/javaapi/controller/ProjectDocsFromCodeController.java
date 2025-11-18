@@ -264,14 +264,18 @@ public class ProjectDocsFromCodeController {
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
 
-        code2docs.generateYamlFromCode(
-                endpoints,
-                projectName,
-                audience,
-                aiYaml,
-                projectDir
-        );
+        // jeśli jeszcze nie ma pliku – wygeneruj z kodu
+        if (!Files.exists(aiYaml)) {
+            code2docs.generateYamlFromCode(
+                    endpoints,
+                    projectName,
+                    audience,
+                    aiYaml,
+                    projectDir
+            );
+        }
 
+        // a jeśli jest, po prostu go czytamy
         String yaml = Files.readString(aiYaml);
 
         return ResponseEntity
