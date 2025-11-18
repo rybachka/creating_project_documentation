@@ -16,7 +16,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
 }) => {
   if (!visible) return null;
 
-  const fillWidth = busy ? "80%" : "100%";
+  const fillWidth = busy ? "60%" : "100%";
 
   return (
     <div style={{ marginTop: 16 }}>

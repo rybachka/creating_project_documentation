@@ -6,6 +6,7 @@ export interface UploadResult {
   status: string;
   message?: string;
   detectedSpec?: string;
+  fileName?: string;
 }
 
 export interface ProjectUploadPanelProps {
@@ -66,7 +67,7 @@ export const ProjectUploadPanel: React.FC<ProjectUploadPanelProps> = ({
       setStatus(
         "Projekt wgrany. Możesz wygenerować dokumentację z kodu."
       );
-      onUploadSuccess(json);
+      onUploadSuccess({...json, fileName: file.name});
     } catch (err) {
       const msg = `Błąd sieci podczas wgrywania projektu: ${String(err)}`;
       console.error(msg);
@@ -139,9 +140,6 @@ export const ProjectUploadPanel: React.FC<ProjectUploadPanelProps> = ({
             opacity: 0.9,
           }}
         >
-          {fileName
-            ? fileName
-            : "Kliknij, aby wybrać ZIP projektu Java Spring."}
         </div>
       </button>
     </div>

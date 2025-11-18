@@ -38,7 +38,7 @@ export const StartBar: React.FC = () => {
               width: 56,
               height: 36,
               borderRadius: 8,
-              background: "#3b82f6",
+              background: "#4F46E5",
               color: "white",
               display: "flex",
               alignItems: "center",
