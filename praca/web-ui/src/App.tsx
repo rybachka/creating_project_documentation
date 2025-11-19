@@ -1,4 +1,3 @@
-// src/App.tsx
 import React, { useRef, useState } from "react";
 import { StartBar } from "./components/StartBar";
 import { HelloText } from "./components/HelloText";
@@ -11,8 +10,13 @@ import { LevelPanel, Level } from "./components/LevelPanel";
 import { StatusGenerate } from "./components/StatusGenerate";
 import { DocsActionsPanel } from "./components/DocsActionsPanel";
 import EditableDocsPanel from "./EditableDocsPanel";
+import { HowItWorksPanel } from "./components/HowItWorksPanel";
+import { ContactPanel } from "./components/ContactPanel";
 
 const App: React.FC = () => {
+  const [showContact, setShowContact] = useState(false);
+  const [showHowItWorks, setShowHowItWorks] = useState(false);
+
   // wspólny timer (upload + generowanie)
   const [status, setStatus] = useState<string>("Gotowa.");
   const [elapsed, setElapsed] = useState<string>("0.0s");
@@ -68,7 +72,7 @@ const App: React.FC = () => {
     progressRef.current = window.setInterval(() => {
       setProgress((prev) => {
         if (prev >= 90) return 90; // czekamy na backend – max 90%
-        return prev + 0.5;         // wolniejsze wypełnianie
+        return prev + 0.5; // wolniejsze wypełnianie
       });
     }, 400);
   };
@@ -87,6 +91,26 @@ const App: React.FC = () => {
     uploadResult?.message ||
     uploadResult?.id ||
     "projekt";
+
+  // ==============================
+  //  POWRÓT NA STRONĘ GŁÓWNĄ
+  // ==============================
+  const handleGoHome = () => {
+    // wracamy do generatora + czyścimy stan
+    setUploadResult(null);
+    setDocsReady(false);
+    setPdfUrl(null);
+    setEditableYaml(null);
+    setIsGenerating(false);
+    setProgress(0);
+    setShowHowItWorks(false);
+
+    stopTimer();
+    stopProgress(false);
+    setStatus("Gotowa.");
+    setElapsed("0.0s");
+    setBusy(false);
+  };
 
   // ==============================
   //  GENEROWANIE PDF PO „TAK”
@@ -146,7 +170,6 @@ const App: React.FC = () => {
   // ==============================
   //  AKCJE PO WYGNEROWANIU PDF
   // ==============================
-
   const handleDownloadPdf = () => {
     if (!pdfUrl) return;
     const link = document.createElement("a");
@@ -164,35 +187,35 @@ const App: React.FC = () => {
 
   // 1) wczytanie YAML do edycji
   const handleEditPdf = async () => {
-  if (!uploadResult) return;
+    if (!uploadResult) return;
 
-  // UX: to już nie „generowanie”, tylko otwieranie do edycji
-  setStatus("Otwieram dokumentację w trybie edycji…");
+    setStatus("Otwieram dokumentację w trybie edycji…");
 
-  try {
-    const url = `/api/projects/${uploadResult.id}/docs/editable?level=${level}`;
-    const res = await fetch(url, { method: "GET" });
+    try {
+      const url = `/api/projects/${uploadResult.id}/docs/editable?level=${level}`;
+      const res = await fetch(url, { method: "GET" });
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(
-        "Błąd wczytywania YAML do edycji:",
-        res.status,
-        res.statusText,
-        text
-      );
-      setStatus("Błąd wczytywania dokumentacji do edycji.");
-      return;
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(
+          "Błąd wczytywania YAML do edycji:",
+          res.status,
+          res.statusText,
+          text
+        );
+        setStatus("Błąd wczytywania dokumentacji do edycji.");
+        return;
+      }
+
+      const text = await res.text();
+      setEditableYaml(text);
+      setStatus("Dokumentacja otwarta w trybie edycji.");
+    } catch (err) {
+      console.error("Błąd sieci podczas wczytywania YAML:", err);
+      setStatus("Błąd sieci podczas wczytywania dokumentacji.");
     }
-
-    const text = await res.text();
-    setEditableYaml(text);
-    setStatus("Dokumentacja otwarta w trybie edycji.");
-  } catch (err) {
-    console.error("Błąd sieci podczas wczytywania YAML:", err);
-    setStatus("Błąd sieci podczas wczytywania dokumentacji.");
-  }
   };
+
   // 2) wygenerowanie PDF z edytowanego YAML
   const handleDownloadEditedPdf = async () => {
     if (!uploadResult || !editableYaml) return;
@@ -249,7 +272,11 @@ const App: React.FC = () => {
         minHeight: "100vh",
       }}
     >
-      <StartBar />
+      <StartBar
+        onHowItWorksClick={() => setShowHowItWorks(true)}
+        onHomeClick={handleGoHome}
+        onContactClick={() => setShowContact(true)}
+      />
 
       <main
         style={{
@@ -258,10 +285,9 @@ const App: React.FC = () => {
           padding: "24px 16px 40px",
         }}
       >
-        {/* Intro tylko, gdy jeszcze nic nie wgrano */}
+        {/* GENERATOR – zawsze obecny na stronie głównej */}
         {!projectUploaded && <HelloText />}
 
-        {/* 1. Upload projektu – dopóki projekt NIE jest wgrany */}
         {!projectUploaded && (
           <section style={{ marginTop: 24 }}>
             <ProjectUploadPanel
@@ -278,7 +304,6 @@ const App: React.FC = () => {
           </section>
         )}
 
-        {/* Pasek statusu – tylko dla uploadu, NIE podczas generowania PDF */}
         <StatusBar
           status={status}
           elapsed={elapsed}
@@ -286,17 +311,15 @@ const App: React.FC = () => {
           visible={busy && !isGenerating}
         />
 
-        {/* 2. Po wgraniu projektu: panel wyboru poziomu + przycisk „Generuj” */}
-        {projectUploaded && !isGenerating && !docsReady && (
+        {projectUploaded && !isGenerating && !docsReady && !editableYaml && (
           <LevelPanel
             level={level}
             projectLabel={projectLabel}
             onLevelChange={setLevel}
-            onGenerate={handleGenerateDocs} // wywoływane po „Tak”
+            onGenerate={handleGenerateDocs}
           />
         )}
 
-        {/* 3. Podczas generowania – karta StatusGenerate */}
         {projectUploaded && isGenerating && (
           <StatusGenerate
             projectName={projectLabel}
@@ -306,18 +329,19 @@ const App: React.FC = () => {
           />
         )}
 
-        {/* 4. Po zakończeniu generowania – panel z akcjami PDF */}
-        {projectUploaded && docsReady && !isGenerating && !editableYaml &&(
-          <DocsActionsPanel
-            projectLabel={projectLabel}
-            level={level}
-            onDownloadPdf={handleDownloadPdf}
-            onPreviewPdf={handlePreviewPdf}
-            onEditPdf={handleEditPdf}   // << TU podpinasz przycisk "Edytować PDF"
-          />
-        )}
+        {projectUploaded &&
+          docsReady &&
+          !isGenerating &&
+          !editableYaml && (
+            <DocsActionsPanel
+              projectLabel={projectLabel}
+              level={level}
+              onDownloadPdf={handleDownloadPdf}
+              onPreviewPdf={handlePreviewPdf}
+              onEditPdf={handleEditPdf}
+            />
+          )}
 
-        {/* 5. Sekcja edycji dokumentacji (YAML → PDF) */}
         {projectUploaded && editableYaml && (
           <section style={{ marginTop: 32 }}>
             <h2
@@ -368,6 +392,18 @@ const App: React.FC = () => {
               </button>
             </div>
           </section>
+        )}
+
+        {/* HOW IT WORKS – doklejony pod generatorem */}
+        {showHowItWorks && (
+          <section style={{ marginTop: 40 }}>
+            <HowItWorksPanel onBack={() => setShowHowItWorks(false)} />
+          </section>
+        )}
+
+        {/* Kontakt – panel modalny */}
+        {showContact && (
+          <ContactPanel onClose={() => setShowContact(false)} />
         )}
       </main>
     </div>

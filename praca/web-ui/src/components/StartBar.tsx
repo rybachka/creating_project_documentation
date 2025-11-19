@@ -1,4 +1,3 @@
-// src/components/StartBar.tsx
 import React from "react";
 
 const navBtn: React.CSSProperties = {
@@ -10,7 +9,17 @@ const navBtn: React.CSSProperties = {
   color: "#111827",
 };
 
-export const StartBar: React.FC = () => {
+interface StartBarProps {
+  onHowItWorksClick: () => void;
+  onHomeClick: () => void;
+  onContactClick?: () => void; // opcjonalnie, jeśli chcesz ContactPanel
+}
+
+export const StartBar: React.FC<StartBarProps> = ({
+  onHowItWorksClick,
+  onHomeClick,
+  onContactClick,
+}) => {
   return (
     <header
       style={{
@@ -31,8 +40,20 @@ export const StartBar: React.FC = () => {
           justifyContent: "space-between",
         }}
       >
-        {/* logo */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {/* logo – kliknięcie wraca do generatora */}
+        <button
+          type="button"
+          onClick={onHomeClick}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "none",
+            border: "none",
+            padding: 0,
+            cursor: "pointer",
+          }}
+        >
           <div
             style={{
               width: 56,
@@ -52,7 +73,7 @@ export const StartBar: React.FC = () => {
           <span style={{ fontWeight: 600, fontSize: 18, color: "#111827" }}>
             Code2Docs AI
           </span>
-        </div>
+        </button>
 
         {/* menu */}
         <nav
@@ -64,9 +85,24 @@ export const StartBar: React.FC = () => {
             color: "#111827",
           }}
         >
-          <button style={navBtn}>Funkcje</button>
-          <button style={navBtn}>Jak to działa</button>
-          <button style={navBtn}>Kontakt</button>
+          {/* Funkcje = powrót do głównego widoku / generatora */}
+          <button style={navBtn} onClick={onHomeClick}>
+            Funkcje
+          </button>
+
+          {/* Jak to działa = HowItWorksPanel */}
+          <button style={navBtn} onClick={onHowItWorksClick}>
+            Jak to działa
+          </button>
+
+          {/* Kontakt – jeśli podasz onContactClick w App */}
+          <button
+            style={navBtn}
+            onClick={onContactClick}
+            disabled={!onContactClick}
+          >
+            Kontakt
+          </button>
         </nav>
       </div>
     </header>

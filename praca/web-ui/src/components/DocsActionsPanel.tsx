@@ -77,12 +77,13 @@ export const DocsActionsPanel: React.FC<DocsActionsPanelProps> = ({
               minWidth: 160,
               padding: "10px 20px",
               borderRadius: 999,
-              border: "1px solid #4f46e5",
-              background: "white",
-              color: "#4f46e5",
+              border: "none",
+              background: "#4f46e5",
+              color: "white",
               fontSize: 14,
               fontWeight: 600,
               cursor: "pointer",
+              boxShadow: "0 14px 30px rgba(79, 70, 229, 0.35)",
             }}
           >
             Pobrać PDF
@@ -114,11 +115,11 @@ export const DocsActionsPanel: React.FC<DocsActionsPanelProps> = ({
               minWidth: 160,
               padding: "10px 20px",
               borderRadius: 999,
-              border: "1px solid #e5e7eb",
-              background: "#f9fafb",
-              color: "#374151",
+              border: "1px solid #4f46e5",
+              background: "white",
+              color: "#4f46e5",
               fontSize: 14,
-              fontWeight: 500,
+              fontWeight: 600,
               cursor: "pointer",
             }}
           >
