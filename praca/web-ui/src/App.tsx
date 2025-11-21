@@ -1,3 +1,4 @@
+// src/App.tsx
 import React, { useRef, useState } from "react";
 import { StartBar } from "./components/StartBar";
 import { HelloText } from "./components/HelloText";
@@ -93,23 +94,38 @@ const App: React.FC = () => {
     "projekt";
 
   // ==============================
-  //  POWRÓT NA STRONĘ GŁÓWNĄ
+  //  POWRÓT NA EKRAN DOMOWY (logo / „Funkcje”)
   // ==============================
-  const handleGoHome = () => {
-    // wracamy do generatora + czyścimy stan
+  const handleHome = () => {
+    // zatrzymujemy wszystkie timery
+    if (tickRef.current) {
+      clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+    if (progressRef.current) {
+      clearInterval(progressRef.current);
+      progressRef.current = null;
+    }
+
+    // chowamy panele pomocnicze
+    setShowHowItWorks(false);
+    setShowContact(false);
+
+    // resetujemy stan generatora
     setUploadResult(null);
     setDocsReady(false);
-    setPdfUrl(null);
-    setEditableYaml(null);
     setIsGenerating(false);
+    setEditableYaml(null);
+    setPdfUrl(null);
     setProgress(0);
-    setShowHowItWorks(false);
 
-    stopTimer();
-    stopProgress(false);
+    // reset statusu / zegara
     setStatus("Gotowa.");
     setElapsed("0.0s");
     setBusy(false);
+
+    // opcjonalnie: przewijanie na górę
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   // ==============================
@@ -170,6 +186,7 @@ const App: React.FC = () => {
   // ==============================
   //  AKCJE PO WYGNEROWANIU PDF
   // ==============================
+
   const handleDownloadPdf = () => {
     if (!pdfUrl) return;
     const link = document.createElement("a");
@@ -183,6 +200,83 @@ const App: React.FC = () => {
   const handlePreviewPdf = () => {
     if (!pdfUrl) return;
     window.open(pdfUrl, "_blank");
+  };
+
+  // Pobrać YAML
+  const handleDownloadYaml = async () => {
+    if (!uploadResult) return;
+
+    setStatus("Pobieram YAML…");
+
+    try {
+      const url = `/api/projects/${uploadResult.id}/docs/yaml/download?level=${level}`;
+      const res = await fetch(url);
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(
+          "Błąd pobierania YAML:",
+          res.status,
+          res.statusText,
+          text
+        );
+        setStatus("Błąd pobierania YAML.");
+        return;
+      }
+
+      const blob = await res.blob();
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${projectLabel}_${level}.yaml`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setStatus("YAML pobrany.");
+    } catch (err) {
+      console.error("Błąd sieci przy pobieraniu YAML:", err);
+      setStatus("Błąd sieci przy pobieraniu YAML.");
+    }
+  };
+
+  // Dane wejściowe do modelu (JSON z /nlp-input)
+  const handleDownloadNlpInput = async () => {
+    if (!uploadResult) return;
+
+    setStatus("Pobieram dane wejściowe do modelu…");
+
+    try {
+      const url = `/api/projects/${uploadResult.id}/docs/nlp-input?level=${level}`;
+      const res = await fetch(url);
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(
+          "Błąd pobierania NLP input:",
+          res.status,
+          res.statusText,
+          text
+        );
+        setStatus("Błąd pobierania danych wejściowych.");
+        return;
+      }
+
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json",
+      });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${projectLabel}_${level}_nlp-input.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setStatus("Dane wejściowe pobrane.");
+    } catch (err) {
+      console.error("Błąd sieci przy pobieraniu NLP input:", err);
+      setStatus("Błąd sieci przy pobieraniu danych wejściowych.");
+    }
   };
 
   // 1) wczytanie YAML do edycji
@@ -273,8 +367,8 @@ const App: React.FC = () => {
       }}
     >
       <StartBar
-        onHowItWorksClick={() => setShowHowItWorks(true)}
-        onHomeClick={handleGoHome}
+        onHowItWorksClick={() => setShowHowItWorks((v) => !v)}
+        onHomeClick={handleHome}
         onContactClick={() => setShowContact(true)}
       />
 
@@ -285,7 +379,7 @@ const App: React.FC = () => {
           padding: "24px 16px 40px",
         }}
       >
-        {/* GENERATOR – zawsze obecny na stronie głównej */}
+        {/* ekran domowy: HelloText + ProjectUploadPanel gdy brak projektu */}
         {!projectUploaded && <HelloText />}
 
         {!projectUploaded && (
@@ -311,7 +405,7 @@ const App: React.FC = () => {
           visible={busy && !isGenerating}
         />
 
-        {projectUploaded && !isGenerating && !docsReady && !editableYaml && (
+        {projectUploaded && !isGenerating && !docsReady && (
           <LevelPanel
             level={level}
             projectLabel={projectLabel}
@@ -329,18 +423,17 @@ const App: React.FC = () => {
           />
         )}
 
-        {projectUploaded &&
-          docsReady &&
-          !isGenerating &&
-          !editableYaml && (
-            <DocsActionsPanel
-              projectLabel={projectLabel}
-              level={level}
-              onDownloadPdf={handleDownloadPdf}
-              onPreviewPdf={handlePreviewPdf}
-              onEditPdf={handleEditPdf}
-            />
-          )}
+        {projectUploaded && docsReady && !isGenerating && !editableYaml && (
+          <DocsActionsPanel
+            projectLabel={projectLabel}
+            level={level}
+            onDownloadPdf={handleDownloadPdf}
+            onPreviewPdf={handlePreviewPdf}
+            onEditPdf={handleEditPdf}
+            onDownloadYaml={handleDownloadYaml}
+            onDownloadNlpInput={handleDownloadNlpInput}
+          />
+        )}
 
         {projectUploaded && editableYaml && (
           <section style={{ marginTop: 32 }}>
@@ -362,8 +455,8 @@ const App: React.FC = () => {
                 marginBottom: 12,
               }}
             >
-              Zmieniasz treść opisu endpointów w YAML. Na podstawie tej
-              wersji możesz pobrać nowy, edytowany PDF.
+              Zmieniasz treść opisu endpointów w YAML. Na podstawie tej wersji
+              możesz pobrać nowy, edytowany PDF.
             </p>
 
             <EditableDocsPanel
@@ -394,17 +487,11 @@ const App: React.FC = () => {
           </section>
         )}
 
-        {/* HOW IT WORKS – doklejony pod generatorem */}
         {showHowItWorks && (
-          <section style={{ marginTop: 40 }}>
-            <HowItWorksPanel onBack={() => setShowHowItWorks(false)} />
-          </section>
+          <HowItWorksPanel onBack={() => setShowHowItWorks(false)} />
         )}
 
-        {/* Kontakt – panel modalny */}
-        {showContact && (
-          <ContactPanel onClose={() => setShowContact(false)} />
-        )}
+        {showContact && <ContactPanel onClose={() => setShowContact(false)} />}
       </main>
     </div>
   );

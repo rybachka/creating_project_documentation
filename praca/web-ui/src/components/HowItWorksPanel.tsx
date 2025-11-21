@@ -142,6 +142,34 @@ const sections: Section[] = [
       </>
     ),
   },
+  {
+    id:8,
+      title: "Funkcje zaawansowane",
+      body: (
+        <ul
+          style={{
+            marginTop: 8,
+            paddingLeft: 18,
+            fontSize: 14,
+            color: "#4b5563",
+          }}
+        >
+          <li>
+            <strong>Pobrać wygenerowany YAML</strong> – możesz pobrać plik{" "}
+            <code>openapi_&lt;poziom&gt;.yaml</code> używany do generowania PDF.
+            Nadaje się do dalszej obróbki, wersjonowania w Git lub integracji
+            z innymi narzędziami (np. Swagger UI).
+          </li>
+          <li>
+            <strong>Pobrać dane wejściowe do modelu</strong> – możesz pobrać JSON
+            z wejściami NLP (np. skróty endpointów, opisy, kontekst), który
+            został użyty przy generowaniu dokumentacji. To przydatne, jeśli
+            chcesz własnoręcznie eksperymentować z modelami AI lub analizować,
+            jakie dane są przekazywane do modelu.
+          </li>
+        </ul>
+      ),
+    },
 ];
 
 export const HowItWorksPanel: React.FC<HowItWorksPanelProps> = ({ onBack }) => {

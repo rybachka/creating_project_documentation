@@ -158,9 +158,9 @@ public class ProjectDocsFromCodeController {
         return asInline(aiPdf, fileName, MediaType.APPLICATION_PDF_VALUE);
     }
 
-    // =========================================================
-    //  YAML (inline + download)
-    // =========================================================
+// =========================================================
+//  YAML (inline + download) – BEZ ponownego generowania
+// =========================================================
 
     @GetMapping(value = "/{id}/docs/yaml", produces = "text/yaml")
     public ResponseEntity<byte[]> viewYamlInline(
@@ -173,24 +173,14 @@ public class ProjectDocsFromCodeController {
             return notFound("Project not found: " + id);
         }
 
-        List<EndpointIR> endpoints = parser.parseProject(projectDir);
-        if (endpoints.isEmpty()) {
-            return badRequest("No endpoints found in source code.");
-        }
-
-        Files.createDirectories(projectDir);
-
-        String audience = level;
+        String audience = level; // beginner / advanced
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
 
-        code2docs.generateYamlFromCode(
-                endpoints,
-                projectName,
-                audience,
-                aiYaml,
-                projectDir
-        );
+        // 🔹 NIC nie generujemy – tylko sprawdzamy, czy plik istnieje
+        if (!Files.exists(aiYaml)) {
+            return badRequest("YAML documentation not found. Generate documentation first.");
+        }
 
         String fileName = buildFileName(projectName, audience, ".yaml");
         return asInline(aiYaml, fileName, "text/yaml");
@@ -207,24 +197,14 @@ public class ProjectDocsFromCodeController {
             return notFound("Project not found: " + id);
         }
 
-        List<EndpointIR> endpoints = parser.parseProject(projectDir);
-        if (endpoints.isEmpty()) {
-            return badRequest("No endpoints found in source code.");
-        }
-
-        Files.createDirectories(projectDir);
-
-        String audience = level;
+        String audience = level; // beginner / advanced
         String projectName = resolveProjectName(id);
         Path aiYaml = projectDir.resolve("openapi_" + audience + ".yaml");
 
-        code2docs.generateYamlFromCode(
-                endpoints,
-                projectName,
-                audience,
-                aiYaml,
-                projectDir
-        );
+        // 🔹 znowu: żadnego generate, tylko odczyt
+        if (!Files.exists(aiYaml)) {
+            return badRequest("YAML documentation not found. Generate documentation first.");
+        }
 
         String fileName = buildFileName(projectName, audience, ".yaml");
         return asAttachment(aiYaml, fileName, "text/yaml");

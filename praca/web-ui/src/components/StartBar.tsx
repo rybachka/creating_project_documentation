@@ -85,11 +85,6 @@ export const StartBar: React.FC<StartBarProps> = ({
             color: "#111827",
           }}
         >
-          {/* Funkcje = powrót do głównego widoku / generatora */}
-          <button style={navBtn} onClick={onHomeClick}>
-            Funkcje
-          </button>
-
           {/* Jak to działa = HowItWorksPanel */}
           <button style={navBtn} onClick={onHowItWorksClick}>
             Jak to działa
